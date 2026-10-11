@@ -32,6 +32,16 @@ Cross-border migration and a fix to the displacement summary.
   `intel_country_signals` can join displacement with the conflict sources;
   that join had no displacement input before.
 
+### Docs
+- README's per-tool reference listed 126 of the 135 tools while every
+  headline count said 135: the 5 newer AOI tools, `intel_bgp_status`,
+  `intel_daily_digest`, and the severe-weather, cyclone, launch and
+  volcano tools were missing. All 139 are listed now, and
+  `test_readme_documents_every_registered_tool` pins the reference and
+  each section's count to the live registry. Collector count 51 -> 53 in
+  README; pyproject description; ROADMAP phases 27-28; CLAUDE.md
+  dispatch note (no `match/case` since Phase 26) and the UNHCR code trap.
+
 ### Data honesty: migration
 - UNHCR figures are year-end stocks, not border crossings; every response
   carries a `measure` string saying so. World Bank net migration is

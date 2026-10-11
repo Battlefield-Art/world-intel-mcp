@@ -8,7 +8,7 @@
 
 Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
-Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
+Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
 ---
 
@@ -145,7 +145,7 @@ collector.py  (daemon)    ─┘
 - **CircuitBreaker**: Per-source tracking. 3 consecutive failures trips for 5 minutes. Each RSS feed gets its own breaker.
 - **Cache**: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 - **VectorStore**: Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim). Async background worker queue for non-blocking storage. Enables semantic search across all accumulated intelligence.
-- **Collector**: Standalone daemon that fetches all 51 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
+- **Collector**: Standalone daemon that fetches all 53 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
 - **Sources** (`sources/*.py`): 30+ modules, each exports `async def fetch_*(fetcher, **kwargs) -> dict`.
 - **Analysis** (`analysis/*.py`): Cross-domain synthesis — signal aggregation, instability indexing, NLP, company enrichment, macro composite.
 - **Config** (`config/*.py`): Curated datasets — 22 hotspots, 70+ bases, 40 ports, 24 pipelines, 24 nuclear facilities, 34 cables, 48 datacenters, 27 spaceports, 82 exchanges.
@@ -251,13 +251,14 @@ collector.py  (daemon)    ─┘
 | `intel_military_surge` | Foreign aircraft concentration anomaly detection |
 | `intel_usni_fleet` | USNI News naval fleet tracker |
 
-### Infrastructure (4)
+### Infrastructure (5)
 | Tool | Description |
 |------|-------------|
 | `intel_internet_outages` | Cloudflare Radar internet disruptions |
 | `intel_cable_health` | Submarine cable corridor health |
 | `intel_cascade_analysis` | Infrastructure cascade simulation |
 | `intel_service_status` | Cloud platform health (AWS, Azure, GCP, Cloudflare, GitHub) |
+| `intel_bgp_status` | RIPEstat BGP status for one prefix or ASN: RIS peer visibility, origin ASNs, RPKI validity (a per-resource health check, not global hijack detection) |
 
 ### Maritime (2)
 | Tool | Description |
@@ -461,14 +462,46 @@ different, openly licensed data source; no ews code is used.
 |------|-------------|
 | `intel_generate_report` | Generate a PDF or HTML intelligence report covering 18 domains in parallel |
 
-### AOI Geofences (5)
+### AOI Geofences (10)
 | Tool | Description |
 |------|-------------|
 | `intel_aoi_define` | Define a named area of interest: point + radius in km (1-2000) |
+| `intel_aoi_define_polygon` | Define a polygon AOI from 3-64 [lat, lon] vertices (a border region, a strait, an EEZ) |
+| `intel_aoi_define_corridor` | Define a corridor AOI: 2-64 waypoints plus a width in km (a shipping lane, supply road, cable run) |
+| `intel_aoi_update` | Rename an AOI or change its center/radius in place (a rename keeps its change history) |
 | `intel_aoi_list` | List all user-defined AOIs |
 | `intel_aoi_delete` | Delete a user-defined AOI by name |
 | `intel_aoi_brief` | Cited brief for an AOI: earthquakes, military flights, wildfires, conflict events, aviation, nearby infrastructure, and news mentions, all filtered to the AOI's radius |
 | `intel_aoi_escalation` | Hotspot escalation scoring (same engine as the 22 built-in hotspots) applied to a user AOI |
+| `intel_aoi_changes` | What entered or left an AOI since the last sweep (earthquakes, military flights, ACLED events, wildfire clusters, news); the first call sets a baseline |
+| `intel_aoi_digest` | One change sweep across every AOI (or a named subset) with a combined markdown digest; a scheduler can call it on an interval |
+
+### Daily Digest (1)
+| Tool | Description |
+|------|-------------|
+| `intel_daily_digest` | Cited markdown morning brief: top events by domain, recent headlines, and (with the vector store) trends and a 24h timeline; every item carries a [n] citation |
+
+### Severe Weather (2)
+| Tool | Description |
+|------|-------------|
+| `intel_weather_alerts` | US National Weather Service active CAP alerts (US only) |
+| `intel_meteoalarm_alerts` | Meteoalarm severe-weather warnings for 39 European countries (per-country feeds) |
+
+### Tropical Cyclones (2)
+| Tool | Description |
+|------|-------------|
+| `intel_cyclones` | NHC active storms: Atlantic, Eastern and Central Pacific |
+| `intel_jtwc_cyclones` | JTWC warnings: Northwest Pacific, North Indian Ocean, Southern Hemisphere |
+
+### Space Launches (1)
+| Tool | Description |
+|------|-------------|
+| `intel_launch_schedule` | Upcoming rocket launches from Launch Library 2 (cached 1 h for the free tier) |
+
+### Volcanoes (1)
+| Tool | Description |
+|------|-------------|
+| `intel_volcano_activity` | Smithsonian GVP / USGS Weekly Volcanic Activity Report (weekly, curated) |
 
 ### Situation Brief (1)
 | Tool | Description |

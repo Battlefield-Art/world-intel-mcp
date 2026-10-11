@@ -1,7 +1,7 @@
 # World Intel MCP — Feature Parity Roadmap
 
 **Benchmark**: [koala73/worldmonitor](https://github.com/koala73/worldmonitor)
-**Updated**: 2026-09-02 (v0.10.0)
+**Updated**: 2026-10-11 (unreleased since v0.10.0: aircraft-cohort early warning, cross-border migration)
 **Current tools**: 139 (138 intel + 1 status)
 
 ---
@@ -132,11 +132,15 @@
 | `intel_strategic_ports` | Static dataset (40 ports) | :white_check_mark: |
 | `intel_pipelines` | Static dataset (24 pipelines) | :white_check_mark: |
 
-### Humanitarian & Social (4 tools)
+### Humanitarian & Social (8 tools)
 | Tool | WM Equivalent | Status |
 |------|---------------|--------|
 | `intel_humanitarian_summary` | `get-humanitarian-summary` | :white_check_mark: |
-| `intel_displacement_summary` | `get-displacement-summary` | :white_check_mark: |
+| `intel_displacement_summary` | `get-displacement-summary` | :white_check_mark: (per-origin rows since 2026-10-11; before that one global row) |
+| `intel_migration_flows` | none (beyond parity) | :white_check_mark: UNHCR origin -> destination corridors |
+| `intel_migration_surges` | none (beyond parity) | :white_check_mark: year-over-year mass-movement ranking |
+| `intel_migration_history` | none (beyond parity) | :white_check_mark: per-country series since 1951 |
+| `intel_net_migration` | none (beyond parity) | :white_check_mark: World Bank net migration + migrant stock |
 | `intel_social_signals` | Reddit public intelligence | :white_check_mark: |
 | `intel_disease_outbreaks` | WHO/ProMED/CIDRAP RSS | :white_check_mark: |
 
@@ -517,6 +521,35 @@ Also in this phase: `SECURITY.md` with an explicit threat model
 gather refactored into a single shared scoping path
 (`_gather_scoped_domains`).
 
+### Phase 27: Aircraft-Cohort Early Warning (+3 = 135 tools)
+`intel_jet_cohort_snapshot`, `intel_jet_activity_anomaly`, `intel_jet_excess_origins`
+
+Approach inspired by kylemcdonald/ews (independent implementation, no
+ews code). Business-jet (69 ICAO types) and military cohorts from
+adsb.lol, learned 24/7 by the collector (`bizjet_cohort`,
+`military_cohort`, collector sources 51 -> 53). The anomaly tool compares
+a UTC half-hour's peak airborne cohort count against the same slot on
+prior same-weekday dates (US holidays swapped out) from `globe_history`
+heatmaps; the excess-origins tool infers takeoffs/landings and clusters
+them. Only aircraft first seen 24 h before the window count, so a fresh
+install answers `warming_up` for a day.
+
+### Phase 28: Cross-Border Migration (+4 = 139 tools)
+`intel_migration_flows`, `intel_migration_surges`, `intel_migration_history`, `intel_net_migration`
+
+UNHCR origin -> destination corridors (about 6,000 for 2025) with
+prior-year change and country/region filters; a surge ranking by
+origin, corridor and internal displacement sized against population
+(World Bank SP.POP.TOTL); per-country series since 1951 as origin or
+host; World Bank net migration and migrant stock for migration of
+every kind. Fixed in the same change: `intel_displacement_summary` had
+never sent `coo_all=true` and returned one global row. All figures are
+year-end stocks (stated in each response), not crossings.
+
+Open: near-real-time displacement (IOM DTM, HDX HAPI: both need keys),
+regional border-crossing series (Frontex, CBP, UK small boats), a
+dashboard flow map, CLI commands and collector sources for migration.
+
 ---
 
 ## Planned Phases
@@ -601,12 +634,12 @@ suite, and a live MCP stdio session.
 
 | Category | Current | Notes |
 |----------|---------|-------|
-| Total MCP tools | 128 | 127 intelligence tools + `intel_status` |
-| Tool parity | 128 / 128 | `TOOLS` and `_dispatch()` are aligned (now machine-checked by import-based tests, not text scans) |
+| Total MCP tools | 139 | 138 intelligence tools + `intel_status` |
+| Tool parity | 139 / 139 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
-| Tests in repo | 918 | 900 non-smoke tests + 18 live smoke tests (measured 2026-09-02: `pytest -q` -> 900 passed, 18 deselected); full suite requires `.[dev]` |
-| Statement coverage | 91% | Measured 2026-09-01 night full-suite `--cov` (91.18%); was 59% that morning. CI ratchet at 89 |
+| Tests in repo | 965 | 947 non-smoke tests + 18 live smoke tests (measured 2026-10-11: `pytest -m 'not smoke'` -> 947 passed, 18 deselected); full suite requires `.[dev]` |
+| Statement coverage | 92% | Measured 2026-10-11 full-suite `--cov` (91.65%); 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
 | Primary remaining gaps | `cli.py` tests, coverage gate, `server.py` refactor | See Planned Phases 23-26 |
 
-**Bottom line**: 122 tools across 30+ domains, with the roadmap aligned to the live MCP registry and, for the first time, a forward-looking plan (Phases 23-26): geofence depth, the coverage gate, missing domains, and `server.py` modularization.
+**Bottom line (2026-10-11)**: 139 tools across 30+ domains; Phases 27-28 added aircraft-cohort early warning and cross-border migration. **Earlier (2026-09-02)**: 122 tools across 30+ domains, with the roadmap aligned to the live MCP registry and, for the first time, a forward-looking plan (Phases 23-26): geofence depth, the coverage gate, missing domains, and `server.py` modularization.

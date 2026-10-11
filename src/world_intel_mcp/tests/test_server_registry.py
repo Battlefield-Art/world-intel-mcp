@@ -200,3 +200,32 @@ async def test_dispatch_polygon_and_corridor_round_trip(server) -> None:
     for name in ("Registry Poly", "Registry Corridor"):
         deleted = await server._dispatch("intel_aoi_delete", {"name": name})
         assert deleted.get("deleted") == name
+
+
+_REPO = Path(__file__).resolve().parents[3]
+
+
+def test_readme_documents_every_registered_tool(server) -> None:
+    """The README's per-tool reference had drifted to 126 of 135 tools by
+    2026-10-11 while every headline count said 135. Pin the reference to
+    the registry itself: same names, and each section's "(n)" matches its
+    rows."""
+    readme = (_REPO / "README.md").read_text()
+    ref = readme.split("## MCP Tools Reference", 1)[1].split("\n## ", 1)[0]
+    registered = {t.name for t in server.TOOLS}
+    listed: list[str] = []
+    for section in re.split(r"^### ", ref, flags=re.M)[1:]:
+        header, _, body = section.partition("\n")
+        rows = re.findall(r"^\| `(intel_[a-z0-9_]+)`", body, re.M)
+        count = re.search(r"\((\d+)\)\s*$", header)
+        assert count, f"README section without a (n) count: {header}"
+        assert int(count.group(1)) == len(rows), f"README '{header}' says {count.group(1)}, lists {len(rows)}"
+        listed.extend(rows)
+    assert len(listed) == len(set(listed)), "a tool is listed twice in the README reference"
+    assert set(listed) == registered, {
+        "undocumented": sorted(registered - set(listed)),
+        "documented_but_not_registered": sorted(set(listed) - registered),
+    }
+    n = len(server.TOOLS)
+    assert f"**{n} MCP tools**" in readme
+    assert f"**Total: {n} tools**" in readme
