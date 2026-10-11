@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-World Intelligence MCP Server: 135 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
+World Intelligence MCP Server: 139 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
 
 ## Commands
 
@@ -47,7 +47,7 @@ collector.py (daemon)  ──┘
 - `CircuitBreaker`: Per-source tracking. 3 consecutive failures trips the breaker for 5 minutes. Each RSS feed gets its own breaker (`rss:bbc_world`).
 - `Cache`: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 
-**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 135 tools live in 12 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) is constructed once in `runtime.py`; handlers reach it as `runtime.fetcher` etc. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time — a drifted registry refuses to start.
+**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 139 tools live in 12 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) is constructed once in `runtime.py`; handlers reach it as `runtime.fetcher` etc. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time — a drifted registry refuses to start.
 
 **Source modules** (`sources/*.py`): Each module exports `async def fetch_*(fetcher: Fetcher, **kwargs) -> dict`. Pure data fetching — no MCP awareness. 30+ modules covering markets, seismology, military, cyber, health, tech, environmental, etc.
 

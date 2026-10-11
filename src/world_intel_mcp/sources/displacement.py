@@ -7,6 +7,7 @@ Population Statistics API. No API key required.
 import logging
 from datetime import datetime, timezone
 
+from ..config.countries import TIER1_COUNTRIES
 from ..fetcher import Fetcher
 
 logger = logging.getLogger("world-intel-mcp.sources.displacement")
@@ -42,17 +43,21 @@ async def fetch_displacement_summary(
         # Ensure year is an int even if passed as string
         year = int(year)
 
+    # coo_all=true asks for one row per origin country. Without it UNHCR
+    # returns a single global row (coo_name "-"), which is what this tool
+    # served until 2026-10-11: "by_origin" held one entry named "-".
     params = {
-        "limit": 100,
+        "limit": 1000,
         "yearFrom": year,
         "yearTo": year,
+        "coo_all": "true",
         "cf_type": "ISO",
     }
 
     data = await fetcher.get_json(
         url=_UNHCR_POPULATION_URL,
         source="unhcr",
-        cache_key=f"displacement:unhcr:{year}",
+        cache_key=f"displacement:unhcr:by_origin:{year}",
         cache_ttl=43200,
         params=params,
     )
@@ -86,11 +91,20 @@ async def fetch_displacement_summary(
 
     items = data.get("items", [])
 
-    # Aggregate by country of origin (coo_name)
+    # Aggregate by country of origin. Rows carry coo_iso (ISO-3) under
+    # cf_type=ISO; the display name prefers the TIER1 short name ("Syria",
+    # not UNHCR's "Syrian Arab Rep.") so signals.py can join it with the
+    # conflict sources, which use short names.
     by_country: dict[str, dict[str, int]] = {}
+    names: dict[str, tuple[str, str | None]] = {}
 
     for item in items:
-        coo_name = item.get("coo_name") or "Unknown"
+        iso3 = (item.get("coo_iso") or "").upper()
+        iso3 = iso3 if len(iso3) == 3 else None
+        tier1 = TIER1_COUNTRIES.get(iso3) if iso3 else None
+        coo_name = tier1["name"] if tier1 else (item.get("coo_name") or "Unknown").strip()
+        key = iso3 or coo_name
+        names[key] = (coo_name, iso3)
 
         refugees = _safe_int(item.get("refugees"))
         asylum_seekers = _safe_int(item.get("asylum_seekers"))
@@ -98,8 +112,8 @@ async def fetch_displacement_summary(
         stateless = _safe_int(item.get("stateless"))
         ooc = _safe_int(item.get("ooc"))
 
-        if coo_name not in by_country:
-            by_country[coo_name] = {
+        if key not in by_country:
+            by_country[key] = {
                 "refugees": 0,
                 "asylum_seekers": 0,
                 "idps": 0,
@@ -107,7 +121,7 @@ async def fetch_displacement_summary(
                 "ooc": 0,
             }
 
-        entry = by_country[coo_name]
+        entry = by_country[key]
         entry["refugees"] += refugees
         entry["asylum_seekers"] += asylum_seekers
         entry["idps"] += idps
@@ -116,7 +130,8 @@ async def fetch_displacement_summary(
 
     # Build sorted list with total_displaced
     by_origin = []
-    for country, totals in by_country.items():
+    for key, totals in by_country.items():
+        country, iso3 = names[key]
         total_displaced = (
             totals["refugees"]
             + totals["asylum_seekers"]
@@ -127,6 +142,7 @@ async def fetch_displacement_summary(
         by_origin.append(
             {
                 "country": country,
+                "iso3": iso3,
                 "refugees": totals["refugees"],
                 "asylum_seekers": totals["asylum_seekers"],
                 "internally_displaced": totals["idps"],

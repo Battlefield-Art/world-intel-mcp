@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+Cross-border migration and a fix to the displacement summary.
+
+### Added: migration
+- `intel_migration_flows`: every UNHCR origin -> destination corridor for a
+  year (about 6,000 with people in them for 2025: refugees, asylum seekers
+  and others in need of international protection), filterable by country
+  (ISO-3, ISO-2 or name) or region (UNHCR major areas and UN sub-regions),
+  with each corridor's change against the prior year and top origins and
+  destinations of the selection.
+- `intel_migration_surges`: largest year-over-year increases and decreases
+  in people abroad, by origin and by corridor, and in internal displacement,
+  with each origin's change as a share of its population (World Bank
+  SP.POP.TOTL). Levels mass / major / notable are stated heuristics.
+  UNHCR's non-country buckets ("Unknown" origin) are reported separately
+  and never ranked.
+- `intel_migration_history`: one country's yearly UNHCR series since 1951,
+  as an origin or as a host, with its peak year and largest annual waves.
+- `intel_net_migration`: World Bank net migration (all reasons, economic
+  included) and international migrant stock: latest-year ranking in
+  absolute and per-1,000 terms with world regions, a World Bank region
+  filter, or one country's series since 1960.
+
+### Fixed: displacement summary
+- `intel_displacement_summary` never sent UNHCR `coo_all=true`, so UNHCR
+  answered with one global row and `by_origin` held a single entry named
+  "-" (found by a live call 2026-10-11). It now returns the top 30 origins
+  with ISO-3 codes. Names prefer the short TIER1 name ("Syria") so
+  `intel_country_signals` can join displacement with the conflict sources;
+  that join had no displacement input before.
+
+### Data honesty: migration
+- UNHCR figures are year-end stocks, not border crossings; every response
+  carries a `measure` string saying so. World Bank net migration is
+  modelled by the UN World Population Prospects, and its latest years can
+  be projections.
+- UNHCR's own country codes are not ISO ("AUS" is Austria), so requests
+  send `cf_type=ISO` and rows are read through `coo_iso` / `coa_iso`.
+- Not included: near-real-time displacement (IOM DTM and HDX HAPI need
+  keys), regional border-crossing series, and bilateral economic migration
+  flows (only national net totals exist in a keyless API).
+
+
 Aircraft-cohort early warning, approach inspired by
 [kylemcdonald/ews](https://github.com/kylemcdonald/ews) (independent
 implementation; no ews code used).

@@ -1,5 +1,5 @@
 """News and public-signal tools: RSS news, trending keywords,
-GDELT, prediction markets, displacement, cyber threats, AI watch,
+GDELT, prediction markets, displacement and migration, cyber threats, AI watch,
 disease outbreaks, sanctions, elections, social signals, tech and
 science feeds, government spending.
 
@@ -17,6 +17,7 @@ from ..sources import (
     news,
     prediction,
     displacement,
+    migration,
     cyber,
     ai_watch,
     health,
@@ -45,7 +46,7 @@ TOOLS: list[Tool] = [
             },
         },
     ),
-    # --- Displacement (1 tool) ---
+    # --- Displacement and migration (5 tools) ---
     Tool(
         name="intel_displacement_summary",
         description="Get UNHCR refugee/displacement statistics by country of origin. No API key needed.",
@@ -56,6 +57,77 @@ TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Reporting year (default: last year)",
                 },
+            },
+        },
+    ),
+    Tool(
+        name="intel_migration_flows",
+        description=(
+            "Cross-border displacement corridors from UNHCR: people from an origin country living in a "
+            "destination country (refugees + asylum seekers + others in need of protection), year-end "
+            "stock, with change vs the prior year. Filter origin/destination by country (ISO-3, ISO-2 or "
+            "name) or region ('Europe', 'Eastern Africa'). No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "Origin country or region"},
+                "destination": {"type": "string", "description": "Destination country or region"},
+                "year": {"type": "integer", "description": "Reporting year (default: latest with data)"},
+                "limit": {"type": "integer", "description": "Corridors to return (default 25)"},
+                "min_people": {"type": "integer", "description": "Drop corridors smaller than this (default 0)"},
+            },
+        },
+    ),
+    Tool(
+        name="intel_migration_surges",
+        description=(
+            "Mass-movement detector: largest year-over-year increases and decreases in people displaced "
+            "abroad (by origin and by corridor) and in internal displacement, from UNHCR, with each "
+            "origin's change as a share of its population (World Bank). Levels mass/major/notable are "
+            "stated heuristics. No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer", "description": "Reporting year (default: latest with data)"},
+                "min_change": {"type": "integer", "description": "Minimum absolute change to report (default 50000)"},
+                "limit": {"type": "integer", "description": "Entries per list (default 20)"},
+            },
+        },
+    ),
+    Tool(
+        name="intel_migration_history",
+        description=(
+            "Yearly UNHCR series since 1951 for one country, as an origin (its people abroad, plus IDPs) "
+            "or as a host (people it hosts), with the peak year and the largest annual waves. "
+            "No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "country": {"type": "string", "description": "Country (ISO-3, ISO-2 or name)"},
+                "role": {"type": "string", "enum": ["origin", "host"], "description": "Default origin"},
+                "year_from": {"type": "integer", "description": "First year (default 1951)"},
+                "year_to": {"type": "integer", "description": "Last year (default current)"},
+            },
+            "required": ["country"],
+        },
+    ),
+    Tool(
+        name="intel_net_migration",
+        description=(
+            "World Bank net migration (immigrants minus emigrants, all reasons incl. economic) and "
+            "international migrant stock. Without a country: latest-year ranking of net immigration and "
+            "emigration (absolute and per 1,000) plus world regions; with a country: its series since "
+            "1960. No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "country": {"type": "string", "description": "Country (ISO-3, ISO-2 or name) for its series"},
+                "region": {"type": "string", "description": "World Bank region code or name to filter the ranking (e.g. SSF, ECS)"},
+                "limit": {"type": "integer", "description": "Entries per ranking (default 20)"},
             },
         },
     ),
@@ -328,6 +400,45 @@ async def _displacement_summary(arguments: dict[str, Any]) -> Any:
     )
 
 
+async def _migration_flows(arguments: dict[str, Any]) -> Any:
+    return await migration.fetch_migration_flows(
+        runtime.fetcher,
+        year=arguments.get("year"),
+        origin=arguments.get("origin"),
+        destination=arguments.get("destination"),
+        limit=arguments.get("limit", 25),
+        min_people=arguments.get("min_people", 0),
+    )
+
+
+async def _migration_surges(arguments: dict[str, Any]) -> Any:
+    return await migration.fetch_migration_surges(
+        runtime.fetcher,
+        year=arguments.get("year"),
+        min_change=arguments.get("min_change", 50_000),
+        limit=arguments.get("limit", 20),
+    )
+
+
+async def _migration_history(arguments: dict[str, Any]) -> Any:
+    return await migration.fetch_migration_history(
+        runtime.fetcher,
+        country=arguments["country"],
+        role=arguments.get("role", "origin"),
+        year_from=arguments.get("year_from", 1951),
+        year_to=arguments.get("year_to"),
+    )
+
+
+async def _net_migration(arguments: dict[str, Any]) -> Any:
+    return await migration.fetch_net_migration(
+        runtime.fetcher,
+        country=arguments.get("country"),
+        region=arguments.get("region"),
+        limit=arguments.get("limit", 20),
+    )
+
+
 async def _cyber_threats(arguments: dict[str, Any]) -> Any:
     return await cyber.fetch_cyber_threats(
         runtime.fetcher, limit=arguments.get("limit", 50)
@@ -428,6 +539,10 @@ async def _usa_spending(arguments: dict[str, Any]) -> Any:
 HANDLERS = {
     "intel_prediction_markets": _prediction_markets,
     "intel_displacement_summary": _displacement_summary,
+    "intel_migration_flows": _migration_flows,
+    "intel_migration_surges": _migration_surges,
+    "intel_migration_history": _migration_history,
+    "intel_net_migration": _net_migration,
     "intel_cyber_threats": _cyber_threats,
     "intel_news_feed": _news_feed,
     "intel_trending_keywords": _trending_keywords,

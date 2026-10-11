@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **135 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -47,7 +47,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Country Intelligence** | 3 | Country brief, country stocks, financial centers |
 | **Prediction Markets** | 1 | Polymarket event contracts |
 | **Elections** | 1 | Global election calendar with risk scoring |
-| **Displacement** | 1 | UNHCR refugee/IDP data |
+| **Displacement and Migration** | 5 | UNHCR refugee/IDP data, origin -> destination corridors since 1951, year-over-year surge detection; World Bank net migration and migrant stock |
 | **Shipping** | 1 | Dry bulk shipping stress index |
 | **Government** | 1 | USAspending.gov federal contracts |
 | **Traffic** | 2 | Road traffic flow, real-time incidents |
@@ -64,7 +64,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 135 tools** across 30+ intelligence domains.
+**Total: 139 tools** across 30+ intelligence domains.
 
 ---
 
@@ -329,10 +329,14 @@ collector.py  (daemon)    ─┘
 |------|-------------|
 | `intel_election_calendar` | Global election calendar with risk scoring |
 
-### Displacement (1)
+### Displacement and migration (5)
 | Tool | Description |
 |------|-------------|
-| `intel_displacement_summary` | UNHCR refugee/IDP statistics |
+| `intel_displacement_summary` | UNHCR refugee/IDP statistics, top 30 origins |
+| `intel_migration_flows` | UNHCR origin -> destination corridors (country or region filters), with change vs the prior year |
+| `intel_migration_surges` | Largest year-over-year increases and decreases by origin and corridor, plus IDPs, sized against population |
+| `intel_migration_history` | One country's yearly series since 1951 as an origin or a host, with its peak and largest waves |
+| `intel_net_migration` | World Bank net migration and migrant stock: latest ranking, regions, or one country since 1960 |
 
 ### Aviation (5)
 | Tool | Description |
