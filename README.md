@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **132 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **135 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -33,7 +33,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Military & Defense** | 6 | adsb.lol, OpenSky, hexdb.io, surge detection, theater posture, aircraft batch |
 | **Infrastructure** | 5 | Cloudflare Radar, submarine cables, cascade analysis, cloud status, RIPEstat BGP/RPKI |
 | **Maritime** | 2 | NGA navigation warnings, vessel snapshots |
-| **Aviation** | 2 | FAA airport delays, domestic flight snapshot |
+| **Aviation** | 5 | FAA airport delays, domestic flight snapshot, business-jet/military cohort early warning (adsb.lol live + globe_history heatmaps) |
 | **News & Media** | 3 | 119 RSS feeds (4-tier), GDELT, trending keywords |
 | **Intelligence Analysis** | 8 | Signal convergence, focal points, instability index, risk scores, escalation |
 | **NLP Intelligence** | 4 | Entity extraction, event classification, news clustering, keyword spikes |
@@ -64,7 +64,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 132 tools** across 30+ intelligence domains.
+**Total: 135 tools** across 30+ intelligence domains.
 
 ---
 
@@ -334,11 +334,36 @@ collector.py  (daemon)    ─┘
 |------|-------------|
 | `intel_displacement_summary` | UNHCR refugee/IDP statistics |
 
-### Aviation (2)
+### Aviation (5)
 | Tool | Description |
 |------|-------------|
 | `intel_airport_delays` | FAA airport delay status |
 | `intel_aviation_domestic` | Global air traffic snapshot from OpenSky |
+| `intel_jet_cohort_snapshot` | Live airborne business-jet (ICAO type designators) or military cohort from adsb.lol; learns cohort membership as a side effect |
+| `intel_jet_activity_anomaly` | Peak concurrent airborne cohort aircraft in a UTC half-hour vs the same slot on prior same-weekday dates (holiday-adjacent dates swapped out); robust z, alert level 1-5, deficit flag |
+| `intel_jet_excess_origins` | Infers takeoffs/landings from heatmap tracks, density-clusters endpoints, and reports clusters above their baseline median: departure/arrival anchor, regional, or diffuse |
+
+**Cohort early warning.** The three `intel_jet_*` tools watch a cohort of aircraft
+(business jets by ICAO type designator, or military) for activity that departs
+from its calendar baseline, and locate where an excess came from. Data:
+adsb.lol's live API and its public half-hour `globe_history` heatmaps (readsb
+format, ODbL 1.0, no key). Heatmaps are ~14 MB each and immutable once
+published, so they are cached on disk next to the cache DB
+(`WORLD_INTEL_HEATMAP_CACHE_MB`, default 1024) and fetched at most one at a
+time with a 2 s floor. The cohort is *learned* from live snapshots (run
+`intel_jet_cohort_snapshot` or the collector daemon, which now includes
+`bizjet_cohort` and `military_cohort`); the analyses only use members first
+seen `min_learning_lead_hours` (default 24) before the window, because a
+cohort learned during a window inflates that window (measured: 1,002 vs a
+206 baseline median when the gate is bypassed). Until the cohort has that
+lead, the tools answer `warming_up`. The baseline is a handful of
+same-weekday slots fetched on demand, not a year-long backfill, so there
+are no learned holiday profiles or annual ratios.
+
+Approach inspired by [kylemcdonald/ews](https://github.com/kylemcdonald/ews)
+(Early Warning System: business-jet cohorts against calendar baselines, and
+the excess-origin detector). This is an independent implementation over a
+different, openly licensed data source; no ews code is used.
 
 ### Cyber Threats (1)
 | Tool | Description |

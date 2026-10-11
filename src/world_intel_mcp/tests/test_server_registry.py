@@ -123,11 +123,11 @@ def test_aggregate_refuses_drift_and_collisions() -> None:
 
 
 def test_tool_count_matches_documented_surface(server) -> None:
-    """132 = 131 intelligence tools + intel_status. If this fails after
+    """135 = 134 intelligence tools + intel_status. If this fails after
     adding a tool, update README.md, ROADMAP.md, and this number in the
     same change: the repo's history shows doc counts drifting stale
     within weeks when nothing enforced them."""
-    assert len(server.TOOLS) == 132
+    assert len(server.TOOLS) == 135
 
 
 @pytest.mark.asyncio

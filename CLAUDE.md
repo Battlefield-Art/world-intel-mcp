@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-World Intelligence MCP Server: 128 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
+World Intelligence MCP Server: 135 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
 
 ## Commands
 
@@ -47,7 +47,7 @@ collector.py (daemon)  ──┘
 - `CircuitBreaker`: Per-source tracking. 3 consecutive failures trips the breaker for 5 minutes. Each RSS feed gets its own breaker (`rss:bbc_world`).
 - `Cache`: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 
-**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 128 tools live in 12 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) is constructed once in `runtime.py`; handlers reach it as `runtime.fetcher` etc. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time — a drifted registry refuses to start.
+**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 135 tools live in 12 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) is constructed once in `runtime.py`; handlers reach it as `runtime.fetcher` etc. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time — a drifted registry refuses to start.
 
 **Source modules** (`sources/*.py`): Each module exports `async def fetch_*(fetcher: Fetcher, **kwargs) -> dict`. Pure data fetching — no MCP awareness. 30+ modules covering markets, seismology, military, cyber, health, tech, environmental, etc.
 
@@ -57,7 +57,7 @@ collector.py (daemon)  ──┘
 
 **Vector store** (`vector_store.py`): Optional Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX). Async background worker queue (`asyncio.Queue` + `asyncio.to_thread()`) for non-blocking storage. Fetcher auto-stores on fresh HTTP fetches. 65+ source name → category mappings for filtered search.
 
-**Collector** (`collector.py`): Standalone daemon for 24/7 vector store population. 51 sources organized by domain, with `--daemon`, `--interval`, `--sources` CLI args. Dynamic import via `_import_fetch_fn()`. Per-source timeout overrides in `SOURCE_TIMEOUTS` (the `aoi_digest` sweep gets 240 s; everything else the flat 45 s). Entry point: `intel-collector`.
+**Collector** (`collector.py`): Standalone daemon for 24/7 vector store population. 53 sources organized by domain, with `--daemon`, `--interval`, `--sources` CLI args. Dynamic import via `_import_fetch_fn()`. Per-source timeout overrides in `SOURCE_TIMEOUTS` (the `aoi_digest` sweep gets 240 s; everything else the flat 45 s). Entry point: `intel-collector`.
 
 **Reports** (`reports.py`): PDF/HTML intelligence report generator. Collects 18 domains in parallel, renders styled HTML, converts to PDF via WeasyPrint. Optional dependency: `pip install -e ".[pdf]"`.
 
@@ -76,6 +76,7 @@ collector.py (daemon)  ──┘
 - **Source name string**: The `source` parameter in `fetcher.get_json()` identifies the API for circuit breaking and rate limiting. Must match entries in `_SOURCE_RATE_LIMITS` if rate-limited (e.g., `"yahoo-finance"`, `"coingecko"`, `"adsblol"`, `"nominatim"`).
 - **GDELT needs its own timeout**: `api.gdeltproject.org` TCP-connects instantly but its TLS handshake runs 17-20 s and sometimes longer (measured 2026-09-02), and the Fetcher's 15 s default counts TLS inside connect. Every GDELT `get_json` call must pass `timeout=GDELT_TIMEOUT` (from `sources/news.py`, 45 s) or it silently fails and serves stale cache.
 - **AOI news is geographic** (`sources/geocode.py`): AOI briefs reverse-geocode the area centre with OSM Nominatim and search GDELT for the settlement/county, never the AOI's name. Nominatim policy: 1 req/s (`_SOURCE_RATE_LIMITS`), identifying User-Agent with contact URL, results cached 30 days. Tests must stub `geocode.fetch_place_context` (the shared `_patch_all_domains` helper in `test_aoi.py` does) — a suite that hits Nominatim live gets rate-limited within seconds.
+- **Heatmap tools** (`sources/jet_cohort.py`, `analysis/jet_activity.py`): adsb.lol heatmaps are binary (~14 MB); fetch them with `fetcher.get_bytes` (source `adsblol-history`, 2 s floor) and the on-disk `HeatmapDiskCache`, never the SQLite TTL cache. Tests build synthetic heatmaps with the encoder in `tests/test_jet_activity.py` and zero the rate floor via monkeypatch.
 - **Tool dispatch**: `server.py` uses Python `match/case` to route tool names to source functions. Tool names follow `intel_*` convention.
 - **All source functions take `fetcher` as first arg** — never construct your own httpx client.
 - **Tests strip proxy env vars** automatically via `conftest.py` fixture (prevents SOCKS proxy interference). The conftest also resets global fetcher rate-limit locks between tests to avoid cross-event-loop binding.

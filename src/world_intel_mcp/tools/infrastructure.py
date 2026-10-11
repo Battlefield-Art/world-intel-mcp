@@ -13,6 +13,7 @@ from typing import Any
 from mcp.types import Tool
 
 from .. import runtime
+from ..sources.jet_cohort import BIZJET_TYPES
 from ..sources import (
     infrastructure,
     maritime,
@@ -124,6 +125,71 @@ TOOLS: list[Tool] = [
             "required": ["resource"],
         },
     ),
+    # --- Aircraft cohort early warning (3 tools; approach inspired by kylemcdonald/ews) ---
+    Tool(
+        name="intel_jet_cohort_snapshot",
+        description=f"Live airborne snapshot of a tracked aircraft cohort from adsb.lol (free, no key, ODbL): business jets ({len(BIZJET_TYPES)} ICAO type designators, one request) or military. "
+        "Counts by type, PIA/LADD privacy flags, positions. Each call also learns the cohort (hex addresses persisted locally) that intel_jet_activity_anomaly and intel_jet_excess_origins filter on; run it periodically to build the cohort.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cohort": {"type": "string", "enum": ["bizjet", "military"], "default": "bizjet"},
+                "region": {
+                    "type": "string",
+                    "description": "global, conus, north_america, europe, middle_east, east_asia, or 'lamin,lomin,lamax,lomax' (filters the summary only; learning is global)",
+                    "default": "global",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="intel_jet_activity_anomaly",
+        description="Early-warning check: peak concurrent airborne cohort aircraft (business jets or military) in the latest published UTC half-hour (or a given slot) vs the same slot on prior same-weekday dates, from adsb.lol globe_history heatmaps. US federal holiday-adjacent baseline dates are swapped for earlier weeks. Returns robust z-score, alert level 1-5 (normal/watch/elevated/high/alarm), deficit flag, and data gaps. Needs a learned cohort (see intel_jet_cohort_snapshot); downloads ~14 MB per uncached slot, cached on disk.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cohort": {"type": "string", "enum": ["bizjet", "military"], "default": "bizjet"},
+                "region": {
+                    "type": "string",
+                    "description": "global, conus, north_america, europe, middle_east, east_asia, or 'lamin,lomin,lamax,lomax'",
+                    "default": "global",
+                },
+                "slot": {
+                    "type": "string",
+                    "description": "UTC ISO datetime inside the half-hour to score (default: latest published)",
+                },
+                "baseline_weeks": {"type": "integer", "minimum": 2, "maximum": 8, "default": 4},
+                "alarm_sigma": {"type": "number", "default": 5.0, "description": "z at which level 5 (alarm) fires"},
+                "min_learning_lead_hours": {
+                    "type": "number",
+                    "default": 24,
+                    "description": "Only use cohort members first seen this long before the window (avoids selection bias). Negative values admit later-learned members for a first look; the result is then marked degraded with a selection-bias data gap.",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="intel_jet_excess_origins",
+        description="Where did an excess of cohort departures/arrivals come from? Infers takeoffs and landings from adsb.lol heatmap tracks for a 0.5-2 h window and the same window on prior weeks, density-clusters the endpoints (default 12-mile radius), and reports clusters above their baseline median with a pattern label: departure_anchor, arrival_anchor, regional concentration, diffuse, or no_excess. Optional reference point gives distance-to-event. At most 12 heatmap files (~14 MB each, cached) per call.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cohort": {"type": "string", "enum": ["bizjet", "military"], "default": "bizjet"},
+                "region": {"type": "string", "default": "global", "description": "Region preset or 'lamin,lomin,lamax,lomax'"},
+                "start": {"type": "string", "description": "UTC ISO start of the window (default: ends at the latest published slot)"},
+                "slots": {"type": "integer", "minimum": 1, "maximum": 4, "default": 2, "description": "Window length in half-hours"},
+                "baseline_weeks": {"type": "integer", "minimum": 1, "maximum": 4, "default": 3},
+                "ref_lat": {"type": "number", "description": "Optional event latitude for distance reporting"},
+                "ref_lon": {"type": "number", "description": "Optional event longitude for distance reporting"},
+                "cluster_radius_mi": {"type": "number", "default": 12, "minimum": 1, "maximum": 50},
+                "min_learning_lead_hours": {
+                    "type": "number",
+                    "default": 24,
+                    "description": "Only use cohort members first seen this long before the window; negative admits later-learned members (marked as a selection-bias data gap)",
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -190,6 +256,47 @@ async def _bgp_status(arguments: dict[str, Any]) -> Any:
     )
 
 
+async def _jet_cohort_snapshot(arguments: dict[str, Any]) -> Any:
+    from ..sources.jet_cohort import fetch_cohort_snapshot
+
+    return await fetch_cohort_snapshot(
+        runtime.fetcher,
+        cohort=arguments.get("cohort", "bizjet"),
+        region=arguments.get("region"),
+    )
+
+
+async def _jet_activity_anomaly(arguments: dict[str, Any]) -> Any:
+    from ..analysis.jet_activity import fetch_cohort_activity
+
+    return await fetch_cohort_activity(
+        runtime.fetcher,
+        cohort=arguments.get("cohort", "bizjet"),
+        region=arguments.get("region"),
+        baseline_weeks=arguments.get("baseline_weeks", 4),
+        slot=arguments.get("slot"),
+        alarm_sigma=float(arguments.get("alarm_sigma", 5.0)),
+        min_learning_lead_hours=float(arguments.get("min_learning_lead_hours", 24)),
+    )
+
+
+async def _jet_excess_origins(arguments: dict[str, Any]) -> Any:
+    from ..analysis.jet_activity import fetch_excess_origins
+
+    return await fetch_excess_origins(
+        runtime.fetcher,
+        cohort=arguments.get("cohort", "bizjet"),
+        region=arguments.get("region"),
+        start=arguments.get("start"),
+        slots=arguments.get("slots", 2),
+        baseline_weeks=arguments.get("baseline_weeks", 3),
+        ref_lat=arguments.get("ref_lat"),
+        ref_lon=arguments.get("ref_lon"),
+        cluster_radius_mi=float(arguments.get("cluster_radius_mi", 12)),
+        min_learning_lead_hours=float(arguments.get("min_learning_lead_hours", 24)),
+    )
+
+
 HANDLERS = {
     "intel_internet_outages": _internet_outages,
     "intel_cable_health": _cable_health,
@@ -200,5 +307,9 @@ HANDLERS = {
     "intel_traffic_incidents": _traffic_incidents,
     "intel_webcams": _webcams,
     "intel_shipping_index": _shipping_index,
-    "intel_service_status": _service_status,    "intel_bgp_status": _bgp_status,
+    "intel_service_status": _service_status,
+    "intel_bgp_status": _bgp_status,
+    "intel_jet_cohort_snapshot": _jet_cohort_snapshot,
+    "intel_jet_activity_anomaly": _jet_activity_anomaly,
+    "intel_jet_excess_origins": _jet_excess_origins,
 }

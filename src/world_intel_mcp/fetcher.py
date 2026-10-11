@@ -8,6 +8,7 @@ response is returned (marked with _stale=True) so dashboards never go blank.
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -40,7 +41,29 @@ _SOURCE_RATE_LIMITS: dict[str, float] = {
     "acled": 2.0,  # API key based
     "nga": 2.0,  # govt API
     "sec-edgar": 1.0,  # SEC EDGAR — be polite
+    # adsb.lol globe_history heatmaps are ~14 MB each; one at a time,
+    # spaced, so a cold baseline never bursts the community server.
+    "adsblol-history": 2.0,
 }
+
+
+@dataclass(frozen=True)
+class BinaryResult:
+    """Outcome of :meth:`Fetcher.get_bytes`.
+
+    ``status`` is the final HTTP status (None when no response arrived),
+    ``content`` the body on 2xx, ``error`` a short reason otherwise. A
+    404 is reported as ``status=404`` with no error so callers can tell
+    "not published (yet)" apart from "the fetch failed".
+    """
+
+    status: int | None
+    content: bytes | None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.content is not None
 _source_locks: dict[str, asyncio.Lock] = {}
 _source_last_call: dict[str, float] = {}
 
@@ -246,6 +269,58 @@ class Fetcher:
     ) -> str | None:
         """Fetch XML content (returns raw text for feedparser/ET parsing)."""
         return await self.get_text(url, source, cache_key, cache_ttl, timeout=timeout)
+
+    async def get_bytes(
+        self,
+        url: str,
+        source: str,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> BinaryResult:
+        """Fetch a binary body with rate limiting, retries and circuit breaking.
+
+        Not cached here: binary payloads (multi-MB) do not belong in the
+        SQLite TTL cache, so callers own any on-disk caching. A 404 is a
+        definitive answer (not retried, not a breaker failure). A body
+        larger than ``max_bytes`` is refused rather than buffered.
+        """
+        if not self.breaker.is_available(source):
+            return BinaryResult(None, None, f"circuit open for {source}")
+
+        await self._source_throttle(source)
+        client = await self._get_client()
+        last_error = "unknown error"
+        last_status: int | None = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = await client.get(
+                    url, headers=headers, timeout=timeout or self.default_timeout
+                )
+                last_status = resp.status_code
+                if resp.status_code == 404:
+                    self.breaker.record_success(source)
+                    return BinaryResult(404, None, None)
+                resp.raise_for_status()
+                body = resp.content
+                if len(body) > max_bytes:
+                    self.breaker.record_success(source)
+                    return BinaryResult(
+                        resp.status_code,
+                        None,
+                        f"body of {len(body)} bytes exceeds cap {max_bytes}",
+                    )
+                self.breaker.record_success(source)
+                return BinaryResult(resp.status_code, body, None)
+            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if attempt < self.max_retries:
+                    await asyncio.sleep(min(2**attempt, 30))
+
+        self.breaker.record_failure(source)
+        logger.warning("Binary fetch failed for %s: %s (url=%s)", source, last_error, url)
+        return BinaryResult(last_status, None, last_error)
 
     def _stale_fallback(self, cache_key: str, source: str) -> Any | None:
         """Return stale (expired) cached data as last-known-good fallback.

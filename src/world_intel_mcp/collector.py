@@ -77,9 +77,13 @@ SOURCES = [
     ("trending_keywords", "sources.news", "fetch_trending_keywords", {}),
     # Prediction (1)
     ("prediction_markets", "sources.prediction", "fetch_prediction_markets", {}),
-    # Aviation (2)
+    # Aviation (4)
     ("airport_delays", "sources.aviation", "fetch_airport_delays", {}),
     ("domestic_flights", "sources.aviation", "fetch_domestic_flights", {}),
+    # Aircraft cohorts (2): each run learns cohort members that the
+    # intel_jet_activity_anomaly / intel_jet_excess_origins tools need.
+    ("bizjet_cohort", "sources.jet_cohort", "fetch_cohort_snapshot", {"cohort": "bizjet"}),
+    ("military_cohort", "sources.jet_cohort", "fetch_cohort_snapshot", {"cohort": "military"}),
     # Cyber (1)
     ("cyber_threats", "sources.cyber", "fetch_cyber_threats", {}),
     # Space (2)
@@ -154,7 +158,7 @@ DOMAIN_GROUPS = {
     "climate": ["climate_anomalies"],
     "news": ["news_feed", "trending_keywords"],
     "prediction": ["prediction_markets"],
-    "aviation": ["airport_delays", "domestic_flights"],
+    "aviation": ["airport_delays", "domestic_flights", "bizjet_cohort", "military_cohort"],
     "cyber": ["cyber_threats"],
     "space": ["space_weather", "launch_schedule"],
     "ai": ["ai_watch"],

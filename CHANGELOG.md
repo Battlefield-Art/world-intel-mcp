@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+Aircraft-cohort early warning, approach inspired by
+[kylemcdonald/ews](https://github.com/kylemcdonald/ews) (independent
+implementation; no ews code used).
+
+### Added
+- `intel_jet_cohort_snapshot`: live airborne snapshot of the business-jet
+  cohort (69 ICAO type designators in one adsb.lol `/v2/type` request) or
+  the military cohort (`/v2/mil`), with per-type counts and PIA/LADD
+  flags. Each call learns cohort membership into a `jet_cohort` table in
+  the cache DB. The collector gains `bizjet_cohort` and `military_cohort`
+  so the cohort keeps learning 24/7 (collector sources 51 -> 53).
+- `intel_jet_activity_anomaly`: peak concurrent airborne cohort aircraft
+  in a UTC half-hour, from adsb.lol `globe_history` heatmaps, against the
+  same slot on 2-8 prior same-weekday dates; dates within a day of a US
+  federal holiday are swapped for earlier weeks. Robust z with a counting
+  noise floor; a second z on the cohort's share of all tracked aircraft
+  guards against feeder-coverage swings, and the level (1-5) uses the
+  smaller. Deficits (z <= -3) are flagged too.
+- `intel_jet_excess_origins`: takeoff/landing inference (ground/air
+  transitions plus low climbs/descents at coverage edges), density
+  clustering of endpoints across the current and baseline windows, and a
+  departure/arrival anchor, regional, diffuse or no-excess label, with
+  optional distance to a reference point.
+- `Fetcher.get_bytes` (binary fetch with rate floor, retries, breaker;
+  404 reported distinctly) and an on-disk LRU for heatmaps
+  (`WORLD_INTEL_HEATMAP_CACHE_MB`, default 1024).
+
+### Data honesty
+- Cohort selection bias is gated: only members first seen
+  `min_learning_lead_hours` (default 24) before the window count. A fresh
+  install answers `warming_up`. A negative lead is allowed for a first
+  look but marks the result degraded and suppresses the alert level and
+  pattern label (bypassing the gate measured 1,002 vs a 206 baseline
+  median on 2026-10-11, i.e. pure selection artefact).
+- Missing, unpublished or low-coverage heatmaps are listed in
+  `data_gaps`; fewer than 3 usable baseline windows is
+  `insufficient_baseline`, never a zero-excess "normal".
+
+### Not ported from ews
+- FAA / global registry cohort importers: the FAA ReleasableAircraft.zip
+  answers 403 to non-browser clients, and the ADS-B Exchange database and
+  `globe_history` are under JETNET terms (robots.txt disallows
+  `/globe_history/`), so the cohort is learned from adsb.lol instead.
+- Year-long backfill, learned holiday profiles and annual ratios,
+  non-ICAO (`~hex`) activity stores, and the paid SMS/email/Telegram
+  alerting stack.
+
 ## 0.10.0 - 2026-09-02
 
 Geofences become visible and their news becomes geographic: the
