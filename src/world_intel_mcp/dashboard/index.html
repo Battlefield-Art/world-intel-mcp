@@ -562,6 +562,11 @@ a { color: var(--accent); text-decoration: none; }
 }
 .leaflet-tooltip.mk-tip::before { border-top-color: var(--border); }
 
+/* Migration corridor legend (under the layer row) */
+.mig-legend { font-family: var(--mono); font-size: 0.55rem; line-height: 1.5; color: rgba(255,255,255,0.55); padding: 2px 4px 6px 16px; }
+.mig-legend .sw { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+.mig-legend.err { color: var(--red); }
+
 /* ═══════════════ UTILITY ═══════════════ */
 .up { color: var(--green); } .down { color: var(--red); }
 .warn { color: var(--amber); } .dim { color: var(--dim); }
@@ -748,6 +753,13 @@ a { color: var(--accent); text-decoration: none; }
         <span class="layer-count" id="cntAoi">—</span>
         <div class="toggle on" style="--lc:#ff7f50"><div class="knob"></div></div>
     </div>
+    <div class="layer-row" data-layer="migration">
+        <span class="layer-dot" style="background:#f472b6"></span>
+        <span class="layer-label">Migration Flows</span>
+        <span class="layer-count" id="cntMigration">—</span>
+        <div class="toggle on" style="--lc:#f472b6"><div class="knob"></div></div>
+    </div>
+    <div class="mig-legend" id="migLegend">loading UNHCR corridors…</div>
     <div style="border-top:1px solid rgba(255,255,255,0.08);margin-top:4px;padding-top:6px">
         <div style="font-size:0.55rem;letter-spacing:1px;color:rgba(255,255,255,0.35);margin-bottom:4px">REGION</div>
         <div id="regionPresets" style="display:flex;flex-wrap:wrap;gap:2px">
@@ -835,7 +847,7 @@ function _withinTimeWindow(ts) { if (!ts) return true; var age = Date.now() - ne
 var latestData = null;
 var map = null;
 var mapLayers = {};
-var layerState = { quakes: true, military: true, conflict: true, fires: true, convergence: true, nuclear: true, infra: true, exposure: true, airtraffic: true, traffic: true, navwarnings: true, webcams: true, climate: true, news: true, aoi: true };
+var layerState = { quakes: true, military: true, conflict: true, fires: true, convergence: true, nuclear: true, infra: true, exposure: true, airtraffic: true, traffic: true, navwarnings: true, webcams: true, climate: true, news: true, aoi: true, migration: true };
 // Restore saved layer toggles from localStorage
 try { var _saved = JSON.parse(localStorage.getItem('phoenix-layers')); if (_saved) { for (var _k in _saved) { if (layerState.hasOwnProperty(_k)) layerState[_k] = _saved[_k]; } } } catch(e) {}
 var drawerOpen = false;
@@ -933,6 +945,10 @@ function initMap() {
     mapLayers.climate = L.layerGroup().addTo(map);
     mapLayers.news = L.markerClusterGroup(clusterOpts(null, 35)).addTo(map);
     mapLayers.aoi = L.layerGroup().addTo(map);
+    mapLayers.migration = L.layerGroup().addTo(map);
+    // The legend explains the lines (or the outage), so it follows the layer however it is toggled.
+    mapLayers.migration.on('add', function() { $('#migLegend').style.display = ''; });
+    mapLayers.migration.on('remove', function() { $('#migLegend').style.display = 'none'; });
 }
 
 // ════════════ LAYER TOGGLES ════════════
@@ -958,8 +974,8 @@ $('#drawerToggle').addEventListener('click', function() {
 });
 
 // ════════════ DETAIL MODAL ════════════
-var COLORS = { earthquake: 'var(--red)', military: 'var(--blue)', conflict: 'var(--amber)', fire: 'var(--gold)', convergence: 'var(--purple)', nuclear: 'var(--green)', military_base: 'var(--teal)', port: 'var(--blue)', nuclear_facility: 'var(--gold)', pipeline: 'var(--purple)', exposure: '#e040fb', waterway: 'var(--accent)', cable: 'var(--blue)', airtraffic: '#00c8ff', traffic_city: '#e0e0e0', navwarn: '#ffc832', webcam: '#909090', aoi: '#ff7f50' };
-var LABELS = { earthquake: 'EARTHQUAKE', military: 'MILITARY AIRCRAFT', conflict: 'CONFLICT EVENT', fire: 'WILDFIRE CLUSTER', convergence: 'SIGNAL CONVERGENCE', nuclear: 'NUCLEAR MONITOR', military_base: 'MILITARY BASE', port: 'STRATEGIC PORT', nuclear_facility: 'NUCLEAR FACILITY', pipeline: 'PIPELINE', exposure: 'POPULATION EXPOSURE', waterway: 'STRATEGIC WATERWAY', cable: 'CABLE CORRIDOR', airtraffic: 'AIRCRAFT', traffic_city: 'TRAFFIC CONGESTION', navwarn: 'NAVIGATION WARNING', webcam: 'WEBCAM', aoi: 'AOI GEOFENCE' };
+var COLORS = { earthquake: 'var(--red)', military: 'var(--blue)', conflict: 'var(--amber)', fire: 'var(--gold)', convergence: 'var(--purple)', nuclear: 'var(--green)', military_base: 'var(--teal)', port: 'var(--blue)', nuclear_facility: 'var(--gold)', pipeline: 'var(--purple)', exposure: '#e040fb', waterway: 'var(--accent)', cable: 'var(--blue)', airtraffic: '#00c8ff', traffic_city: '#e0e0e0', navwarn: '#ffc832', webcam: '#909090', aoi: '#ff7f50', migration: '#f472b6' };
+var LABELS = { earthquake: 'EARTHQUAKE', military: 'MILITARY AIRCRAFT', conflict: 'CONFLICT EVENT', fire: 'WILDFIRE CLUSTER', convergence: 'SIGNAL CONVERGENCE', nuclear: 'NUCLEAR MONITOR', military_base: 'MILITARY BASE', port: 'STRATEGIC PORT', nuclear_facility: 'NUCLEAR FACILITY', pipeline: 'PIPELINE', exposure: 'POPULATION EXPOSURE', waterway: 'STRATEGIC WATERWAY', cable: 'CABLE CORRIDOR', airtraffic: 'AIRCRAFT', traffic_city: 'TRAFFIC CONGESTION', navwarn: 'NAVIGATION WARNING', webcam: 'WEBCAM', aoi: 'AOI GEOFENCE', migration: 'MIGRATION CORRIDOR' };
 
 function showDetail(type, d) {
     var title = '', subtitle = '', fields = [], link = '';
@@ -1163,6 +1179,20 @@ function showDetail(type, d) {
             ['Precip Anomaly', d.precip_anomaly_pct != null ? (d.precip_anomaly_pct > 0 ? '+' : '') + d.precip_anomaly_pct.toFixed(0) + '%' : '\u2014', Math.abs(d.precip_anomaly_pct || 0) > 50 ? 'high' : ''],
             ['Significant', d.is_significant ? 'YES' : 'No', d.is_significant ? 'crit' : 'ok'],
             ['Coordinates', d.lat != null ? d.lat.toFixed(3) + ', ' + d.lon.toFixed(3) : '\u2014']
+        ];
+    } else if (type === 'migration') {
+        title = (d.origin || '?') + ' \u2192 ' + (d.destination || '?');
+        subtitle = 'UNHCR year-end stock, capital to capital';
+        fields = [
+            ['Origin', d.origin || '\u2014'],
+            ['Destination', d.destination || '\u2014'],
+            ['People', fmtPeople(d.people)],
+            ['Refugees', d.refugees != null ? fmtPeople(d.refugees) : '\u2014'],
+            ['Asylum seekers', d.asylum_seekers != null ? fmtPeople(d.asylum_seekers) : '\u2014'],
+            ['Other in need of protection', d.other_in_need_of_protection != null ? fmtPeople(d.other_in_need_of_protection) : '\u2014'],
+            ['Prior year', d.prior_year_people != null ? fmtPeople(d.prior_year_people) : 'n/a'],
+            ['Change', fmtPeopleChange(d.change), d.change > 0 ? 'high' : ''],
+            ['Anchors', (d.origin_point.capital || '?') + ' \u2192 ' + (d.destination_point.capital || '?')]
         ];
     }
 
@@ -1529,7 +1559,7 @@ function _toggleHelp() {
     document.body.appendChild(_helpOverlay);
 }
 
-var _layerKeys = ['quakes','military','conflict','fires','convergence','nuclear','infra','exposure','airtraffic','news','aoi'];
+var _layerKeys = ['quakes','military','conflict','fires','convergence','nuclear','infra','exposure','airtraffic','news','aoi','migration'];
 function _toggleLayerByIndex(idx) {
     var key = _layerKeys[idx];
     if (!key || !mapLayers[key]) return;
@@ -3251,6 +3281,70 @@ function updateMapAois(data) {
     cnt.textContent = aois.length;
     cnt.title = '';
 }
+// Migration corridors: UNHCR origin -> destination year-end stocks, drawn capital to capital
+// (the World Bank gives one coordinate per country). Line weight = people, colour = year-over-year
+// change. An outage shows in the count and legend; it must never read as a quiet world.
+function fmtPeople(n) { return n == null ? '\u2014' : Number(n).toLocaleString('en-US'); }
+function fmtPeopleChange(n) { return n == null ? 'n/a' : (n > 0 ? '+' : '') + Number(n).toLocaleString('en-US'); }
+function _migArc(a, b) {
+    // Short way round the globe, bowed to the left of travel so opposite flows do not overlap.
+    var lon2 = b.lon;
+    if (lon2 - a.lon > 180) lon2 -= 360; else if (lon2 - a.lon < -180) lon2 += 360;
+    var mx = (a.lat + b.lat) / 2, my = (a.lon + lon2) / 2;
+    var dx = b.lat - a.lat, dy = lon2 - a.lon;
+    var cx = mx - dy * 0.18, cy = my + dx * 0.18;
+    var pts = [];
+    for (var i = 0; i <= 20; i++) {
+        var t = i / 20, u = 1 - t;
+        pts.push([u * u * a.lat + 2 * u * t * cx + t * t * b.lat, u * u * a.lon + 2 * u * t * cy + t * t * lon2]);
+    }
+    return pts;
+}
+function updateMapMigration(data) {
+    mapLayers.migration.clearLayers();
+    var cnt = $('#cntMigration'), lg = $('#migLegend');
+    if (!data || data.error) {
+        var msg = (data && data.error) || 'migration fetch failed';
+        cnt.textContent = '!'; cnt.title = msg;
+        lg.className = 'mig-legend err'; lg.textContent = 'Migration data unavailable: ' + msg;
+        return;
+    }
+    var drawn = {}, maxPeople = 1;
+    var all = (data.corridors || []).map(function(c) { return { c: c, rising: false }; });
+    all.forEach(function(x) { drawn[x.c.origin_iso3 + '|' + x.c.destination_iso3] = true; });
+    (data.rising || []).forEach(function(c) {
+        if (!drawn[c.origin_iso3 + '|' + c.destination_iso3]) all.push({ c: c, rising: true });
+    });
+    all.forEach(function(x) { if (x.c.people > maxPeople) maxPeople = x.c.people; });
+    all.forEach(function(x) {
+        var c = x.c;
+        var col = c.change == null || c.change === 0 ? '#8a94a6' : c.change > 0 ? '#FF3B3B' : '#2DD4BF';
+        var w = 1.5 + 9 * Math.sqrt(c.people / maxPeople);
+        var line = L.polyline(_migArc(c.origin_point, c.destination_point), { color: col, weight: w, opacity: 0.7, dashArray: x.rising ? '6 5' : null, className: 'migration-line' });
+        var tip = '<b>' + esc(c.origin) + ' \u2192 ' + esc(c.destination) + '</b><br>' + esc(fmtPeople(c.people)) + ' people' +
+            '<br><span style="opacity:0.7">change ' + esc(fmtPeopleChange(c.change)) + (c.pct_change != null ? ' (' + esc((c.pct_change > 0 ? '+' : '') + c.pct_change) + '%)' : '') + '</span>';
+        line.bindTooltip(tip, { className: 'mk-tip', sticky: true });
+        line.on('click', function() { showDetail('migration', c); });
+        line.addTo(mapLayers.migration);
+        // The head marks the destination end, so direction reads without arrowheads.
+        L.circleMarker([c.destination_point.lat, c.destination_point.lon], { radius: w / 2 + 2, color: col, weight: 1, fillColor: col, fillOpacity: 0.9 }).addTo(mapLayers.migration);
+    });
+    cnt.textContent = (data.corridors || []).length;
+    cnt.title = '';
+    lg.className = 'mig-legend';
+    var parts = [];
+    parts.push('UNHCR ' + esc(String(data.year)) + ' year-end stock, ' + esc(String(data.plotted)) + ' largest corridors, capital to capital (World Bank).');
+    parts.push('<span class="sw" style="background:#FF3B3B"></span>up <span class="sw" style="background:#2DD4BF"></span>down <span class="sw" style="background:#8a94a6"></span>n/a; width = people; dot = destination; dashed = rising corridor outside the top list.');
+    if (data.unplotted) parts.push(esc(String(data.unplotted)) + ' corridor(s) unplotted, no coordinates: ' + esc((data.unplotted_corridors || []).slice(0, 5).map(function(u) { return u.origin + ' \u2192 ' + u.destination; }).join('; ')) + (data.unplotted > 5 ? '; \u2026' : ''));
+    if (data.rising_error) parts.push('<span style="color:var(--red)">Rising corridors unavailable: ' + esc(data.rising_error) + '</span>');
+    else if (data.rising_unplotted) parts.push(esc(String(data.rising_unplotted)) + ' rising corridor(s) unplotted.');
+    lg.innerHTML = parts.join('<br>');
+}
+fetch('/api/migration')
+    .then(function(r) { return r.json(); })
+    .then(function(data) { try { updateMapMigration(data); } catch(e) { console.warn('migration layer failed:', e); updateMapMigration({ error: String(e) }); } })
+    .catch(function(e) { console.warn('migration fetch failed:', e); updateMapMigration({ error: String(e) }); });
+
 fetch('/api/aois')
     .then(function(r) { return r.json(); })
     .then(function(data) { try { updateMapAois(data); } catch(e) { console.warn('aoi layer failed:', e); } })

@@ -120,7 +120,7 @@ intel report -o brief.pdf    # custom output path
 intel report -s markets,cyber,earthquakes  # select sections
 ```
 
-Map-first ops center: Leaflet map with toggle-able layers (quakes, military, conflict, fires, convergence, nuclear, infrastructure, your AOI geofences with last-sweep counts), 47 live SSE feeds, HUD bar, glassmorphic panels, per-source circuit breaker health.
+Map-first ops center: Leaflet map with toggle-able layers (quakes, military, conflict, fires, convergence, nuclear, infrastructure, your AOI geofences with last-sweep counts, UNHCR migration corridors between capitals), 47 live SSE feeds, HUD bar, glassmorphic panels, per-source circuit breaker health.
 
 ### CLI
 

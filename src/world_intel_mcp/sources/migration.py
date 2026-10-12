@@ -179,8 +179,18 @@ async def _wb_indicator(fetcher: Fetcher, indicator: str, country: str = "all",
     return rows
 
 
+def _coord(value: Any) -> float | None:
+    """A World Bank coordinate string ("15.5932"), or None for the empty string
+    it returns for aggregates and for places without a capital (West Bank and Gaza)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def wb_countries(fetcher: Fetcher) -> dict[str, dict] | None:
-    """ISO-3 -> {name, region, income, aggregate} from the World Bank country list."""
+    """ISO-3 -> {name, region, income, aggregate, capital, latitude, longitude}
+    from the World Bank country list. The coordinates are the capital city's."""
     data = await fetcher.get_json(
         url=_WB + "country", source="worldbank", cache_key="migration:wb:countries",
         cache_ttl=_META_TTL, params={"format": "json", "per_page": 1000},
@@ -197,6 +207,9 @@ async def wb_countries(fetcher: Fetcher) -> dict[str, dict] | None:
             "region_id": region.get("id"),
             "income": ((c.get("incomeLevel") or {}).get("value") or "").strip(),
             "aggregate": region.get("id") == "NA",
+            "capital": (c.get("capitalCity") or "").strip() or None,
+            "latitude": _coord(c.get("latitude")),
+            "longitude": _coord(c.get("longitude")),
         }
     return out
 

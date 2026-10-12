@@ -24,6 +24,18 @@ Cross-border migration and a fix to the displacement summary.
   absolute and per-1,000 terms with world regions, a World Bank region
   filter, or one country's series since 1960.
 
+### Added: migration corridor map layer
+- The dashboard gains a "Migration Flows" layer and `GET /api/migration`
+  (`?limit=` 1-150, default 40; `?year=`): the largest UNHCR origin ->
+  destination corridors plus the fastest-rising ones, drawn capital to
+  capital with weight by people and colour by year-over-year change.
+  Coordinates are the capital-city latitude/longitude of the World Bank
+  country list (`wb_countries` now returns `capital`, `latitude`,
+  `longitude`); the legend says so. Corridors with no coordinates (UNHCR
+  "Unknown" origin, Stateless, West Bank and Gaza) are counted in
+  `unplotted` and listed, never dropped. An upstream failure is a 503 with
+  `error`, shown as `!` and a red legend line, never an empty map.
+
 ### Added: migration in the CLI and collector
 - `intel migration-flows`, `intel migration-surges`, `intel migration-history`
   and `intel net-migration` render the four tools as tables, with the same

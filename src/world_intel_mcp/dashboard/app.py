@@ -49,6 +49,7 @@ from world_intel_mcp.sources import (
     service_status,
     traffic,
     webcams,
+    migration,
 )
 from world_intel_mcp.analysis.alerts import fetch_alert_digest, fetch_weekly_trends
 from world_intel_mcp.analysis.posture import fetch_strategic_posture
@@ -581,6 +582,112 @@ async def api_aois(request):
     )
 
 
+_MIGRATION_DEFAULT_LIMIT = 40
+_MIGRATION_MAX_LIMIT = 150
+_MIGRATION_RISING_LIMIT = 15
+
+
+def _capital_point(iso3: str, wb: dict[str, dict]) -> dict | None:
+    """The country's capital as a map anchor, from the World Bank country list.
+    None for UNHCR's non-country buckets (Unknown, Stateless), for aggregates and
+    for places the World Bank gives no capital coordinates."""
+    c = wb.get(iso3)
+    if not c or c.get("aggregate") or c.get("latitude") is None or c.get("longitude") is None:
+        return None
+    return {"lat": c["latitude"], "lon": c["longitude"], "capital": c.get("capital")}
+
+
+def _place_corridors(corridors: list[dict], wb: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+    """Split corridors into (plotted, unplotted). A plotted corridor gains
+    ``origin_point`` / ``destination_point``; an unplotted one is summarised with
+    the endpoints that have no coordinates, so nothing is dropped silently."""
+    plotted, unplotted = [], []
+    for c in corridors:
+        o = _capital_point(c["origin_iso3"], wb)
+        d = _capital_point(c["destination_iso3"], wb)
+        if o and d:
+            plotted.append({**c, "origin_point": o, "destination_point": d})
+            continue
+        unplotted.append({
+            "origin": c["origin"], "origin_iso3": c["origin_iso3"],
+            "destination": c["destination"], "destination_iso3": c["destination_iso3"],
+            "people": c["people"],
+            "no_coordinates": [side for side, pt in (("origin", o), ("destination", d)) if pt is None],
+        })
+    return plotted, unplotted
+
+
+async def api_migration(request):
+    """Largest origin -> destination migration corridors (UNHCR) anchored on
+    capital-city coordinates (World Bank), plus the fastest-rising corridors.
+
+    ``?limit=`` (1-150, default 40) is how many of the largest corridors to
+    examine; ``?year=`` pins the UNHCR year. Corridors whose endpoint has no
+    coordinates are counted in ``unplotted`` and listed in ``unplotted_corridors``.
+    An upstream failure is a 503 carrying ``error``, never an empty corridor
+    list, so the map cannot show an outage as a quiet world. The rising list is
+    secondary: if only it fails, the largest corridors are still returned with
+    ``rising_error`` set.
+    """
+    cors = {"Access-Control-Allow-Origin": "*"}
+    try:
+        limit = int(request.query_params.get("limit", _MIGRATION_DEFAULT_LIMIT))
+        year_param = request.query_params.get("year")
+        year = int(year_param) if year_param else None
+    except ValueError:
+        return JSONResponse({"error": "limit and year must be integers"}, status_code=400, headers=cors)
+    if not 1 <= limit <= _MIGRATION_MAX_LIMIT:
+        return JSONResponse(
+            {"error": f"limit must be between 1 and {_MIGRATION_MAX_LIMIT}"}, status_code=400, headers=cors
+        )
+
+    fetcher = _ensure_fetcher()
+    try:
+        flows, surges, wb = await asyncio.gather(
+            migration.fetch_migration_flows(fetcher, year=year, limit=limit),
+            migration.fetch_migration_surges(fetcher, year=year, limit=_MIGRATION_RISING_LIMIT),
+            migration.wb_countries(fetcher),
+        )
+    except Exception as exc:
+        logger.warning("Migration layer unavailable: %s", exc)
+        return JSONResponse(
+            {"error": f"Migration fetch failed: {exc}", "corridors": [], "rising": []},
+            status_code=503, headers=cors,
+        )
+    if "error" in flows:
+        return JSONResponse({**flows, "corridors": [], "rising": []}, status_code=503, headers=cors)
+    if wb is None:
+        return JSONResponse(
+            {"error": "World Bank country coordinates unavailable", "source": "worldbank",
+             "corridors": [], "rising": []},
+            status_code=503, headers=cors,
+        )
+
+    plotted, unplotted = _place_corridors(flows["corridors"], wb)
+    payload = {
+        "year": flows["year"],
+        "limit": limit,
+        "corridors": plotted,
+        "plotted": len(plotted),
+        "unplotted": len(unplotted),
+        "unplotted_corridors": unplotted,
+        "corridor_count": flows["corridor_count"],
+        "prior_year_available": flows["prior_year_available"],
+        "anchor": "capital city (World Bank country list); a corridor is drawn capital to capital, "
+                  "not along a route",
+        "measure": flows["measure"],
+        "source": "unhcr+worldbank",
+        "timestamp": flows["timestamp"],
+    }
+    if "error" in surges:
+        payload.update(rising=[], rising_unplotted=0, rising_error=surges["error"])
+    else:
+        rising, rising_unplotted = _place_corridors(surges["corridor_increases"], wb)
+        payload.update(rising=rising, rising_unplotted=len(rising_unplotted),
+                       compared_with=surges["compared_with"])
+    return JSONResponse(payload, headers=cors)
+
+
 async def api_health(request):
     """Health check."""
     return JSONResponse({"status": "ok"})
@@ -735,6 +842,7 @@ app = Starlette(
         Route("/api/stream", api_stream),
         Route("/api/static", api_static),
         Route("/api/aois", api_aois),
+        Route("/api/migration", api_migration),
         Route("/api/health", api_health),
         Route("/api/report/pdf", api_report_pdf),
         Route("/sse/vector-analytics", sse_vector_analytics),
