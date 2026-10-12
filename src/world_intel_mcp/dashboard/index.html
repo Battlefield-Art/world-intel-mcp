@@ -1206,6 +1206,18 @@ function showDetail(type, d) {
             ['Last sweep', ls ? ago(ls.taken_at * 1000) + ' ago (' + ls.total + ' items)' : 'never \u2014 run intel-collector --sources aoi', ls ? '' : 'high']
         ];
         if (ls) { Object.keys(ls.counts).sort().forEach(function(k) { fields.push([k.replace(/_/g, ' '), String(ls.counts[k])]); }); }
+    } else if (type === 'trade_route') {
+        title = d.name || 'Trade Route';
+        subtitle = (d.type || '').replace(/_/g, ' ');
+        fields = [
+            ['Name', d.name || '\u2014'],
+            ['Type', (d.type || '\u2014').replace(/_/g, ' ')],
+            ['Oil Flow', d.oil_flow_mbd != null ? d.oil_flow_mbd + ' mb/d' : '\u2014'],
+            ['Vessel Transits', d.daily_transits != null ? '~' + d.daily_transits + ' / day' : '\u2014'],
+            ['Share of Global Trade', d.trade_value_pct != null ? d.trade_value_pct + '%' : '\u2014'],
+            ['Countries (ISO-3)', d.countries || '\u2014'],
+            ['Notes', d.notes || '\u2014']
+        ];
     }
 
     var hdr = '<div class="detail-cat"><span class="detail-cat-dot" style="background:' + c + ';--cat-color:' + c + '"></span><span class="detail-cat-label">' + esc(LABELS[type] || type) + '</span></div>' +
@@ -1258,6 +1270,8 @@ COLORS.space = 'var(--gold)'; LABELS.space = 'SPACE WEATHER';
 COLORS.shipping = 'var(--teal)'; LABELS.shipping = 'SHIPPING';
 COLORS.service = 'var(--blue)'; LABELS.service = 'SERVICE STATUS';
 COLORS.pipeline = 'var(--purple)'; LABELS.pipeline = 'PIPELINE';
+COLORS.trade_route = 'var(--teal)'; LABELS.trade_route = 'TRADE ROUTE';
+COLORS.ucdp_event = 'var(--amber)'; LABELS.ucdp_event = 'UCDP CONFLICT EVENT';
 
 var _drawerItems = {};
 var _drawerIdx = 0;
@@ -1372,6 +1386,28 @@ function showDrawerDetail(id) {
             ['Number', d.number || d.id || '\u2014'],
             ['Issued', d.dtg || d.date || '\u2014'],
             ['Text', d.text || d.description || '\u2014']
+        ];
+    } else if (type === 'conflict') {
+        // Same event shape as the map's conflict layer (hotspot fallback rows): one renderer for both.
+        showDetail('conflict', d);
+        return;
+    } else if (type === 'ucdp_event') {
+        var ub = d.best || 0;
+        title = (d.side_a || '?') + (d.side_b ? ' vs ' + d.side_b : '');
+        subtitle = (d.country || '') + (d.date_start ? ' \u2014 ' + String(d.date_start).slice(0, 10) : '');
+        fields = [
+            ['Country', d.country || '\u2014'],
+            ['Region', d.region || '\u2014'],
+            ['Violence Type', d.type_of_violence_label || '\u2014'],
+            ['Side A', d.side_a || '\u2014'],
+            ['Side B', d.side_b || '\u2014'],
+            ['Deaths (best)', String(ub), ub > 10 ? 'crit' : ub > 0 ? 'high' : ''],
+            ['Deaths (low-high)', (d.low != null ? d.low : '?') + ' \u2013 ' + (d.high != null ? d.high : '?')],
+            ['Dates', (d.date_start ? String(d.date_start).slice(0, 10) : '?') + (d.date_end ? ' \u2192 ' + String(d.date_end).slice(0, 10) : '')],
+            ['Coordinates', d.latitude != null && d.longitude != null ? Number(d.latitude).toFixed(3) + ', ' + Number(d.longitude).toFixed(3) : '\u2014'],
+            ['Headline', trunc(d.source_headline || '', 200) || '\u2014'],
+            ['Source', trunc(d.source_article || '', 200) || '\u2014'],
+            ['UCDP ID', d.relid || d.id || '\u2014']
         ];
     } else if (type === 'pipeline') {
         title = d.name || 'Pipeline';
@@ -1834,10 +1870,10 @@ function updateMapInfra(data) {
         var line = L.polyline([[p.lat_start, p.lon_start], [p.lat_end, p.lon_end]], opts);
         line.bindTooltip(esc(p.name) + '<br><span style="opacity:0.7">' + esc(p.type) + ' \u2022 ' + esc(p.status) + '</span>', { className: 'mk-tip', sticky: true });
         line.on('click', function() {
-            showDetail('pipeline', {
+            showDrawerDetail(_storeItem('pipeline', {
                 name: p.name, route: p.route, type: p.type,
                 capacity: p.capacity, status: p.status, notes: p.notes
-            });
+            }));
         });
         line.addTo(mapLayers.infra);
     });
@@ -2510,7 +2546,7 @@ function updateDrawer(data) {
             h += '<div class="sub">UCDP Events (' + (data.ucdp_events.count || ucdp.length) + ')</div><table class="dtable"><thead><tr><th>Conflict</th><th>Deaths</th></tr></thead><tbody>';
             ucdp.slice(0, 10).forEach(function(e) {
                 var best = e.best || e.best_fatality_estimate || 0;
-                var did = _storeItem('conflict', e);
+                var did = _storeItem('ucdp_event', e);
                 h += '<tr data-click="' + did + '"><td>' + esc(trunc(e.dyad_name || e.side_a || '?', 30)) + '</td><td class="' + (best > 10 ? 'down' : best > 0 ? 'warn' : 'dim') + '">' + best + '</td></tr>';
             });
             h += '</tbody></table>';

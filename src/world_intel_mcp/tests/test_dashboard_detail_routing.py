@@ -4,34 +4,33 @@ index.html renders item details through two functions: map clicks call
 ``showDetail(type, d)`` and drawer rows call ``showDrawerDetail(id)``, each
 an ``if (type === ...)`` chain. A click whose type has no branch in the
 function it reaches opens an empty panel (category label, no title, no
-fields) with no console error. The AOI layer shipped that way: its branch
-sat in ``showDrawerDetail`` while the map click went to ``showDetail``.
+fields) with no console error; ``showDrawerDetail`` instead falls back to a
+raw dump of the first 12 keys. The AOI layer shipped with an empty panel:
+its branch sat in ``showDrawerDetail`` while the map click went to
+``showDetail``. Pipelines and trade routes (map) were empty the same way,
+and the drawer's UCDP and conflict-zone rows got the raw dump.
 
 These tests read index.html as text and assert that every type a caller
 dispatches has a branch in the renderer it reaches.
 
 Gaps / not covered:
 - Static text analysis, not execution. It proves a branch exists, not that
-  the branch renders the right fields; the AOI panel itself was verified
-  by clicking circle, polygon and corridor AOIs in headless Chromium.
+  the branch renders the right fields. The panels were verified by real
+  clicks in headless Chromium (AOI circle/polygon/corridor, pipeline and
+  trade route on the map, pipeline/UCDP/conflict-zone drawer rows).
+- The raw-dump fallback means a missing drawer branch is not an empty
+  panel, only an unformatted one; this test is what catches it.
 - Only literal dispatches (``showDetail('x', ...)``, ``_storeItem('x', ...)``)
   are seen; a type passed through a variable is not.
-- ``_KNOWN_UNROUTED_*`` lists types that are broken today in the same way
-  (found while fixing AOI, not fixed in that change). The sets are strict:
-  fixing one fails the test until the set is shrunk, so they cannot hide a
-  new regression or outlive the fix.
+- A delegating branch (the drawer's ``conflict`` rows hand off to
+  ``showDetail``) counts as handled; the delegate's own branch is checked
+  by the map-side test because the hand-off is a literal ``showDetail('conflict'``.
 """
 
 import re
 from pathlib import Path
 
 _INDEX = Path(__file__).resolve().parents[1] / "dashboard" / "index.html"
-
-# Map clicks with no showDetail branch: pipeline's branch lives only in
-# showDrawerDetail; trade_route has no branch anywhere.
-_KNOWN_UNROUTED_MAP = {"pipeline", "trade_route"}
-# Drawer rows with no showDrawerDetail branch: UCDP conflict rows.
-_KNOWN_UNROUTED_DRAWER = {"conflict"}
 
 
 def _function_body(src: str, signature: str) -> str:
@@ -50,7 +49,7 @@ def test_every_map_click_type_has_a_show_detail_branch() -> None:
     handled = _branch_types(_function_body(src, "function showDetail(type, d) {"))
     assert "aoi" in dispatched, "AOI layer no longer dispatches to showDetail"
     assert "aoi" in handled, "AOI click reaches showDetail, which has no aoi branch"
-    assert dispatched - handled == _KNOWN_UNROUTED_MAP
+    assert dispatched - handled == set()
 
 
 def test_every_drawer_item_type_has_a_show_drawer_detail_branch() -> None:
@@ -58,4 +57,4 @@ def test_every_drawer_item_type_has_a_show_drawer_detail_branch() -> None:
     stored = set(re.findall(r"_storeItem\('(\w+)'", src))
     handled = _branch_types(_function_body(src, "function showDrawerDetail(id) {"))
     assert stored, "no drawer items found; the extraction regex is stale"
-    assert stored - handled == _KNOWN_UNROUTED_DRAWER
+    assert stored - handled == set()

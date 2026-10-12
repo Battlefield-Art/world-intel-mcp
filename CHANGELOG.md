@@ -63,15 +63,22 @@ displacement summary and the dashboard AOI detail panel. Tools 132 -> 139.
   `intel_country_signals` can join displacement with the conflict sources;
   that join had no displacement input before.
 
-### Fixed: dashboard AOI detail
+### Fixed: dashboard detail panels
 - Clicking an AOI on the map opened an empty detail panel (label only,
   since 0.10.0): the click called `showDetail`, but the AOI branch lived in
   `showDrawerDetail`, which AOIs never reach. The branch now sits in
   `showDetail`; circle, polygon and corridor AOIs show name, shape,
-  centre and last-sweep counts. `test_dashboard_detail_routing.py` checks
-  that every dispatched type has a branch in the renderer it reaches.
-  Same defect, not yet fixed: map clicks on pipelines and trade routes,
-  and UCDP conflict rows in the drawer.
+  centre and last-sweep counts.
+- Map clicks on pipelines and trade routes opened the same empty panel.
+  Pipelines now go to the pipeline renderer the drawer already used; trade
+  routes gain one (type, oil flow, vessel transits, share of global trade,
+  ISO-3 countries, notes, all from `config/trade_routes.py`).
+- Drawer rows for UCDP events and conflict-zone hotspots showed a raw dump
+  of the first 12 keys under a JSON title. UCDP rows now show both sides,
+  violence type, deaths (best and low-high), dates, coordinates, headline,
+  source and UCDP id; conflict-zone rows use the map's conflict renderer.
+- `test_dashboard_detail_routing.py` fails if any dispatched type lacks a
+  branch in the renderer it reaches.
 
 ### Docs
 - README's per-tool reference listed 126 of the 135 tools while every
