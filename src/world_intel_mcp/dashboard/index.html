@@ -1194,6 +1194,18 @@ function showDetail(type, d) {
             ['Change', fmtPeopleChange(d.change), d.change > 0 ? 'high' : ''],
             ['Anchors', (d.origin_point.capital || '?') + ' \u2192 ' + (d.destination_point.capital || '?')]
         ];
+    } else if (type === 'aoi') {
+        title = d.name || 'AOI';
+        var ak = d.kind || 'circle';
+        subtitle = ak.toUpperCase() + (ak === 'circle' ? ' \u2022 ' + d.radius_km + ' km radius' : ak === 'corridor' && d.geometry ? ' \u2022 ' + d.geometry.width_km + ' km wide' : '');
+        var ls = d.last_sweep;
+        fields = [
+            ['Name', d.name || '\u2014'],
+            ['Shape', ak],
+            ['Center', (d.lat != null ? d.lat.toFixed(3) : '\u2014') + ', ' + (d.lon != null ? d.lon.toFixed(3) : '\u2014')],
+            ['Last sweep', ls ? ago(ls.taken_at * 1000) + ' ago (' + ls.total + ' items)' : 'never \u2014 run intel-collector --sources aoi', ls ? '' : 'high']
+        ];
+        if (ls) { Object.keys(ls.counts).sort().forEach(function(k) { fields.push([k.replace(/_/g, ' '), String(ls.counts[k])]); }); }
     }
 
     var hdr = '<div class="detail-cat"><span class="detail-cat-dot" style="background:' + c + ';--cat-color:' + c + '"></span><span class="detail-cat-label">' + esc(LABELS[type] || type) + '</span></div>' +
@@ -1361,18 +1373,6 @@ function showDrawerDetail(id) {
             ['Issued', d.dtg || d.date || '\u2014'],
             ['Text', d.text || d.description || '\u2014']
         ];
-    } else if (type === 'aoi') {
-        title = d.name || 'AOI';
-        var ak = d.kind || 'circle';
-        subtitle = ak.toUpperCase() + (ak === 'circle' ? ' • ' + d.radius_km + ' km radius' : ak === 'corridor' && d.geometry ? ' • ' + d.geometry.width_km + ' km wide' : '');
-        var ls = d.last_sweep;
-        fields = [
-            ['Name', d.name || '—'],
-            ['Shape', ak],
-            ['Center', (d.lat != null ? d.lat.toFixed(3) : '—') + ', ' + (d.lon != null ? d.lon.toFixed(3) : '—')],
-            ['Last sweep', ls ? ago(ls.taken_at * 1000) + ' ago (' + ls.total + ' items)' : 'never — run intel-collector --sources aoi', ls ? '' : 'high']
-        ];
-        if (ls) { Object.keys(ls.counts).sort().forEach(function(k) { fields.push([k.replace(/_/g, ' '), String(ls.counts[k])]); }); }
     } else if (type === 'pipeline') {
         title = d.name || 'Pipeline';
         subtitle = d.route || '';

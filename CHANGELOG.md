@@ -61,6 +61,16 @@ Cross-border migration and a fix to the displacement summary.
   `intel_country_signals` can join displacement with the conflict sources;
   that join had no displacement input before.
 
+### Fixed: dashboard AOI detail
+- Clicking an AOI on the map opened an empty detail panel (label only,
+  since 0.10.0): the click called `showDetail`, but the AOI branch lived in
+  `showDrawerDetail`, which AOIs never reach. The branch now sits in
+  `showDetail`; circle, polygon and corridor AOIs show name, shape,
+  centre and last-sweep counts. `test_dashboard_detail_routing.py` checks
+  that every dispatched type has a branch in the renderer it reaches.
+  Same defect, not yet fixed: map clicks on pipelines and trade routes,
+  and UCDP conflict rows in the drawer.
+
 ### Docs
 - README's per-tool reference listed 126 of the 135 tools while every
   headline count said 135: the 5 newer AOI tools, `intel_bgp_status`,
