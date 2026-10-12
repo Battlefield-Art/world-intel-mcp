@@ -639,8 +639,8 @@ suite, and a live MCP stdio session.
 | Tool parity | 139 / 139 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
-| Tests in repo | 987 | 969 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 969 passed, 18 deselected); full suite requires `.[dev]` |
-| Statement coverage | 92% | Measured 2026-10-12 full-suite `--cov` (91.81%); 91.65% on 2026-10-11; 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
+| Tests in repo | 991 | 973 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 973 passed, 18 deselected); full suite requires `.[dev]` |
+| Statement coverage | 92% | Measured 2026-10-12 full-suite `--cov` (92.02%); 91.65% on 2026-10-11; 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
 | Primary remaining gaps | `cli.py` tests, coverage gate, `server.py` refactor | See Planned Phases 23-26 |
 
 **Bottom line (2026-10-11)**: 139 tools across 30+ domains; Phases 27-28 added aircraft-cohort early warning and cross-border migration. **Earlier (2026-09-02)**: 122 tools across 30+ domains, with the roadmap aligned to the live MCP registry and, for the first time, a forward-looking plan (Phases 23-26): geofence depth, the coverage gate, missing domains, and `server.py` modularization.

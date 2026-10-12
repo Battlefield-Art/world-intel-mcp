@@ -1719,7 +1719,11 @@ function updateMapConflict(data) {
         if (fat > 0) tip += ' (' + fat + ' fatal)';
         else if (e.severity) tip += ' [' + e.severity + ']';
         mk.bindTooltip(tip, { className: 'mk-tip', direction: 'top', offset: [0, -size/2] });
-        mk.on('click', function() { showDetail('conflict', e); });
+        // UCDP events carry best/low/high and side_a/side_b, not the ACLED/hotspot shape showDetail reads.
+        mk.on('click', function() {
+            if (data.source === 'ucdp') showDrawerDetail(_storeItem('ucdp_event', e));
+            else showDetail('conflict', e);
+        });
         mk.addTo(mapLayers.conflict);
     });
 }

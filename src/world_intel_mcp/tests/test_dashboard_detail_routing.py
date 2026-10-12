@@ -58,3 +58,19 @@ def test_every_drawer_item_type_has_a_show_drawer_detail_branch() -> None:
     handled = _branch_types(_function_body(src, "function showDrawerDetail(id) {"))
     assert stored, "no drawer items found; the extraction regex is stale"
     assert stored - handled == set()
+
+
+def test_map_conflict_click_routes_ucdp_events_to_the_ucdp_renderer() -> None:
+    """The map's conflict layer draws ACLED, UCDP or hotspot events, but
+    showDetail's conflict branch reads the ACLED/hotspot shape (fatalities,
+    event_type, actor1/2); a UCDP event there showed 0 deaths under a
+    generic title. UCDP (``source: 'ucdp'``) must reach ``ucdp_event``."""
+    src = _INDEX.read_text()
+    body = _function_body(src, "function updateMapConflict(data) {")
+    assert re.search(
+        r"if \(data\.source === 'ucdp'\) showDrawerDetail\(_storeItem\('ucdp_event', e\)\);"
+        r"\s*else showDetail\('conflict', e\);",
+        body,
+    ), "map conflict click does not route UCDP events to the ucdp_event renderer"
+    drawer = _function_body(src, "function showDrawerDetail(id) {")
+    assert "type === 'ucdp_event'" in drawer

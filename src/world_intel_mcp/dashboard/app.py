@@ -122,6 +122,62 @@ def _open_aoi_store() -> AOIStore:
 # ---------------------------------------------------------------------------
 
 
+def _conflict_zones_fallback(acled: dict | None, ucdp: dict | None) -> dict | None:
+    """Static hotspot events for the conflict layer when neither ACLED nor
+    UCDP has data (error or zero events), else ``None``.
+
+    Shared by ``/api/overview`` and ``/api/stream`` so both deliver the
+    same fallback; before it was shared, the stream never sent one and the
+    page's conflict layer and drawer section stayed empty."""
+    acled = acled or {}
+    ucdp = ucdp or {}
+    acled_ok = not acled.get("error") and (acled.get("count") or 0) > 0
+    ucdp_ok = not ucdp.get("error") and (ucdp.get("count") or 0) > 0
+    if acled_ok or ucdp_ok:
+        return None
+    escalation_labels = {
+        1: "low",
+        2: "low",
+        3: "moderate",
+        4: "high",
+        5: "critical",
+    }
+    # Map ISO codes to country names for richer display
+    _iso_names = {c: info["name"] for c, info in TIER1_COUNTRIES.items()}
+    hotspot_events = []
+    for name, h in INTEL_HOTSPOTS.items():
+        assoc = h.get("associated_countries", [])
+        country_name = _iso_names.get(assoc[0], "") if assoc else ""
+        actors = [_iso_names.get(c, c) for c in assoc]
+        esc = h["baseline_escalation"]
+        hotspot_events.append(
+            {
+                "latitude": h["lat"],
+                "longitude": h["lon"],
+                "country": country_name or name.replace("_", " ").title(),
+                "location": name.replace("_", " ").title(),
+                "event_type": "Active Hotspot",
+                "type_of_violence_label": "active hotspot",
+                "fatalities": 0,
+                "best": 0,
+                "escalation": esc,
+                "severity": escalation_labels.get(esc, "unknown"),
+                "event_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "actor1": actors[0] if len(actors) > 0 else "\u2014",
+                "actor2": actors[1] if len(actors) > 1 else "\u2014",
+                "source": "Intel Hotspot Database",
+                "notes": f"Escalation level {esc}/5 ({escalation_labels.get(esc, 'unknown')}). "
+                f"Monitored hotspot involving {', '.join(actors)}.",
+                "associated_countries": assoc,
+            }
+        )
+    return {
+        "events": hotspot_events,
+        "count": len(hotspot_events),
+        "source": "intel-hotspots",
+    }
+
+
 async def _fetch_overview() -> dict:
     """Fetch all dashboard domains in parallel, return unified dict."""
     fetcher = _ensure_fetcher()
@@ -209,52 +265,11 @@ async def _fetch_overview() -> dict:
 
     # Conflict zone fallback: when both ACLED and UCDP fail, provide
     # static hotspot data so the conflict layer is never empty.
-    acled = result.get("acled_events", {})
-    ucdp = result.get("ucdp_events", {})
-    acled_ok = not acled.get("error") and (acled.get("count") or 0) > 0
-    ucdp_ok = not ucdp.get("error") and (ucdp.get("count") or 0) > 0
-    if not acled_ok and not ucdp_ok:
-        escalation_labels = {
-            1: "low",
-            2: "low",
-            3: "moderate",
-            4: "high",
-            5: "critical",
-        }
-        # Map ISO codes to country names for richer display
-        _iso_names = {c: info["name"] for c, info in TIER1_COUNTRIES.items()}
-        hotspot_events = []
-        for name, h in INTEL_HOTSPOTS.items():
-            assoc = h.get("associated_countries", [])
-            country_name = _iso_names.get(assoc[0], "") if assoc else ""
-            actors = [_iso_names.get(c, c) for c in assoc]
-            esc = h["baseline_escalation"]
-            hotspot_events.append(
-                {
-                    "latitude": h["lat"],
-                    "longitude": h["lon"],
-                    "country": country_name or name.replace("_", " ").title(),
-                    "location": name.replace("_", " ").title(),
-                    "event_type": "Active Hotspot",
-                    "type_of_violence_label": "active hotspot",
-                    "fatalities": 0,
-                    "best": 0,
-                    "escalation": esc,
-                    "severity": escalation_labels.get(esc, "unknown"),
-                    "event_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    "actor1": actors[0] if len(actors) > 0 else "\u2014",
-                    "actor2": actors[1] if len(actors) > 1 else "\u2014",
-                    "source": "Intel Hotspot Database",
-                    "notes": f"Escalation level {esc}/5 ({escalation_labels.get(esc, 'unknown')}). "
-                    f"Monitored hotspot involving {', '.join(actors)}.",
-                    "associated_countries": assoc,
-                }
-            )
-        result["conflict_zones"] = {
-            "events": hotspot_events,
-            "count": len(hotspot_events),
-            "source": "intel-hotspots",
-        }
+    zones = _conflict_zones_fallback(
+        result.get("acled_events", {}), result.get("ucdp_events", {})
+    )
+    if zones is not None:
+        result["conflict_zones"] = zones
 
     # Static geospatial datasets (no API calls)
     result["military_bases"] = {"bases": MILITARY_BASES, "count": len(MILITARY_BASES)}
@@ -326,6 +341,90 @@ async def api_overview(request):
     return JSONResponse(data, headers={"Access-Control-Allow-Origin": "*"})
 
 
+_CONFLICT_FEEDS = ("acled_events", "ucdp_events")
+
+
+def _stream_source_defs(fetcher: Fetcher) -> dict:
+    """Source name -> zero-arg coroutine factory for one /api/stream tick."""
+    return {
+        "market_quotes": lambda: markets.fetch_market_quotes(fetcher),
+        "crypto_quotes": lambda: markets.fetch_crypto_quotes(fetcher),
+        "macro_signals": lambda: markets.fetch_macro_signals(fetcher),
+        "sector_heatmap": lambda: markets.fetch_sector_heatmap(fetcher),
+        "earthquakes": lambda: seismology.fetch_earthquakes(fetcher),
+        "military_flights": lambda: military.fetch_military_flights(
+            fetcher
+        ),
+        "cyber_threats": lambda: cyber.fetch_cyber_threats(fetcher),
+        "news_feed": lambda: news.fetch_news_feed(fetcher),
+        "trending_keywords": lambda: news.fetch_trending_keywords(fetcher),
+        "nav_warnings": lambda: maritime.fetch_nav_warnings(fetcher),
+        "internet_outages": lambda: infrastructure.fetch_internet_outages(
+            fetcher
+        ),
+        "cable_health": lambda: infrastructure.fetch_cable_health(fetcher),
+        "wildfires": lambda: wildfire.fetch_wildfires(fetcher),
+        "prediction_markets": lambda: prediction.fetch_prediction_markets(
+            fetcher
+        ),
+        "airport_delays": lambda: aviation.fetch_airport_delays(fetcher),
+        "climate_anomalies": lambda: climate.fetch_climate_anomalies(
+            fetcher
+        ),
+        "energy_prices": lambda: economic.fetch_energy_prices(fetcher),
+        "gas_prices": lambda: economic.fetch_gas_prices(fetcher),
+        "residential_natgas": lambda: economic.fetch_residential_natgas_prices(
+            fetcher
+        ),
+        "electricity_rates": lambda: economic.fetch_electricity_rates(
+            fetcher
+        ),
+        "stablecoin_status": lambda: markets.fetch_stablecoin_status(
+            fetcher
+        ),
+        "etf_flows": lambda: markets.fetch_etf_flows(fetcher),
+        "acled_events": lambda: conflict.fetch_acled_events(fetcher),
+        "ucdp_events": lambda: conflict.fetch_ucdp_events(fetcher),
+        "displacement": lambda: displacement.fetch_displacement_summary(
+            fetcher
+        ),
+        "risk_scores": lambda: intelligence.fetch_risk_scores(fetcher),
+        "signal_convergence": lambda: intelligence.fetch_signal_convergence(
+            fetcher
+        ),
+        "space_weather": lambda: space_weather.fetch_space_weather(fetcher),
+        "ai_watch": lambda: ai_watch.fetch_ai_watch(fetcher),
+        "disease_outbreaks": lambda: health.fetch_disease_outbreaks(
+            fetcher
+        ),
+        "election_calendar": lambda: elections.fetch_election_calendar(
+            fetcher
+        ),
+        "shipping_index": lambda: shipping.fetch_shipping_index(fetcher),
+        "social_signals": lambda: social.fetch_social_signals(fetcher),
+        "nuclear_monitor": lambda: nuclear.fetch_nuclear_monitor(fetcher),
+        "alert_digest": lambda: fetch_alert_digest(fetcher),
+        "weekly_trends": lambda: fetch_weekly_trends(fetcher),
+        "service_status": lambda: service_status.fetch_service_status(
+            fetcher
+        ),
+        "strategic_posture": lambda: fetch_strategic_posture(fetcher),
+        "fleet_report": lambda: fetch_fleet_report(fetcher),
+        "usni_fleet": lambda: fetch_usni_fleet(fetcher),
+        "population_exposure": lambda: fetch_population_exposure(fetcher),
+        "domestic_flights": lambda: aviation.fetch_domestic_flights(
+            fetcher
+        ),
+        "traffic_flow": lambda: traffic.fetch_traffic_flow(fetcher),
+        "traffic_incidents": lambda: traffic.fetch_traffic_incidents(
+            fetcher
+        ),
+        "webcams": lambda: webcams.fetch_webcams(fetcher),
+        "btc_technicals": lambda: markets.fetch_btc_technicals(fetcher),
+        "central_bank_rates": lambda: fetch_central_bank_rates(fetcher),
+    }
+
+
 async def api_stream(request):
     """SSE endpoint — progressive: emits each source as it completes."""
 
@@ -335,83 +434,7 @@ async def api_stream(request):
                 fetcher = _ensure_fetcher()
 
                 # Sources to fetch, grouped so fast ones arrive first
-                source_defs = {
-                    "market_quotes": lambda: markets.fetch_market_quotes(fetcher),
-                    "crypto_quotes": lambda: markets.fetch_crypto_quotes(fetcher),
-                    "macro_signals": lambda: markets.fetch_macro_signals(fetcher),
-                    "sector_heatmap": lambda: markets.fetch_sector_heatmap(fetcher),
-                    "earthquakes": lambda: seismology.fetch_earthquakes(fetcher),
-                    "military_flights": lambda: military.fetch_military_flights(
-                        fetcher
-                    ),
-                    "cyber_threats": lambda: cyber.fetch_cyber_threats(fetcher),
-                    "news_feed": lambda: news.fetch_news_feed(fetcher),
-                    "trending_keywords": lambda: news.fetch_trending_keywords(fetcher),
-                    "nav_warnings": lambda: maritime.fetch_nav_warnings(fetcher),
-                    "internet_outages": lambda: infrastructure.fetch_internet_outages(
-                        fetcher
-                    ),
-                    "cable_health": lambda: infrastructure.fetch_cable_health(fetcher),
-                    "wildfires": lambda: wildfire.fetch_wildfires(fetcher),
-                    "prediction_markets": lambda: prediction.fetch_prediction_markets(
-                        fetcher
-                    ),
-                    "airport_delays": lambda: aviation.fetch_airport_delays(fetcher),
-                    "climate_anomalies": lambda: climate.fetch_climate_anomalies(
-                        fetcher
-                    ),
-                    "energy_prices": lambda: economic.fetch_energy_prices(fetcher),
-                    "gas_prices": lambda: economic.fetch_gas_prices(fetcher),
-                    "residential_natgas": lambda: economic.fetch_residential_natgas_prices(
-                        fetcher
-                    ),
-                    "electricity_rates": lambda: economic.fetch_electricity_rates(
-                        fetcher
-                    ),
-                    "stablecoin_status": lambda: markets.fetch_stablecoin_status(
-                        fetcher
-                    ),
-                    "etf_flows": lambda: markets.fetch_etf_flows(fetcher),
-                    "acled_events": lambda: conflict.fetch_acled_events(fetcher),
-                    "ucdp_events": lambda: conflict.fetch_ucdp_events(fetcher),
-                    "displacement": lambda: displacement.fetch_displacement_summary(
-                        fetcher
-                    ),
-                    "risk_scores": lambda: intelligence.fetch_risk_scores(fetcher),
-                    "signal_convergence": lambda: intelligence.fetch_signal_convergence(
-                        fetcher
-                    ),
-                    "space_weather": lambda: space_weather.fetch_space_weather(fetcher),
-                    "ai_watch": lambda: ai_watch.fetch_ai_watch(fetcher),
-                    "disease_outbreaks": lambda: health.fetch_disease_outbreaks(
-                        fetcher
-                    ),
-                    "election_calendar": lambda: elections.fetch_election_calendar(
-                        fetcher
-                    ),
-                    "shipping_index": lambda: shipping.fetch_shipping_index(fetcher),
-                    "social_signals": lambda: social.fetch_social_signals(fetcher),
-                    "nuclear_monitor": lambda: nuclear.fetch_nuclear_monitor(fetcher),
-                    "alert_digest": lambda: fetch_alert_digest(fetcher),
-                    "weekly_trends": lambda: fetch_weekly_trends(fetcher),
-                    "service_status": lambda: service_status.fetch_service_status(
-                        fetcher
-                    ),
-                    "strategic_posture": lambda: fetch_strategic_posture(fetcher),
-                    "fleet_report": lambda: fetch_fleet_report(fetcher),
-                    "usni_fleet": lambda: fetch_usni_fleet(fetcher),
-                    "population_exposure": lambda: fetch_population_exposure(fetcher),
-                    "domestic_flights": lambda: aviation.fetch_domestic_flights(
-                        fetcher
-                    ),
-                    "traffic_flow": lambda: traffic.fetch_traffic_flow(fetcher),
-                    "traffic_incidents": lambda: traffic.fetch_traffic_incidents(
-                        fetcher
-                    ),
-                    "webcams": lambda: webcams.fetch_webcams(fetcher),
-                    "btc_technicals": lambda: markets.fetch_btc_technicals(fetcher),
-                    "central_bank_rates": lambda: fetch_central_bank_rates(fetcher),
-                }
+                source_defs = _stream_source_defs(fetcher)
 
                 _SLOW = {
                     "news_feed",
@@ -439,6 +462,7 @@ async def api_stream(request):
                 ]
                 total = len(tasks)
                 completed = 0
+                conflict_seen: dict = {}
 
                 # Yield each result as it arrives
                 while completed < total:
@@ -459,6 +483,26 @@ async def api_stream(request):
                         default=str,
                     )
                     yield f"data: {payload}\n\n"
+                    # Once both conflict feeds are in, send the same fallback
+                    # /api/overview builds (or null, so a recovered feed clears
+                    # a stale fallback in the page's accumulated state).
+                    if name in _CONFLICT_FEEDS:
+                        conflict_seen[name] = data
+                        if len(conflict_seen) == len(_CONFLICT_FEEDS):
+                            zones = _conflict_zones_fallback(
+                                conflict_seen["acled_events"],
+                                conflict_seen["ucdp_events"],
+                            )
+                            payload = json.dumps(
+                                {
+                                    "_progressive": True,
+                                    "_done": completed,
+                                    "_total": total,
+                                    "conflict_zones": zones,
+                                },
+                                default=str,
+                            )
+                            yield f"data: {payload}\n\n"
 
                 # Final event with metadata
                 meta = {

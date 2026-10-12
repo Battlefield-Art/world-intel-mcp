@@ -77,8 +77,16 @@ displacement summary and the dashboard AOI detail panel. Tools 132 -> 139.
   of the first 12 keys under a JSON title. UCDP rows now show both sides,
   violence type, deaths (best and low-high), dates, coordinates, headline,
   source and UCDP id; conflict-zone rows use the map's conflict renderer.
+- UCDP events on the map's conflict layer opened the ACLED-shaped panel:
+  "Conflict Event", 0 fatalities, no dates. They now open the UCDP panel.
+- The conflict-zone hotspot fallback (used when ACLED and UCDP both have no
+  events) was built only by `/api/overview`, which the page never calls,
+  so with no conflict feed the map layer and the drawer's "Active Conflict
+  Zones" section stayed empty. `/api/stream` now sends it from the same
+  builder once both feeds report, or `null` when one has events.
 - `test_dashboard_detail_routing.py` fails if any dispatched type lacks a
-  branch in the renderer it reaches.
+  branch in the renderer it reaches, or if UCDP map clicks miss the UCDP
+  renderer; `test_dashboard_stream_conflict.py` drives one stream tick.
 
 ### Docs
 - README's per-tool reference listed 126 of the 135 tools while every
