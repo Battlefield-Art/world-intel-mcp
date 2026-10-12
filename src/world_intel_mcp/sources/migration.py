@@ -398,6 +398,9 @@ async def fetch_migration_surges(
         for (o, _d), e in table.items():
             a = origins.setdefault(o, {"origin_name": e["origin_name"], "now": 0, "was": 0})
             a["now" if sign == 1 else "was"] += e["people"]
+    # A country with only internal displacement has no corridor rows; it still belongs here.
+    for o in set(idp_cur) | set(idp_prev):
+        origins.setdefault(o, {"origin_name": None, "now": 0, "was": 0})
     origin_changes, unattributed = [], []
     for o, a in origins.items():
         delta = a["now"] - a["was"]
@@ -410,6 +413,8 @@ async def fetch_migration_surges(
             "origin": _name(o, a["origin_name"], countries), "origin_iso3": o,
             "people_abroad": a["now"], "prior_year_people_abroad": a["was"], "change_abroad": delta,
             "idps": idp_cur.get(o, 0), "change_idps": idp_delta,
+            # No IDP figure the year before: the jump may be a first report, not new displacement.
+            "idps_first_reported": idp_cur.get(o, 0) > 0 and idp_prev.get(o, 0) == 0,
             "population": pop,
             "change_abroad_pct_of_population": round(100.0 * delta / pop, 2) if pop else None,
             "level": _surge_level(delta, pop) if delta >= min_change else None,

@@ -49,6 +49,7 @@ from .sources import (
     intelligence,
     prediction,
     displacement,
+    migration,
     aviation,
     cyber,
     shipping,
@@ -927,6 +928,255 @@ def displacement_cmd(ctx: click.Context, year: int | None) -> None:
             f"{c.get('internally_displaced', 0):,}",
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+
+def _signed(value: Any) -> str:
+    return "n/a" if value is None else f"{value:+,}"
+
+
+@main.command(name="migration-flows")
+@click.option("--year", "-y", default=None, type=int, help="Reporting year (default: latest)")
+@click.option("--origin", "-o", default=None, help="Origin country, ISO3 code or region")
+@click.option("--destination", "-d", default=None, help="Destination country, ISO3 code or region")
+@click.option("--limit", "-n", default=25, help="Max corridors")
+@click.option("--min-people", default=0, help="Skip corridors smaller than this")
+@click.pass_context
+def migration_flows_cmd(
+    ctx: click.Context,
+    year: int | None,
+    origin: str | None,
+    destination: str | None,
+    limit: int,
+    min_people: int,
+) -> None:
+    """Largest UNHCR origin -> destination corridors (year-end stocks)."""
+    f = _get_fetcher()
+    data = _run(
+        migration.fetch_migration_flows(
+            f, year=year, origin=origin, destination=destination,
+            limit=limit, min_people=min_people,
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    filters = [
+        f"{label} {escape(sel['name'])}"
+        for label, sel in (("from", data.get("origin_filter")), ("to", data.get("destination_filter")))
+        if sel
+    ]
+    console.print(
+        f"[bold]Displacement corridors ({data.get('year', '?')})[/bold]"
+        + (f" {' '.join(filters)}" if filters else "")
+    )
+    console.print(
+        f"  {data.get('corridor_count', 0):,} corridors, "
+        f"{data.get('total_people', 0):,} people\n"
+    )
+    table = Table(title="Corridors", box=box.SIMPLE_HEAVY)
+    table.add_column("Origin", style="bold")
+    table.add_column("Destination")
+    table.add_column("People", justify="right")
+    table.add_column("Change vs prior year", justify="right")
+    for c in data.get("corridors", []):
+        table.add_row(
+            _cell(c.get("origin", "")),
+            _cell(c.get("destination", "")),
+            f"{c.get('people', 0):,}",
+            _signed(c.get("change")),
+        )
+    console.print(table)
+
+
+@main.command(name="migration-surges")
+@click.option("--year", "-y", default=None, type=int, help="Reporting year (default: latest)")
+@click.option("--min-change", default=50_000, help="Smallest year-over-year change to report")
+@click.option("--limit", "-n", default=20, help="Max rows per ranking")
+@click.pass_context
+def migration_surges_cmd(
+    ctx: click.Context, year: int | None, min_change: int, limit: int
+) -> None:
+    """Year-over-year jumps in people displaced from each origin."""
+    f = _get_fetcher()
+    data = _run(
+        migration.fetch_migration_surges(f, year=year, min_change=min_change, limit=limit)
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    console.print(
+        f"[bold]Displacement surges {data.get('compared_with', '?')} -> "
+        f"{data.get('year', '?')}[/bold] (min change {data.get('min_change', 0):,})\n"
+    )
+    for key, title in (
+        ("origin_outflow_increases", "Rising outflows by origin"),
+        ("origin_outflow_decreases", "Falling outflows by origin"),
+    ):
+        table = Table(title=title, box=box.SIMPLE_HEAVY)
+        table.add_column("Origin", style="bold")
+        table.add_column("People abroad", justify="right")
+        table.add_column("Change", justify="right")
+        table.add_column("% of pop.", justify="right")
+        table.add_column("Level")
+        for o in data.get(key, []):
+            pct = o.get("change_abroad_pct_of_population")
+            table.add_row(
+                _cell(o.get("origin", "")),
+                f"{o.get('people_abroad', 0):,}",
+                _signed(o.get("change_abroad")),
+                "n/a" if pct is None else f"{pct:+.2f}%",
+                o.get("level") or "",
+            )
+        console.print(table)
+
+    idps = data.get("internal_displacement_increases", [])
+    if idps:
+        table = Table(title="Rising internal displacement", box=box.SIMPLE_HEAVY)
+        table.add_column("Country", style="bold")
+        table.add_column("IDPs", justify="right")
+        table.add_column("Change", justify="right")
+        table.add_column("Note")
+        for o in idps:
+            table.add_row(
+                _cell(o.get("origin", "")), f"{o.get('idps', 0):,}", _signed(o.get("change_idps")),
+                "none reported prior year" if o.get("idps_first_reported") else "",
+            )
+        console.print(table)
+
+    table = Table(title="Rising corridors", box=box.SIMPLE_HEAVY)
+    table.add_column("Origin", style="bold")
+    table.add_column("Destination")
+    table.add_column("People", justify="right")
+    table.add_column("Change", justify="right")
+    for c in data.get("corridor_increases", []):
+        table.add_row(
+            _cell(c.get("origin", "")), _cell(c.get("destination", "")),
+            f"{c.get('people', 0):,}", _signed(c.get("change")),
+        )
+    console.print(table)
+
+    for o in data.get("unattributed_origin_changes", []):
+        console.print(
+            f"  [dim]Not ranked: {escape(str(o.get('origin', '')))} "
+            f"{_signed(o.get('change_abroad'))} (not a country; often a host reporting change)[/dim]"
+        )
+    console.print(f"[dim]Levels are {escape(data.get('levels', {}).get('basis', 'heuristic'))}.[/dim]")
+
+
+@main.command(name="migration-history")
+@click.argument("country")
+@click.option(
+    "--role", "-r", type=click.Choice(["origin", "host"]), default="origin",
+    help="origin = people from the country; host = people it hosts",
+)
+@click.option("--from", "year_from", default=1951, help="First year")
+@click.option("--to", "year_to", default=None, type=int, help="Last year")
+@click.pass_context
+def migration_history_cmd(
+    ctx: click.Context, country: str, role: str, year_from: int, year_to: int | None
+) -> None:
+    """One country's UNHCR displacement series and its largest waves."""
+    f = _get_fetcher()
+    data = _run(
+        migration.fetch_migration_history(
+            f, country=country, role=role, year_from=year_from, year_to=year_to
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    console.print(
+        f"[bold]{escape(str(data.get('country', country)))} as {role}[/bold]: "
+        f"{escape(str(data.get('meaning', '')))}"
+    )
+    peak, latest = data.get("peak"), data.get("latest")
+    if latest:
+        idps = f", {latest.get('idps', 0):,} IDPs" if role == "origin" else ""
+        console.print(f"  Latest {latest.get('year')}: {latest.get('people', 0):,} people{idps}")
+    if peak:
+        console.print(f"  Peak {peak.get('year')}: {peak.get('people', 0):,} people")
+    console.print(f"  {data.get('years', 0)} years of data since {data.get('first_year', '?')}\n")
+
+    table = Table(title="Largest waves", box=box.SIMPLE_HEAVY)
+    table.add_column("Year", style="bold")
+    table.add_column("People", justify="right")
+    table.add_column("Increase", justify="right")
+    table.add_column("% change", justify="right")
+    for w in data.get("largest_waves", []):
+        pct = w.get("pct_change")
+        table.add_row(
+            str(w.get("year", "")), f"{w.get('people', 0):,}", _signed(w.get("increase")),
+            "n/a" if pct is None else f"{pct:+.1f}%",
+        )
+    console.print(table)
+
+
+@main.command(name="net-migration")
+@click.option("--country", "-c", default=None, help="One country: its series since 1960")
+@click.option("--region", "-r", default=None, help="World Bank region code or name")
+@click.option("--limit", "-n", default=20, help="Max rows per ranking")
+@click.pass_context
+def net_migration_cmd(
+    ctx: click.Context, country: str | None, region: str | None, limit: int
+) -> None:
+    """World Bank net migration, all reasons (immigrants minus emigrants)."""
+    f = _get_fetcher()
+    data = _run(
+        migration.fetch_net_migration(f, country=country, region=region, limit=limit)
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    if country:
+        latest = data.get("latest") or {}
+        console.print(
+            f"[bold]Net migration: {escape(str(data.get('country', country)))}[/bold] "
+            f"({escape(str(data.get('region', '')))})"
+        )
+        if latest:
+            console.print(
+                f"  Latest {latest.get('year')}: {_signed(latest.get('net_migration'))}"
+                f" ({latest.get('per_1000')} per 1,000)\n"
+            )
+        for key, title in (
+            ("largest_net_inflow_years", "Largest net inflow years"),
+            ("largest_net_outflow_years", "Largest net outflow years"),
+        ):
+            table = Table(title=title, box=box.SIMPLE_HEAVY)
+            table.add_column("Year", style="bold")
+            table.add_column("Net migration", justify="right")
+            table.add_column("Per 1,000", justify="right")
+            for e in data.get(key, []):
+                table.add_row(
+                    str(e.get("year", "")), _signed(e.get("net_migration")),
+                    "n/a" if e.get("per_1000") is None else f"{e['per_1000']:+.2f}",
+                )
+            console.print(table)
+    else:
+        scope = escape(str(data.get("region_filter") or "all countries"))
+        console.print(f"[bold]Net migration, latest year ({scope})[/bold]\n")
+        for key, title in (
+            ("top_net_immigration", "Largest net immigration"),
+            ("top_net_emigration", "Largest net emigration"),
+        ):
+            table = Table(title=title, box=box.SIMPLE_HEAVY)
+            table.add_column("Country", style="bold")
+            table.add_column("Year", justify="right")
+            table.add_column("Net migration", justify="right")
+            table.add_column("Per 1,000", justify="right")
+            for r in data.get(key, []):
+                table.add_row(
+                    _cell(r.get("name", "")), str(r.get("year", "")),
+                    _signed(r.get("net_migration")),
+                    "n/a" if r.get("per_1000") is None else f"{r['per_1000']:+.2f}",
+                )
+            console.print(table)
+    console.print("[dim]Source: UN WPP via World Bank; recent years can be projections.[/dim]")
 
 
 # ---------------------------------------------------------------------------

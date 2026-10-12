@@ -98,6 +98,10 @@ def test_command_registry() -> None:
         "gdelt",
         "predictions",
         "displacement",
+        "migration-flows",
+        "migration-surges",
+        "migration-history",
+        "net-migration",
         "delays",
         "threats",
         "brief",
@@ -134,7 +138,7 @@ def test_command_registry() -> None:
     # `_cmd` suffix when deriving default command names, so the
     # user-facing name still comes out right.
     assert "webcams" in names
-    assert len(names) == 54
+    assert len(names) == 58
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +956,126 @@ def test_displacement_outage_shape_bails_not_zero_totals(
     assert result.exit_code == 0
     assert "UNHCR API unavailable" in result.output
     assert "Grand total: 0" not in result.output
+
+
+def test_migration_flows_passes_filters_and_renders_corridors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    payload = {
+        "year": 2025,
+        "origin_filter": {"kind": "country", "name": "Sudan"},
+        "destination_filter": None,
+        "total_people": 1_334_595,
+        "corridor_count": 1,
+        "corridors": [
+            {"origin": "Sudan", "destination": "Chad", "people": 1_334_595, "change": 222_134},
+        ],
+    }
+    monkeypatch.setattr(cli.migration, "fetch_migration_flows", _fake(payload, calls))
+    result = _invoke("migration-flows", "-o", "SDN", "-y", "2025", "-n", "5", "--min-people", "1000")
+    assert result.exit_code == 0
+    assert calls == [{"year": 2025, "origin": "SDN", "destination": None, "limit": 5, "min_people": 1000}]
+    assert "Displacement corridors (2025) from Sudan" in result.output
+    assert "Chad" in result.output
+    assert "1,334,595" in result.output
+    assert "+222,134" in result.output
+
+
+def test_migration_flows_unknown_prior_year_is_not_zero_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # change=None means UNHCR had no prior year to compare; rendering "+0"
+    # would claim a measured standstill.
+    payload = {"year": 2025, "total_people": 10, "corridor_count": 1,
+               "corridors": [{"origin": "A", "destination": "B", "people": 10, "change": None}]}
+    monkeypatch.setattr(cli.migration, "fetch_migration_flows", _fake(payload))
+    result = _invoke("migration-flows")
+    assert "n/a" in result.output
+    assert "+0" not in result.output
+
+
+def test_migration_surges_renders_levels_flags_and_unranked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    payload = {
+        "year": 2025, "compared_with": 2024, "min_change": 100_000,
+        "origin_outflow_increases": [
+            {"origin": "Sudan", "people_abroad": 3_761_034, "change_abroad": 984_126,
+             "change_abroad_pct_of_population": 1.9, "level": "mass"},
+        ],
+        "origin_outflow_decreases": [
+            {"origin": "Afghanistan", "people_abroad": 3_972_525, "change_abroad": -2_178_793,
+             "change_abroad_pct_of_population": -4.97, "level": None},
+        ],
+        "internal_displacement_increases": [
+            {"origin": "Guatemala", "idps": 573_000, "change_idps": 573_000, "idps_first_reported": True},
+        ],
+        "corridor_increases": [
+            {"origin": "Sudan", "destination": "Libya", "people": 639_166, "change": 383_518},
+        ],
+        "unattributed_origin_changes": [{"origin": "Unknown", "change_abroad": 1_548_961}],
+        "levels": {"basis": "heuristic thresholds of this tool"},
+    }
+    monkeypatch.setattr(cli.migration, "fetch_migration_surges", _fake(payload, calls))
+    result = _invoke("migration-surges", "--min-change", "100000", "-n", "3")
+    assert result.exit_code == 0
+    assert calls == [{"year": None, "min_change": 100_000, "limit": 3}]
+    assert "2024 -> 2025" in result.output
+    assert "+984,126" in result.output and "mass" in result.output
+    assert "-2,178,793" in result.output
+    assert "none reported prior year" in result.output
+    assert "Libya" in result.output
+    assert "Not ranked: Unknown" in result.output
+
+
+def test_migration_history_passes_role_and_renders_waves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    payload = {
+        "country": "Syrian Arab Rep.", "role": "origin", "meaning": "people FROM this country",
+        "years": 4, "first_year": 2011,
+        "latest": {"year": 2014, "people": 3_887_000, "idps": 7_600_000},
+        "peak": {"year": 2014, "people": 3_887_000},
+        "largest_waves": [{"year": 2013, "people": 2_400_000, "increase": 1_671_000, "pct_change": 229.2}],
+    }
+    monkeypatch.setattr(cli.migration, "fetch_migration_history", _fake(payload, calls))
+    result = _invoke("migration-history", "Syria", "--from", "2011", "--to", "2014")
+    assert result.exit_code == 0
+    assert calls == [{"country": "Syria", "role": "origin", "year_from": 2011, "year_to": 2014}]
+    assert "7,600,000 IDPs" in result.output
+    assert "Peak 2014: 3,887,000" in result.output
+    assert "+1,671,000" in result.output
+    assert "+229.2%" in result.output
+
+
+def test_net_migration_ranking_and_country_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+    ranking = {
+        "region_filter": None,
+        "top_net_immigration": [{"name": "Germany", "year": 2024, "net_migration": 700_000, "per_1000": 8.4}],
+        "top_net_emigration": [{"name": "Chad", "year": 2024, "net_migration": -120_000, "per_1000": None}],
+    }
+    monkeypatch.setattr(cli.migration, "fetch_net_migration", _fake(ranking, calls))
+    result = _invoke("net-migration", "-n", "5")
+    assert result.exit_code == 0
+    assert calls == [{"country": None, "region": None, "limit": 5}]
+    assert "Germany" in result.output and "+700,000" in result.output and "+8.40" in result.output
+    assert "-120,000" in result.output
+
+    series = {
+        "country": "Germany", "region": "Europe & Central Asia",
+        "latest": {"year": 2024, "net_migration": 700_000, "per_1000": 8.4},
+        "largest_net_inflow_years": [{"year": 2015, "net_migration": 1_175_000, "per_1000": 14.33}],
+        "largest_net_outflow_years": [],
+    }
+    monkeypatch.setattr(cli.migration, "fetch_net_migration", _fake(series))
+    result = _invoke("net-migration", "-c", "DEU")
+    assert result.exit_code == 0
+    assert "Net migration: Germany" in result.output
+    assert "+1,175,000" in result.output and "+14.33" in result.output
 
 
 def test_delays_all_clear_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2021,6 +2145,10 @@ _ERROR_SWEEP = [
     (("gdelt",), cli.news, "fetch_gdelt_search"),
     (("predictions",), cli.prediction, "fetch_prediction_markets"),
     (("displacement",), cli.displacement, "fetch_displacement_summary"),
+    (("migration-flows",), cli.migration, "fetch_migration_flows"),
+    (("migration-surges",), cli.migration, "fetch_migration_surges"),
+    (("migration-history", "Sudan"), cli.migration, "fetch_migration_history"),
+    (("net-migration",), cli.migration, "fetch_net_migration"),
     (("delays",), cli.aviation, "fetch_airport_delays"),
     (("threats",), cli.cyber, "fetch_cyber_threats"),
     (("brief",), cli.intelligence, "fetch_country_brief"),

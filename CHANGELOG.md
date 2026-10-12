@@ -24,6 +24,23 @@ Cross-border migration and a fix to the displacement summary.
   absolute and per-1,000 terms with world regions, a World Bank region
   filter, or one country's series since 1960.
 
+### Added: migration in the CLI and collector
+- `intel migration-flows`, `intel migration-surges`, `intel migration-history`
+  and `intel net-migration` render the four tools as tables, with the same
+  error surfacing as every other command. A change with no prior-year
+  figure renders "n/a", never "+0".
+- The collector gains `migration_surges` and `net_migration` (55 sources)
+  and a `migration` domain group (`--sources migration`, which also takes
+  `displacement`).
+
+### Fixed: migration surges
+- A country whose UNHCR rows were all internal (IDPs, nobody abroad) never
+  entered the surge comparison, so its IDP jump was dropped.
+- Internal-displacement rows now carry `idps_first_reported` when the prior
+  year had no IDP figure. Live 2024 -> 2025 ranked Guatemala (+573,000) and
+  Cambodia (+517,555) as IDP surges from a prior figure of 0, which can be
+  a first report rather than new displacement; the CLI labels those rows.
+
 ### Fixed: displacement summary
 - `intel_displacement_summary` never sent UNHCR `coo_all=true`, so UNHCR
   answered with one global row and `by_origin` held a single entry named

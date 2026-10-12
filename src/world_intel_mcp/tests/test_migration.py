@@ -261,6 +261,19 @@ async def test_surges_rank_origins_levels_and_population_share(fetcher: Fetcher,
     assert "heuristic" in result["levels"]["basis"]
 
 
+async def test_surges_flag_idps_with_no_prior_year_figure(fetcher: Fetcher, apis,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    # Live 2024->2025 showed Guatemala +573,000 IDPs from a prior figure of 0: a first
+    # report ranks like a surge unless it is flagged.
+    monkeypatch.setitem(_PAIRS, 2025, [*_PAIRS[2025], _row("COD", "COD", idps=600_000)])
+    result = await migration.fetch_migration_surges(fetcher, year=2025, min_change=50_000)
+    idps = {o["origin_iso3"]: o for o in result["internal_displacement_increases"]}
+    assert idps["COD"]["change_idps"] == 600_000
+    assert idps["COD"]["idps_first_reported"] is True
+    sdn = next(o for o in result["origin_outflow_increases"] if o["origin_iso3"] == "SDN")
+    assert sdn["idps_first_reported"] is False
+
+
 def test_surge_levels() -> None:
     assert migration._surge_level(600_000, None) == "mass"
     assert migration._surge_level(60_000, 5_000_000) == "mass"  # 1.2% of population

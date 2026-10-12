@@ -62,6 +62,10 @@ SOURCES = [
     ("acled_events", "sources.conflict", "fetch_acled_events", {}),
     ("ucdp_events", "sources.conflict", "fetch_ucdp_events", {}),
     ("displacement", "sources.displacement", "fetch_displacement_summary", {}),
+    # Migration (2): UNHCR year-over-year surges and World Bank net migration.
+    # Both are annual series; the fetcher cache keeps repeat cycles cheap.
+    ("migration_surges", "sources.migration", "fetch_migration_surges", {}),
+    ("net_migration", "sources.migration", "fetch_net_migration", {}),
     # Military (2)
     ("military_flights", "sources.military", "fetch_military_flights", {}),
     # Infrastructure (4)
@@ -152,6 +156,7 @@ DOMAIN_GROUPS = {
         "cyclones",
     ],
     "conflict": ["acled_events", "ucdp_events", "displacement"],
+    "migration": ["displacement", "migration_surges", "net_migration"],
     "military": ["military_flights"],
     "infrastructure": ["internet_outages", "cable_health", "service_status"],
     "maritime": ["nav_warnings"],
