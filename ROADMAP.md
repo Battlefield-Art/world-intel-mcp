@@ -1,7 +1,7 @@
 # World Intel MCP — Feature Parity Roadmap
 
 **Benchmark**: [koala73/worldmonitor](https://github.com/koala73/worldmonitor)
-**Updated**: 2026-10-11 (unreleased since v0.10.0: aircraft-cohort early warning, cross-border migration)
+**Updated**: 2026-10-12 (0.11.0: aircraft-cohort early warning, cross-border migration)
 **Current tools**: 139 (138 intel + 1 status)
 
 ---
@@ -546,9 +546,10 @@ every kind. Fixed in the same change: `intel_displacement_summary` had
 never sent `coo_all=true` and returned one global row. All figures are
 year-end stocks (stated in each response), not crossings.
 
-Open: near-real-time displacement (IOM DTM, HDX HAPI: both need keys),
-regional border-crossing series (Frontex, CBP, UK small boats), a
-dashboard flow map, CLI commands and collector sources for migration.
+Shipped in 0.11.0 with the dashboard corridor map, CLI commands and
+collector sources. Open: near-real-time displacement (IOM DTM, HDX HAPI:
+both need keys) and regional border-crossing series (Frontex, CBP, UK
+small boats).
 
 ---
 
@@ -638,8 +639,8 @@ suite, and a live MCP stdio session.
 | Tool parity | 139 / 139 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
-| Tests in repo | 965 | 947 non-smoke tests + 18 live smoke tests (measured 2026-10-11: `pytest -m 'not smoke'` -> 947 passed, 18 deselected); full suite requires `.[dev]` |
-| Statement coverage | 92% | Measured 2026-10-11 full-suite `--cov` (91.65%); 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
+| Tests in repo | 987 | 969 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 969 passed, 18 deselected); full suite requires `.[dev]` |
+| Statement coverage | 92% | Measured 2026-10-12 full-suite `--cov` (91.81%); 91.65% on 2026-10-11; 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
 | Primary remaining gaps | `cli.py` tests, coverage gate, `server.py` refactor | See Planned Phases 23-26 |
 
 **Bottom line (2026-10-11)**: 139 tools across 30+ domains; Phases 27-28 added aircraft-cohort early warning and cross-border migration. **Earlier (2026-09-02)**: 122 tools across 30+ domains, with the roadmap aligned to the live MCP registry and, for the first time, a forward-looking plan (Phases 23-26): geofence depth, the coverage gate, missing domains, and `server.py` modularization.

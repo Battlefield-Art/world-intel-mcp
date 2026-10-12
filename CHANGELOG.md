@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 - 2026-10-12
 
-Cross-border migration and a fix to the displacement summary.
+Cross-border migration (MCP tools, CLI, collector and a dashboard
+corridor map), aircraft-cohort early warning, and fixes to the
+displacement summary and the dashboard AOI detail panel. Tools 132 -> 139.
 
 ### Added: migration
 - `intel_migration_flows`: every UNHCR origin -> destination corridor for a
@@ -92,12 +94,11 @@ Cross-border migration and a fix to the displacement summary.
   keys), regional border-crossing series, and bilateral economic migration
   flows (only national net totals exist in a keyless API).
 
-
-Aircraft-cohort early warning, approach inspired by
+### Added: aircraft-cohort early warning
+Approach inspired by
 [kylemcdonald/ews](https://github.com/kylemcdonald/ews) (independent
 implementation; no ews code used).
 
-### Added
 - `intel_jet_cohort_snapshot`: live airborne snapshot of the business-jet
   cohort (69 ICAO type designators in one adsb.lol `/v2/type` request) or
   the military cohort (`/v2/mil`), with per-type counts and PIA/LADD
@@ -120,7 +121,7 @@ implementation; no ews code used).
   404 reported distinctly) and an on-disk LRU for heatmaps
   (`WORLD_INTEL_HEATMAP_CACHE_MB`, default 1024).
 
-### Data honesty
+### Data honesty: aircraft cohort
 - Cohort selection bias is gated: only members first seen
   `min_learning_lead_hours` (default 24) before the window count. A fresh
   install answers `warming_up`. A negative lead is allowed for a first
