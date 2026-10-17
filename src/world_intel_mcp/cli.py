@@ -3318,5 +3318,201 @@ def history_revisions(
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 
 
+@history_group.command(name="day")
+@click.argument("day")
+@click.option(
+    "--by",
+    type=click.Choice(["collected", "observed"]),
+    default="collected",
+    show_default=True,
+    help="collected: what was captured that day; observed: values whose observed_at is that day",
+)
+@click.option("--source", default=None, help="One collector source name")
+@click.option("--limit", default=None, type=int, help="Most items listed in all")
+@click.option("--per-source", "per_source", default=None, type=int, help="Most items listed per source")
+@click.pass_context
+def history_day(
+    ctx: click.Context,
+    day: str,
+    by: str,
+    source: str | None,
+    limit: int | None,
+    per_source: int | None,
+) -> None:
+    """What the history store recorded for one UTC day (YYYY-MM-DD)."""
+    import time
+
+    from .collector import SOURCES
+    from .history_timeline import (
+        DEFAULT_LIMIT,
+        DEFAULT_PER_SOURCE_LIMIT,
+        day_timeline,
+        parse_day,
+    )
+
+    now = time.time()
+    _, problem = parse_day(day, now)
+    if problem:
+        raise click.BadParameter(problem, param_hint="DAY")
+    data = day_timeline(
+        _get_fetcher().cache.db_path,
+        day,
+        by=by,
+        source=source,
+        roster=[name for name, _, _, _ in SOURCES],
+        limit=DEFAULT_LIMIT if limit is None else limit,
+        per_source_limit=DEFAULT_PER_SOURCE_LIMIT if per_source is None else per_source,
+        now=now,
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    window = data["window"]
+    span = f"{window['start']} to {window['end']} (end exclusive)"
+    if not window["complete"]:
+        span += f", in progress through {window['through']}"
+    console.print(f"[bold]{data['day']}[/bold] (UTC) by {data['by']} date: {span}")
+    if by == "collected":
+        _print_day_collected(data)
+    else:
+        _print_day_observed(data)
+    _print_data_gaps(data)
+    for line in data["cannot_prove"]:
+        console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
+
+
+def _print_day_collected(data: dict) -> None:
+    c = data["collector"]
+    if c["state"] == "ran":
+        console.print(
+            f"Collector: ran, {c['captures']:,} captures of {c['sources_captured']} "
+            f"source(s), {c['first_capture_at']} to {c['last_capture_at']}; longest gap "
+            f"{c['longest_gap_s']:,.0f} s ({c['longest_gap_from']} to {c['longest_gap_to']})"
+        )
+    else:
+        console.print(f"Collector: [yellow]{c['state']}[/yellow]. {escape(c['explanation'])}")
+
+    styles = {"changed": "green", "unchanged": "green", "answered": "green",
+              "failed": "red", "never_run": "dim"}
+    table = Table(title=f"Sources on {data['day']}", box=box.SIMPLE_HEAVY)
+    for name in ("Source", "State", "Tries", "OK", "Degr", "Err", "Changed", "Same",
+                 "First", "Last", "Obs", "Reason / context"):
+        table.add_column(name, justify="right" if name in {
+            "Tries", "OK", "Degr", "Err", "Changed", "Same", "Obs"} else "left")
+    for row in data["sources"]:
+        counts = row.get("status_counts") or {}
+        changes = row.get("payload_changes") or {}
+        if row["attempts"]:
+            top = (row.get("reasons") or [None])[0]
+            context = f"{top['reason']} (x{top['count']})" if top else ""
+            if row.get("more_reasons"):
+                context += f" +{row['more_reasons']} more"
+            stored = row.get("observations_stored")
+            obs = "-" if stored is None else str(stored)
+        else:
+            parts = []
+            if row.get("last_capture_before"):
+                parts.append(f"last before {row['last_capture_before']}")
+            if row.get("next_capture_after"):
+                parts.append(f"next after {row['next_capture_after']}")
+            context = ", ".join(parts)
+            obs = str(row["observations_retained"]) if row["observations_retained"] else "-"
+        table.add_row(
+            _cell(row["source"]),
+            Text(row["day_state"], style=styles.get(row["day_state"], "yellow")),
+            str(row["attempts"]),
+            str(counts.get("ok", "-")),
+            str(counts.get("degraded", "-")),
+            str(counts.get("error", "-")),
+            (f"{changes['changed']}" + (f" +{changes['first']} first" if changes["first"] else ""))
+            if changes else "-",
+            str(changes.get("unchanged", "-")),
+            _cell(row.get("first_capture_at") or "-"),
+            _cell(row.get("last_capture_at") or "-"),
+            obs,
+            _cell(context),
+        )
+    console.print(table)
+    states = ", ".join(f"{k} {v}" for k, v in sorted(data["state_counts"].items()))
+    console.print(f"States: {states}.")
+
+    items = data["observations"]
+    trunc = data["truncation"]
+    if items:
+        obs_table = Table(
+            title=f"Observations saved that day ({trunc['returned']:,} of {trunc['matched']:,})",
+            box=box.SIMPLE_HEAVY,
+        )
+        for name in ("Collected", "Source", "Series", "Observed", "Published", "Value", "Unit"):
+            obs_table.add_column(name, justify="right" if name == "Value" else "left")
+        for item in items:
+            obs_table.add_row(
+                item["collected_at"],
+                _cell(item["source"]),
+                _cell(item["series_key"]),
+                _cell(item["observed_at"] or "unknown"),
+                _cell(item["published_at"] or "unknown"),
+                f"{item['value']:g}",
+                _cell(item.get("unit") or ""),
+            )
+        console.print(obs_table)
+    else:
+        console.print("[dim]No observations saved that day.[/dim]")
+
+
+def _print_day_observed(data: dict) -> None:
+    def _points_table(title: str, points: list[dict]) -> Table:
+        table = Table(title=title, box=box.SIMPLE_HEAVY)
+        for name in ("Observed", "Precision", "Series", "Value", "Unit", "Published",
+                     "Collected", "Stored"):
+            table.add_column(name, justify="right" if name in {"Value", "Stored"} else "left")
+        for point in points:
+            stored = str(point["stored_values"])
+            if point["stored_values"] > 1:
+                stored += f" (first {point['first_value']:g} at {point['first_collected_at']})"
+            table.add_row(
+                _cell(point["observed_at"]),
+                point["precision"],
+                _cell(point["series_key"]),
+                f"{point['value']:g}",
+                _cell(point.get("unit") or ""),
+                _cell(point["published_at"] or "unknown"),
+                point["collected_at"],
+                stored,
+            )
+        return table
+
+    day_trunc = data["truncation"]["day_values"]
+    if data["day_values"]:
+        console.print(_points_table(
+            f"Values observed on {data['day']} ({day_trunc['returned']:,} of "
+            f"{day_trunc['matched']:,})",
+            data["day_values"],
+        ))
+    else:
+        console.print(f"[yellow]No stored value is observed on {data['day']}.[/yellow]")
+    if data["period_values"]:
+        period_trunc = data["truncation"]["period_values"]
+        console.print(_points_table(
+            f"Period values containing the day, not values for it "
+            f"({period_trunc['returned']:,} of {period_trunc['matched']:,})",
+            data["period_values"],
+        ))
+        console.print(f"[dim]{escape(data['period_values_note'])}[/dim]")
+    if data["sources"]:
+        table = Table(title="By source", box=box.SIMPLE_HEAVY)
+        for name in ("Source", "Day values", "Revised", "Period values", "No observed_at"):
+            table.add_column(name, justify="left" if name == "Source" else "right")
+        for row in data["sources"]:
+            table.add_row(
+                _cell(row["source"]),
+                str(row["day_values"]),
+                str(row["day_values_revised"]),
+                str(row["period_values"]),
+                str(row["without_observed_at_collected_that_day"]),
+            )
+        console.print(table)
+
+
 if __name__ == "__main__":
     main()

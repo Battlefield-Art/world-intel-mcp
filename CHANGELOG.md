@@ -186,6 +186,47 @@ source here, and no proxy is substituted for any of these measures.
   terms could not be read; its RSS and warning texts served 200 to the
   same client. Wind radii and seas are not parsed.
 
+### Added: day timeline (Phase 29)
+- `intel_day_timeline` (MCP) and `intel history day YYYY-MM-DD [--by
+  collected|observed] [--source NAME] [--limit N] [--per-source N]` (CLI):
+  what the history store holds for one UTC calendar day, the half-open
+  window `[day 00:00:00Z, next day 00:00:00Z)`. Input is `YYYY-MM-DD` only;
+  a malformed or impossible date, or a future day, is an error naming the
+  format (the CLI exits 2). Today is allowed and reported as in progress.
+- `by=collected` (default) reads the run log. Per source: attempts, ok /
+  degraded / error counts with up to 5 distinct reasons, payload changes
+  (changed, unchanged, first capture, not stored), first and last capture,
+  observations stored and still retained, and how many of the day's
+  payload bodies are still kept. Each source gets a `day_state`:
+  `changed`, `unchanged`, `answered`, `degraded`, `failed`,
+  `not_attempted` (the collector ran that day, not this source),
+  `collector_did_not_run` (no capture of any source that day), `never_run`
+  (no capture of it in the retained run log) or `unknown_past_retention`.
+  A collector block gives the day's capture count, first and last capture
+  and the longest stretch without any capture.
+- `by=observed`: values whose `observed_at` is the day (a date) or a UTC
+  instant on it, one item per series and `observed_at` with the latest
+  value, how many values were stored for it and the first one when it was
+  revised. Month (`YYYY-MM`) and year (`YYYY`) values containing the day
+  are listed apart as period values. Observations without `observed_at`
+  (Yahoo quotes) are excluded, and those collected that day are counted
+  with the reason.
+- Every item carries `observed_at`, `published_at` and `collected_at`.
+  Retention is stated per record kind for the day (payload bodies, run
+  log, observations): a day past the run-log window reads
+  `unknown_past_retention`, never as a day on which nothing ran, and pruned
+  payload bodies and observations that outlived their capture are counted.
+  Output is capped (default 10 per source and 100 in all, at most 1,000
+  and 5,000) with matched and returned counts per source.
+- Read-only: the store is opened with SQLite `mode=ro`, so the tool cannot
+  write it, and it never fetches. Queries range-scan
+  `idx_history_captures_time` and `idx_history_obs_time` and walk
+  `idx_history_obs_series` one key at a time; a test checks every
+  statement's query plan for a full scan of a history table. On a
+  synthetic store of 475,200 captures and 1.75 million observations
+  (10,982 series), one call took 24 to 46 ms.
+- Tools 152 -> 153.
+
 ### Added: observation history and collection health
 - A history store in the cache SQLite file. Every collector source run is a
   capture: source, collected_at, status (ok, degraded or error), duration,
