@@ -3101,7 +3101,8 @@ def _with_history_store(fn: Any) -> dict:
 def history_group() -> None:
     """Saved collector history: health, captures, series, revisions.
 
-    History accrues only while the collector (intel-collector) runs.
+    History accrues only while the collector (intel-collector) runs, except
+    series that intel history backfill loads from FRED or the ECB Data Portal.
     """
 
 
@@ -3144,8 +3145,17 @@ def history_health(ctx: click.Context, source: str | None) -> None:
             _cell(row.get("latest_observed_at") or "-"),
             _cell(row.get("last_reason") or ""),
         )
-    console.print(table)
-    counts = ", ".join(f"{k} {v}" for k, v in sorted(data["state_counts"].items()))
+    if data["sources"]:
+        console.print(table)
+    for row in data.get("backfills", []):
+        console.print(
+            f"Backfill [bold]{escape(row['source'])}[/bold]: {row['captures']} capture(s), "
+            f"last {row['last_run_at']} ({row['last_status']}), {row['observations']} "
+            f"observations in {row['series']} series, observed "
+            f"{escape(str(row['first_observed_at'] or '-'))} to "
+            f"{escape(str(row['latest_observed_at'] or '-'))}."
+        )
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(data["state_counts"].items())) or "none"
     storage = data["storage"]
     console.print(
         f"States: {counts}. Stored: {storage['captures']} captures, "
@@ -3316,6 +3326,108 @@ def history_revisions(
         console.print(table)
     for line in data["cannot_prove"]:
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
+
+
+# ---------------------------------------------------------------------------
+# Backfill (history FRED and the ECB already serve, into the history store)
+# ---------------------------------------------------------------------------
+
+
+@history_group.group(name="backfill")
+def backfill_group() -> None:
+    """Load history FRED or the ECB Data Portal already serve into the history store.
+
+    Values are the publisher's current vintage, so revisions made before the
+    first backfill are invisible. Read them back with intel history series.
+    """
+
+
+def _run_backfill(
+    ctx: click.Context, provider: str, requests: tuple[str, ...], start: str | None
+) -> None:
+    from . import history_backfill
+    from .history import HistoryStore
+
+    fetcher = _get_fetcher()
+    run = history_backfill.backfill_fred if provider == "fred" else history_backfill.backfill_ecb
+    store = HistoryStore(fetcher.cache.db_path)
+    try:
+        data = _run(run(fetcher, store, list(requests), start))
+    finally:
+        store.close()
+    if ctx.obj.get("json"):
+        _print_json(data)
+    else:
+        _print_backfill(data)
+    if "error" in data or data["totals"]["failed"]:
+        ctx.exit(1)
+
+
+def _print_backfill(data: dict) -> None:
+    if not data.get("requests"):
+        console.print(f"[red]Error:[/red] {escape(str(data['error']))}")
+        return
+    title = f"Backfill into {data['source']} at {data['collected_at']}"
+    if data.get("start"):
+        title += f" from {data['start']}"
+    table = Table(title=escape(title), box=box.SIMPLE_HEAVY)
+    table.add_column("Series", style="bold")
+    table.add_column("Status")
+    table.add_column("Loaded", justify="right")
+    table.add_column("New", justify="right")
+    table.add_column("Revised", justify="right")
+    table.add_column("Unchanged", justify="right")
+    table.add_column("Missing", justify="right")
+    table.add_column("Observed from")
+    table.add_column("Observed to")
+    for req in data["requests"]:
+        if req["status"] == "error":
+            table.add_row(_cell(req["request"]), Text("error", style="red"), *["-"] * 7)
+            continue
+        for s in req["series"]:
+            table.add_row(
+                _cell(s["series_key"]),
+                Text("ok", style="green"),
+                str(s["loaded"]),
+                str(s["stored_new"]),
+                str(s["stored_revised"]),
+                str(s["unchanged"]),
+                "unknown" if s["missing_skipped"] is None else str(s["missing_skipped"]),
+                _cell(s["first_observed_at"] or "-"),
+                _cell(s["last_observed_at"] or "-"),
+            )
+    console.print(table)
+    totals = data["totals"]
+    console.print(
+        f"Stored {totals['stored_new']} new and {totals['stored_revised']} revised values, "
+        f"{totals['unchanged']} unchanged, in {escape(data['db_path'])}."
+    )
+    _print_data_gaps(data)
+
+
+@backfill_group.command(name="fred")
+@click.argument("series_ids", nargs=-1, required=True)
+@click.option("--start", default=None, help="Only observations on or after YYYY-MM-DD")
+@click.pass_context
+def backfill_fred_cmd(ctx: click.Context, series_ids: tuple[str, ...], start: str | None) -> None:
+    """Load FRED graph CSV series (up to 5).
+
+    For example: intel history backfill fred WALCL RRPONTSYD DGS10 --start 2020-01-01
+    """
+    _run_backfill(ctx, "fred", series_ids, start)
+
+
+@backfill_group.command(name="ecb")
+@click.argument("keys", nargs=-1, required=True)
+@click.option("--start", default=None, help="Only observations on or after YYYY-MM-DD")
+@click.pass_context
+def backfill_ecb_cmd(ctx: click.Context, keys: tuple[str, ...], start: str | None) -> None:
+    """Load ECB Data Portal series (up to 2 keys).
+
+    Each key is DATASET.KEY, for example BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.E
+    (euro area M3); a key with + alternatives loads every series it matches.
+    """
+    _run_backfill(ctx, "ecb", keys, start)
 
 
 if __name__ == "__main__":

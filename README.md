@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **152 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **153 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -66,9 +66,9 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Volcanoes** | 1 | Smithsonian GVP weekly activity report |
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere), with opt-in forecast tracks: positions, UTC valid times and intensities, plus NHC's cone of uncertainty |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
-| **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
+| **Collection History** | 5 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions, and on-demand backfill of the history FRED and the ECB Data Portal already serve |
 
-**Total: 152 tools** across 30+ intelligence domains.
+**Total: 153 tools** across 30+ intelligence domains.
 
 ---
 
@@ -142,6 +142,8 @@ intel top-stories -m 4                 # stories carried by 4+ outlets
 intel status               # cache + circuit breaker health
 intel guide                # the research guide (also served as intel://guide)
 intel history health       # per-source collection health from the collector's run log
+intel history backfill fred WALCL RRPONTSYD --start 2020-01-01  # load FRED history into the history store
+intel history backfill ecb BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.E   # load ECB Data Portal history (euro area M3)
 ```
 
 ---
@@ -596,8 +598,8 @@ different, openly licensed data source; no ews code is used.
 |------|-------------|
 | `intel_situation_brief` | Cited situational awareness brief, generated on demand over MCP: a bounded server-side overview (earthquakes, military flights, ACLED conflict events, wildfires, cyber threats, disease outbreaks, news, space weather, strategic posture, alert digest), synthesized via local Ollama or a mechanically-cited fallback when Ollama is unreachable |
 
-### Collection History (4)
-History accrues only while the collector (`intel-collector`) runs; nothing before its first recorded cycle exists. Every observation keeps three dates: `observed_at` (the period the value describes, from the payload, or null when the payload has none), `published_at` (publisher release, when known) and `collected_at` (when this server saved it).
+### Collection History (5)
+History accrues only while the collector (`intel-collector`) runs; nothing before its first recorded cycle exists, except what a backfill loads (`intel_history_backfill`, `intel history backfill`): FRED graph CSV and ECB Data Portal series, stored under `backfill:fred` and `backfill:ecb` with the publisher's current vintage, so revisions made before the first backfill are invisible. Every observation keeps three dates: `observed_at` (the period the value describes, from the payload, or null when the payload has none), `published_at` (publisher release, when known) and `collected_at` (when this server saved it).
 
 | Tool | Description |
 |------|-------------|
@@ -605,6 +607,7 @@ History accrues only while the collector (`intel-collector`) runs; nothing befor
 | `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload |
 | `intel_series_history` | One series' observations with all three dates, or the list of available series |
 | `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates) |
+| `intel_history_backfill` | Load the history FRED (graph CSV) or the ECB Data Portal already serve into the history store: one capture per series under `backfill:fred` / `backfill:ecb`, `observed_at` from the publisher's dates, `published_at` null, `collected_at` the backfill time; re-runs store only new or changed values (a change is a revision); missing values skipped and counted; writes and fetches, so capped at 5 FRED series or 2 ECB keys per call |
 
 ---
 

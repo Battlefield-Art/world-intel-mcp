@@ -29,6 +29,7 @@ from . import (  # noqa: E402
     geospatial,
     hazards,
     history,
+    history_backfill,
     infrastructure,
     intelligence,
     liquidity,
@@ -59,6 +60,7 @@ _MODULES = [
     vector,
     aoi,
     history,
+    history_backfill,
     system,
 ]
 

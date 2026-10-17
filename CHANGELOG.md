@@ -229,6 +229,60 @@ source here, and no proxy is substituted for any of these measures.
   history capture is an error.
 - Tools 139 -> 143.
 
+### Added: history backfill and more history extractors (Phase 29)
+- `intel history backfill fred SERIES... [--start YYYY-MM-DD]`,
+  `intel history backfill ecb DATASET.KEY... [--start YYYY-MM-DD]` and the
+  MCP tool `intel_history_backfill` load the history that FRED's keyless graph CSV
+  and the ECB Data Portal (BSI and ILM datasets) already serve into the
+  history store. Requests reuse the liquidity tools' fetch and parse code,
+  so they go through the Fetcher (FRED rate floor, circuit breaker, cache):
+  a copy cached by an earlier call (FRED 1 h, ECB 3 h) is reused without a
+  request.
+- Backfilled rows have their own sources, `backfill:fred` and
+  `backfill:ecb` (series `backfill:fred:<ID>` and
+  `backfill:ecb:<DATASET>.<KEY>`), so they never read as collector
+  captures; `intel_collection_health` and `intel history health` list them
+  apart (`backfills`). Every run is logged in a new table,
+  `history_backfills`, created in place with `CREATE TABLE IF NOT EXISTS`
+  (existing rows untouched).
+- Dates: `observed_at` is the publisher's period (FRED's date; ECB months
+  as written, ECB weeks as the Sunday that ends the ISO week);
+  `published_at` is NULL, because neither response names a release or
+  vintage date; `collected_at` is the backfill time, stamped after the
+  call's last fetch. Values are the publisher's vintage on the backfill
+  day, already revised, so revisions made before the first backfill are
+  invisible.
+- Idempotent: a re-run stores only new or changed values, and a changed
+  value is a revision in `intel_revisions`. FRED's missing cells (`.` and
+  blank) are skipped and counted, never stored as zero. ECB missing values
+  cannot be counted (the SDMX-JSON parser drops them) and read `unknown`.
+- Failures are errors, never an empty success: an HTTP error, an empty or
+  malformed body, a window without values, and a response available only
+  as a stale cache copy each record an error capture and store nothing.
+  The CLI exits 1 when any request failed.
+- Caps per call: 5 FRED series or 2 ECB keys (at most 20 series per key),
+  the newest 20,000 points per series and 100,000 per call; `--start`
+  narrows the window.
+- Retention: observations are pruned by `collected_at`, not `observed_at`,
+  so a 1962 value is kept as long as any value stored by the same backfill
+  (`WORLD_INTEL_HISTORY_DAYS`, default 365). A backfill prunes before it
+  stores, so a pruned value is stored again as new.
+- New history extractors (`history_extractors.py`): `liquidity_board`
+  (latest and previous value per indicator; the derived net liquidity row
+  is left to its own source), `net_liquidity` (net liquidity and its three
+  terms per Wednesday, reverse repo dated by the day it was taken from) and
+  `net_migration` (World Bank SM.POP.NETM per country and year). Each
+  dates a value only from the payload.
+- Measured 2026-10-17, live, isolated HOME: WALCL 1,244 values
+  (2002-12-18 to 2026-10-14), RRPONTSYD 3,348 (2,833 blank cells skipped),
+  DGS10 16,182 (721 skipped; units unknown, it is not in this server's
+  FRED catalog), euro area M3 560 months (1980-01 to 2026-08, 1
+  provisional). A second run from the cached copies and a refetch of WALCL
+  and M3 stored 0.
+- FRED's terms of use speak of personal, non-commercial use of FRED data;
+  whether a deployment fits them is the operator's call.
+- Tools 152 -> 153; the `intel history` group gains `backfill fred|ecb`.
+
 ### Added: news signals (ROADMAP Phase 29)
 - `intel_hostility_timeline`: per UTC day, GDELT DOC 2.0 coverage of a
   country or a pair of countries (`timelinevolraw`): matching articles,

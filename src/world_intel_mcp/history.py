@@ -26,8 +26,12 @@ settled on, fallback path included):
   stored value for the same series and ``observed_at``, so successive
   rows for one ``(series_key, observed_at)`` are revisions.
 
-History accrues only while the collector runs: nothing is backfilled, and
-a source the collector does not run reads ``never_run``.
+History accrues while the collector runs, plus what a backfill
+(``history_backfill.py``) loads on demand from FRED and the ECB Data
+Portal, which serve their whole history; a source the collector does not
+run reads ``never_run``. Backfills are captures under ``backfill:*``
+sources, so their rows never read as collector captures, and
+``collection_health`` lists them apart from the collector's roster.
 
 Registering an extractor (the public API)::
 
@@ -70,8 +74,10 @@ Gaps / not covered:
 - Growth was measured on a Saturday with markets closed: the 15 Yahoo quote
   series, which have no observation date, gain a row per price change while
   markets trade, and that rate is not measured.
-- No backfill: sources that serve history (FRED CSV) are not replayed into
-  the store; only what the collector sees from the first recorded cycle on.
+- Backfill covers FRED graph CSV and ECB Data Portal series only, and
+  stores the publisher's current vintage: revisions made before a
+  backfill are invisible (see ``history_backfill.py``). Every other source
+  has only what the collector saw from its first recorded cycle on.
 - ``published_at`` is NULL for every built-in extractor: none of their
   payloads names a release time.
 - ``record_count`` is a size hint (the payload's longest top-level list,
@@ -122,7 +128,17 @@ _MAX_LIMIT = 1000
 
 HISTORY_ACCRUAL_NOTE = (
     "History accrues only while the collector (intel-collector) runs; "
-    "nothing before its first recorded cycle exists here."
+    "nothing before its first recorded cycle exists here, except series under "
+    "backfill:* sources, which a backfill loaded from the publisher's current data."
+)
+
+# Source-name prefix of backfill captures (history_backfill.py). They run on
+# demand, so collection_health reports them apart from the cadence roster.
+BACKFILL_PREFIX = "backfill:"
+BACKFILL_VINTAGE_NOTE = (
+    "Backfilled: each value is the publisher's vintage on the day it was "
+    "collected (collected_at is the backfill time), so revisions made before the "
+    "first backfill are invisible; later backfills store changed values as revisions."
 )
 
 
@@ -693,14 +709,16 @@ class HistoryStore:
         known = set(roster)
         conn = self._conn
         logged = [r[0] for r in conn.execute("SELECT DISTINCT source FROM history_captures")]
-        names = roster + sorted(set(logged) - known)
+        backfilled = sorted(s for s in logged if s.startswith(BACKFILL_PREFIX))
+        names = roster + sorted(set(logged) - known - set(backfilled))
         if source is not None:
-            if source not in names:
+            if source not in names and source not in backfilled:
                 return {
                     "error": f"unknown source {source!r}: not a collector source and never captured",
-                    "known_sources": sorted(names),
+                    "known_sources": sorted(names + backfilled),
                 }
-            names = [source]
+            names = [source] if source in names else []
+            backfilled = [source] if source in backfilled else []
 
         rows = []
         for name in names:
@@ -790,6 +808,8 @@ class HistoryStore:
         return {
             "sources": rows,
             "state_counts": states,
+            # On-demand loads, not judged against a cadence.
+            "backfills": [self._backfill_row(name) for name in backfilled],
             "checked_at": _iso(now),
             "default_cadence_s": default_cadence,
             "overdue_multiple": OVERDUE_MULTIPLE,
@@ -818,6 +838,35 @@ class HistoryStore:
                 f"{OVERDUE_MULTIPLE:g} cadences (overdue is then always true)",
                 "never_run": "no capture recorded",
             },
+        }
+
+    def _backfill_row(self, name: str) -> dict:
+        """One backfill source: its captures and the series it stored."""
+        conn = self._conn
+        captures, last_at = conn.execute(
+            "SELECT COUNT(*), MAX(collected_at) FROM history_captures WHERE source = ?", (name,)
+        ).fetchone()
+        last_status, last_reason = conn.execute(
+            "SELECT status, error FROM history_captures WHERE source = ? "
+            "ORDER BY collected_at DESC, id DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+        series, points, first_obs, last_obs = conn.execute(
+            "SELECT COUNT(DISTINCT series_key), COUNT(*), MIN(observed_at), MAX(observed_at) "
+            "FROM history_observations WHERE source = ?",
+            (name,),
+        ).fetchone()
+        return {
+            "source": name,
+            "captures": captures,
+            "last_run_at": _iso(last_at),
+            "last_status": last_status,
+            "last_reason": last_reason,
+            "series": series,
+            "observations": points,
+            "first_observed_at": first_obs,
+            "latest_observed_at": last_obs,
+            "note": BACKFILL_VINTAGE_NOTE,
         }
 
     def capture_history(
@@ -972,6 +1021,8 @@ class HistoryStore:
             )
         if all(o["published_at"] is None for o in observations):
             gaps.append("published_at unknown: this source's payload names no release time")
+        if str(rows[0][7]).startswith(BACKFILL_PREFIX):
+            gaps.append(BACKFILL_VINTAGE_NOTE)
         return {
             "series_key": series_key,
             "source": rows[0][7],
@@ -1029,3 +1080,9 @@ class HistoryStore:
             ],
             "note": HISTORY_ACCRUAL_NOTE,
         }
+
+
+# Extractors for further collector sources live in their own module. Importing
+# it here registers them wherever a capture is classified, whichever module
+# imported the store first.
+from . import history_extractors  # noqa: E402,F401  (registers on import)
