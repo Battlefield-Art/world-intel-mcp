@@ -216,6 +216,20 @@ source here, and no proxy is substituted for any of these measures.
   `world-intel-mcp` console script (or `python -m world_intel_mcp.server`
   where none is installed), one always against the module form. Neither
   is skipped.
+- The maritime, hotspot and airspace prompts state the maritime and
+  flight outage behaviour fixed below: a warning counts at a waterway only
+  within 300 km of a position it states, a naval warning with no readable
+  position changes no status, `unknown` is an NGA outage and `stale` a
+  frozen feed (`status_as_of`), the `navarea` filter takes NGA area codes,
+  and a flight source outage reads `source: "none"` with `reason`
+  `military_flights_unavailable` in military flights, `unavailable_theaters`
+  in theater posture and `unchecked_regions` in surge detection. The
+  hotspot prompt also says that the escalation
+  score's military component is 0 at every hotspot whatever the aircraft
+  data (measured 2026-10-17 with mocked aircraft over all 22 hotspots), so
+  military activity is read from the surge and posture tools instead. Tests
+  hold each statement against the code through a real fetcher with every
+  upstream mocked.
 
 ### Fixed
 - `intel_ucdp_events`: a missing token or a refused request (the UCDP API
