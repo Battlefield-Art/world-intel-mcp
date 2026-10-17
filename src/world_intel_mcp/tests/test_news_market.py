@@ -12,7 +12,9 @@ company_tickers.json. Clustering and entity matching run for real on
 headlines in the live feed-item shape; only the RSS fetch is faked.
 """
 
+import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -104,11 +106,26 @@ _SEC_SUBSET = {
 _SATURDAY = datetime(2026, 10, 17, 16, 0, tzinfo=timezone.utc)
 
 
+def _market_time(last_stamp, tz, period):
+    """regularMarketTime as Yahoo sends it: a finished daily bar (stamped
+    at the session open) carries its day's closing print, as the live
+    AAPL 16:00:01 and SPY 16:00:00 captures do; a bar stamped later is a
+    live intraday print and carries that stamp."""
+    zone = ZoneInfo(tz)
+    regular = period["regular"]
+    last = datetime.fromtimestamp(last_stamp, zone)
+    if last.time() != datetime.fromtimestamp(regular["start"], zone).time():
+        return last_stamp
+    close = datetime.fromtimestamp(regular["end"], zone).time()
+    return int(datetime.combine(last.date(), close, zone).timestamp())
+
+
 def _chart(symbol, bars, *, tz="America/New_York", abbr="EDT", gmtoffset=-14400,
-           period=None, instrument="EQUITY", exchange="NMS", full="NasdaqGS"):
+           period=None, instrument="EQUITY", exchange="NMS", full="NasdaqGS", market_time=None):
     stamps = [b[0] for b in bars]
     closes = [b[1] for b in bars]
     adj = [b[2] if len(b) > 2 else b[1] for b in bars]
+    period = period or _US_PERIOD
     return {
         "chart": {
             "result": [{
@@ -118,12 +135,13 @@ def _chart(symbol, bars, *, tz="America/New_York", abbr="EDT", gmtoffset=-14400,
                     "exchangeName": exchange,
                     "fullExchangeName": full,
                     "instrumentType": instrument,
-                    "regularMarketTime": stamps[-1],
+                    "regularMarketTime": (
+                        _market_time(stamps[-1], tz, period) if market_time is None else market_time),
                     "gmtoffset": gmtoffset,
                     "timezone": abbr,
                     "exchangeTimezoneName": tz,
                     "chartPreviousClose": closes[0],
-                    "currentTradingPeriod": period or _US_PERIOD,
+                    "currentTradingPeriod": period,
                     "dataGranularity": "1d",
                     "range": "3mo",
                 },
@@ -854,3 +872,544 @@ async def test_tool_handler_passes_arguments(monkeypatch):
     assert result == {"ok": True}
     assert calls == [{"category": "finance", "limit": 150, "threshold": 0.25, "min_cluster_size": 1,
                       "include_countries": False, "max_symbols": 40}]
+
+
+@pytest.mark.asyncio
+async def test_tool_handler_passes_max_age_hours_when_given(monkeypatch):
+    from world_intel_mcp import tools
+    from world_intel_mcp.tools import news_market as tool_mod
+
+    calls = []
+
+    async def _fake(fetcher, **kwargs):
+        calls.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(nm, "fetch_news_market_reaction", _fake)
+    await tools.ALL_HANDLERS["intel_news_market_reaction"]({"max_age_hours": 24})
+    assert calls[0]["max_age_hours"] == 24
+    [tool] = tool_mod.TOOLS
+    assert tool.inputSchema["properties"]["max_age_hours"]["default"] == 168
+    # The SEC lookup annotates a US ticker with its registrant; it confirms nothing.
+    assert "SEC-confirmed" not in tool.description
+
+
+# ---------------------------------------------------------------------------
+# Stale cache copies, bar finality, placeholder bars
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bars_stale_cached_chart_is_a_gap_naming_its_age():
+    """When Yahoo fails the fetcher serves an expired copy marked _stale;
+    an old chart must never become a measured row."""
+    payload = _chart("AAPL", _AAPL)
+    payload.update({"_stale": True, "_stale_age_seconds": 259200.4})
+    assert nm.parse_bars("AAPL", payload) == (
+        None, "AAPL: Yahoo unavailable; a cached chart 259200 s old was not used")
+    del payload["_stale_age_seconds"]
+    assert nm.parse_bars("AAPL", payload)[1] == (
+        "AAPL: Yahoo unavailable; a cached chart of unknown age was not used")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_stale_yahoo_and_sec_copies_are_gaps(fast_fetcher, monkeypatch):
+    """Yahoo and SEC down, expired copies in the cache: no row is measured
+    from the old charts and no registrant comes from the old file."""
+    _feed(monkeypatch, [_ITEMS[0]])
+    fast_fetcher.cache.set("news_market:bars:AAPL", _chart("AAPL", _AAPL), -1)
+    fast_fetcher.cache.set("news_market:bars:SPY", _chart("SPY", _SPY), -1)
+    fast_fetcher.cache.set("sec:company_tickers", _SEC_SUBSET, -1)
+    respx.get(_CHART.format("AAPL")).mock(return_value=httpx.Response(503))
+    respx.get(_CHART.format("SPY")).mock(return_value=httpx.Response(503))
+    respx.get(_SEC).mock(return_value=httpx.Response(503))
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, min_cluster_size=1, now=_SATURDAY)
+
+    [row] = out["company_reactions"]
+    assert row["status"] == "data_gap"
+    assert row["gap"] == "no daily bars for AAPL"
+    assert "stock_return_pct" not in row and "registrant" not in row
+    gaps = " | ".join(out["data_gaps"])
+    assert re.search(r"AAPL: Yahoo unavailable; a cached chart \d+ s old was not used", gaps)
+    assert re.search(r"SPY: Yahoo unavailable; a cached chart \d+ s old was not used", gaps)
+    assert re.search(r"SEC company_tickers\.json unavailable; a cached copy \d+ s old was not used, "
+                     r"so US registrants are not confirmed", gaps)
+    assert out["summary"]["symbols_fetched"] == 0
+
+
+def test_bars_keep_regular_market_time_and_last_bar_finality():
+    final = _bars("AAPL", _chart("AAPL", _AAPL))  # closing print at 16:00 on 2026-10-16
+    assert final.market_time.isoformat() == "2026-10-16T16:00:00-04:00"
+    assert final.last_final is True
+    live = _bars("AAPL", _chart("AAPL", _AAPL, market_time=1792180680))  # a 15:58 print
+    assert live.last_final is False
+    one_past = _bars("AAPL", _chart("AAPL", _AAPL, market_time=1792180801))  # 16:00:01, as live AAPL
+    assert one_past.last_final is True
+
+
+def test_last_bar_printed_before_the_close_is_pending_after_the_close():
+    """A chart read at 15:58 and cached is still served at 16:05: the
+    clock says the session closed, but the last bar is the 15:58 print."""
+    cached = _bars("AAPL", _chart("AAPL", _AAPL, market_time=1792180680))
+    after_close = datetime(2026, 10, 16, 20, 5, tzinfo=timezone.utc)  # 16:05 EDT
+    s = _assign("2026-10-16T14:00:00Z", cached, now=after_close)
+    assert s["status"] == "pending"
+    assert s["session_date"] == "2026-10-16"
+    assert s["reason"] == (
+        "the 2026-10-16 AAPL bar is not final: Yahoo's last regular-market time is "
+        "2026-10-16T15:58:00-04:00, before the 16:00 close")
+    # An earlier session of the same series is final whatever the last bar is
+    assert _assign("2026-10-15T14:00:00Z", cached, now=after_close)["status"] == "assigned"
+    no_time = _chart("AAPL", _AAPL)
+    del no_time["chart"]["result"][0]["meta"]["regularMarketTime"]
+    s = _assign("2026-10-16T14:00:00Z", _bars("AAPL", no_time), now=after_close)
+    assert s["status"] == "pending"
+    assert s["reason"] == "the 2026-10-16 AAPL bar may not be final: Yahoo gave no regularMarketTime"
+
+
+def test_measure_company_benchmark_bar_not_final_is_pending():
+    aapl = _bars("AAPL", _chart("AAPL", _AAPL))
+    spy = _bars("SPY", _chart("SPY", _SPY, market_time=1792180680))
+    row = nm.measure_company(nm.parse_published("2026-10-16T14:00:00Z"), aapl, spy, _SATURDAY)
+    assert row["status"] == "pending"
+    assert row["gap"] == (
+        "the 2026-10-16 SPY bar is not final: Yahoo's last regular-market time is "
+        "2026-10-16T15:58:00-04:00, before the 16:00 close")
+    assert "stock_return_pct" not in row and "excess_return_pct" not in row
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_bars_cached_before_the_close_stay_pending(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [_item("Apple foldable iPhones sell out in hours", "2026-10-16T14:00:00Z")])
+    aapl = respx.get(_CHART.format("AAPL")).mock(return_value=httpx.Response(
+        200, json=_chart("AAPL", _AAPL[:-1] + [(1792180680, 341.1, 341.1)])))  # 15:58 print
+    respx.get(_CHART.format("SPY")).mock(return_value=httpx.Response(
+        200, json=_chart("SPY", _SPY[:-1] + [(1792180680, 766.4, 766.4)])))
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+
+    before = await nm.fetch_news_market_reaction(
+        fast_fetcher, min_cluster_size=1, now=datetime(2026, 10, 16, 19, 58, tzinfo=timezone.utc))
+    after = await nm.fetch_news_market_reaction(
+        fast_fetcher, min_cluster_size=1, now=datetime(2026, 10, 16, 20, 5, tzinfo=timezone.utc))
+
+    assert aapl.call_count == 1  # the 16:05 call read the 15:58 chart from the cache
+    assert before["company_reactions"][0]["status"] == "pending"
+    row = after["company_reactions"][0]
+    assert row["status"] == "pending"
+    assert row["gap"].startswith("the 2026-10-16 AAPL bar is not final")
+    assert "stock_return_pct" not in row
+
+
+# Live 2222.SR daily bars (Yahoo v8, range 3mo, read 2026-10-17). Sunday
+# 2026-08-16 is a bar in which nothing traded: open, high, low and close
+# all equal Thursday's close and volume is 0.
+_ARAMCO = [  # (timestamp = session open, open, high, low, close, volume, adjclose)
+    (1786431600, 26.639999389648438, 26.860000610351562, 26.600000381469727, 26.600000381469727,
+     10714020, 26.26120948791504),  # 2026-08-11
+    (1786518000, 26.600000381469727, 26.68000030517578, 26.520000457763672, 26.600000381469727,
+     6601208, 26.26120948791504),  # 2026-08-12
+    (1786604400, 26.559999465942383, 26.600000381469727, 26.479999542236328, 26.479999542236328,
+     7482066, 26.142736434936523),  # 2026-08-13
+    (1786863600, 26.479999542236328, 26.479999542236328, 26.479999542236328, 26.479999542236328,
+     0, 26.142736434936523),  # 2026-08-16 (nothing traded)
+    (1786950000, 26.700000762939453, 26.700000762939453, 26.520000457763672, 26.520000457763672,
+     9968769, 26.182228088378906),  # 2026-08-17
+    (1787036400, 26.579999923706055, 26.700000762939453, 26.559999465942383, 26.579999923706055,
+     10271573, 26.241464614868164),  # 2026-08-18
+]
+# Live 2222.SR currentTradingPeriod (2026-10-15 session).
+_RIYADH_PERIOD = {
+    "pre": {"timezone": "AST", "start": 1792047600, "end": 1792047600, "gmtoffset": 10800},
+    "regular": {"timezone": "AST", "start": 1792047600, "end": 1792065600, "gmtoffset": 10800},
+    "post": {"timezone": "AST", "start": 1792065600, "end": 1792065600, "gmtoffset": 10800},
+}
+
+
+def _aramco_chart(rows=_ARAMCO):
+    payload = _chart("2222.SR", [(r[0], r[4], r[6]) for r in rows], tz="Asia/Riyadh", abbr="AST",
+                     gmtoffset=10800, period=_RIYADH_PERIOD, exchange="SAU", full="Saudi")
+    result = payload["chart"]["result"][0]
+    result["meta"]["currency"] = "SAR"
+    result["indicators"]["quote"] = [{
+        "open": [r[1] for r in rows], "high": [r[2] for r in rows], "low": [r[3] for r in rows],
+        "close": [r[4] for r in rows], "volume": [r[5] for r in rows]}]
+    return payload
+
+
+def test_parse_bars_drops_a_bar_in_which_nothing_traded():
+    bars = _bars("2222.SR", _aramco_chart())
+    assert [d.isoformat() for d in bars.dates] == [
+        "2026-08-11", "2026-08-12", "2026-08-13", "2026-08-17", "2026-08-18"]
+    assert bars.notes == [
+        "2222.SR: placeholder bar dropped for 2026-08-16 (open = high = low = close = the "
+        "previous close, volume 0): a day without trading, not a 0% session"]
+    # A Sunday story maps to Monday, measured from Thursday's close
+    s = _assign("2026-08-16T07:30:00Z", bars)  # 10:30 Riyadh
+    assert (s["session_date"], s["basis"]) == ("2026-08-17", "next_session_non_trading_day")
+    prior, ret = nm.session_return(bars, datetime(2026, 8, 17).date())
+    assert (prior.isoformat(), round(ret * 100, 4)) == ("2026-08-13", 0.1511)
+    # The same flat bar with any volume traded and stays
+    traded = [r[:5] + (5,) + r[6:] if r[0] == 1786863600 else r for r in _ARAMCO]
+    assert "2026-08-16" in [d.isoformat() for d in _bars("2222.SR", _aramco_chart(traded)).dates]
+
+
+def test_placeholder_bar_does_not_enter_the_zscore_sample():
+    """A volume-0 bar copying the previous close on a closed weekday
+    (2026-09-25, Mid-Autumn) would add a fake 0.0% return to the sample."""
+    filler = (1790299800, 3888.3740234375)  # 2026-09-25 09:30 Shanghai, 09-24's close again
+    rows = sorted(_SSE + [filler])
+    payload = _sse_chart(rows)
+    payload["chart"]["result"][0]["indicators"]["quote"][0]["volume"][rows.index(filler)] = 0
+    sse = _bars("000001.SS", payload)
+    row = nm.measure_country(nm.parse_published("2026-10-16T01:00:00Z"), sse, _SATURDAY)
+    assert (row["index_return_pct"], row["zscore"], row["trailing_sessions"]) == (0.2376, 0.6, 16)
+    assert sse.notes == [
+        "000001.SS: placeholder bar dropped for 2026-09-25 (open = high = low = close = the "
+        "previous close, volume 0): a day without trading, not a 0% session"]
+
+
+def test_parse_bars_raw_closes_without_adjclose_are_noted():
+    payload = _chart("SPY", _SPY)
+    del payload["chart"]["result"][0]["indicators"]["adjclose"]
+    bars = _bars("SPY", payload)
+    _prior, ret = nm.session_return(bars, datetime(2026, 9, 18).date())
+    assert round(ret * 100, 4) == -0.1193  # the unadjusted ex-dividend move
+    assert bars.notes == [
+        "SPY: no adjusted closes in the Yahoo chart; raw closes used, so a dividend or split "
+        "in range distorts its returns"]
+
+
+def test_close_differing_from_the_zone_standard_is_noted():
+    assert _bars("AAPL", _chart("AAPL", _AAPL)).notes == []
+    # A US early-close day: Yahoo's current period ends 13:00 and that
+    # close is applied to every day in range.
+    early = {"regular": {"timezone": "EDT", "start": 1792157400, "end": 1792170000, "gmtoffset": -14400}}
+    bars = _bars("AAPL", _chart("AAPL", _AAPL, period=early))
+    assert bars.close_time.isoformat() == "13:00:00"
+    assert bars.notes == [
+        "AAPL: Yahoo's current regular close, 13:00 America/New_York, differs from the standard "
+        "16:00 for that zone; it is applied to every day in range, so a story published between "
+        "the two times may map to the wrong session"]
+    # KRX: Yahoo's period ends 15:00 (live, 2026-10-16) but the closing
+    # print of 005930.KS that day was at 15:30:05.
+    seoul = {"regular": {"timezone": "KST", "start": 1792108800, "end": 1792130400, "gmtoffset": 32400}}
+    krx = _bars("005930.KS", _chart("005930.KS", [(1792022400, 100.0), (1792108800, 101.0)],
+                                    tz="Asia/Seoul", abbr="KST", gmtoffset=32400, period=seoul,
+                                    market_time=1792132205))
+    assert krx.last_final is True
+    assert krx.notes == [
+        "005930.KS: Yahoo's current regular close, 15:00 Asia/Seoul, differs from the standard "
+        "15:30 for that zone; it is applied to every day in range, so a story published between "
+        "the two times may map to the wrong session"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_rows_name_the_close_used_and_bar_notes_reach_data_gaps(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [_ITEMS[0], _ITEMS[5]])
+    early = {"regular": {"timezone": "EDT", "start": 1792157400, "end": 1792170000, "gmtoffset": -14400}}
+    respx.get(_CHART.format("AAPL")).mock(return_value=httpx.Response(
+        200, json=_chart("AAPL", _AAPL, period=early)))
+    spy = _chart("SPY", _SPY, instrument="ETF", exchange="PCX", full="NYSEArca")
+    del spy["chart"]["result"][0]["indicators"]["adjclose"]
+    respx.get(_CHART.format("SPY")).mock(return_value=httpx.Response(200, json=spy))
+    respx.get(_CHART.format("000001.SS")).mock(return_value=httpx.Response(200, json=_sse_chart()))
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, min_cluster_size=1, now=_SATURDAY)
+
+    [apple] = out["company_reactions"]
+    assert apple["close_time_used"] == "13:00"
+    assert apple["status"] == "measured" and apple["benchmark_return_pct"] == -1.1065
+    [china] = out["country_reactions"]
+    assert china["close_time_used"] == "15:00"
+    assert out["data_gaps"] == [
+        "AAPL: Yahoo's current regular close, 13:00 America/New_York, differs from the standard "
+        "16:00 for that zone; it is applied to every day in range, so a story published between "
+        "the two times may map to the wrong session",
+        "SPY: no adjusted closes in the Yahoo chart; raw closes used, so a dividend or split "
+        "in range distorts its returns",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Session windows and story spans
+# ---------------------------------------------------------------------------
+
+
+def test_measure_company_stock_missing_the_prior_session_is_a_gap():
+    """AAPL lacks 2026-10-15 while SPY traded: a 10-16 story would be
+    measured from 10-14, a two-session return labelled same_session."""
+    aapl = _bars("AAPL", _chart("AAPL", [b for b in _AAPL if b[0] != 1792071000]))
+    spy = _bars("SPY", _chart("SPY", _SPY))
+    row = nm.measure_company(nm.parse_published("2026-10-16T14:00:00Z"), aapl, spy, _SATURDAY)
+    assert row["status"] == "data_gap"
+    assert row["gap"] == (
+        "SPY traded on 2026-10-15 but the AAPL series has no bar for it; the 2026-10-14 to "
+        "2026-10-16 return would span more than one session")
+    assert "stock_return_pct" not in row
+
+
+def test_measure_company_benchmark_already_closed_the_pending_session_is_a_gap():
+    aapl = _bars("AAPL", _chart("AAPL", _AAPL[:-1]))  # series ends 2026-10-15
+    spy = _bars("SPY", _chart("SPY", _SPY))  # 2026-10-16 bar is final
+    row = nm.measure_company(nm.parse_published("2026-10-15T20:30:00Z"), aapl, spy, _SATURDAY)
+    assert row["status"] == "data_gap"
+    assert row["gap"] == (
+        "SPY traded on 2026-10-16 but the AAPL series has no bar for it; the session cannot be assigned")
+    # While the benchmark's own 10-16 bar is not final either, it stays pending
+    live_spy = _bars("SPY", _chart("SPY", _SPY, market_time=1792180680))
+    row = nm.measure_company(nm.parse_published("2026-10-15T20:30:00Z"), aapl, live_spy, _SATURDAY)
+    assert row["status"] == "pending"
+
+
+_MULTI_DAY = [  # sources/news.py sorts newest first
+    _item("Apple shares rise after analyst upgrade", "2026-10-16T14:00:00Z", "finance", "CNBC"),
+    _item("Apple shares fall after earnings miss", "2026-10-08T14:00:00Z", "finance", "MarketWatch"),
+]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_cluster_spanning_sessions_is_a_gap(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, list(_MULTI_DAY))
+    _mock_markets()
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, max_age_hours=400, now=_SATURDAY)
+
+    [row] = out["company_reactions"]
+    story = row["story"]
+    # Headline, link and time all come from the earliest article
+    assert story["headline"] == "Apple shares fall after earnings miss"
+    assert story["link"] == "https://example.com/apple-shares-fall-after-earnings-miss"
+    assert (story["first_published"], story["last_published"], story["span_hours"]) == (
+        "2026-10-08T14:00:00Z", "2026-10-16T14:00:00Z", 192.0)
+    assert row["status"] == "data_gap"
+    assert row["gap"] == (
+        "the story's articles run from 2026-10-08T14:00:00Z to 2026-10-16T14:00:00Z, which map "
+        "to different AAPL sessions (2026-10-08 and 2026-10-16); the move cannot be tied to one session")
+    assert "stock_return_pct" not in row
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_cluster_with_a_future_article_is_a_gap(fast_fetcher, monkeypatch):
+    """Any article stamped after the collection time puts the cluster's
+    times in doubt, not only the earliest one."""
+    _feed(monkeypatch, [
+        _item("Apple foldable iPhones sell out in hours worldwide", "2026-10-17T21:18:34Z"),
+        _item("Apple foldable iPhones sell out in hours", "2026-10-16T14:00:00Z"),
+    ])
+    _mock_markets()
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, now=_SATURDAY)
+
+    [row] = out["company_reactions"]
+    assert (row["story"]["first_published"], row["story"]["last_published"]) == (
+        "2026-10-16T14:00:00Z", "2026-10-17T21:18:34Z")
+    assert row["status"] == "data_gap"
+    assert row["gap"].startswith(
+        "story timestamp 2026-10-17T21:18:34Z is later than the collection time 2026-10-17T16:00:00Z")
+    assert "stock_return_pct" not in row
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_country_cluster_spanning_sessions_is_a_gap(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [
+        _item("China shares rise after stimulus pledge", "2026-10-16T01:00:00Z", "finance", "CNBC"),
+        _item("China shares fall after stimulus pledge", "2026-10-14T01:00:00Z", "finance", "MarketWatch"),
+    ])
+    _mock_markets()
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, now=_SATURDAY)
+
+    [row] = out["country_reactions"]
+    assert row["symbol"] == "000001.SS"
+    assert row["status"] == "data_gap"
+    assert row["gap"] == (
+        "the story's articles run from 2026-10-14T01:00:00Z to 2026-10-16T01:00:00Z, which map "
+        "to different 000001.SS sessions (2026-10-14 and 2026-10-16); the move cannot be tied to one session")
+    assert "index_return_pct" not in row
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_leaves_out_stories_older_than_max_age(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, list(_MULTI_DAY))
+    _mock_markets()
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+
+    out = await nm.fetch_news_market_reaction(fast_fetcher, now=_SATURDAY)  # default 168 h
+
+    assert out["company_reactions"] == []
+    s = out["summary"]
+    assert (s["stories_considered"], s["stories_dropped_by_age"], s["max_age_hours"]) == (0, 1, 168)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_clamps_threshold_and_max_age(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [_ITEMS[3]])  # OpenAI: unmapped, no market data needed
+    seen = []
+    real = nm.clustering.cluster_articles
+
+    def _recording(articles, similarity_threshold=0.3, title_field="title"):
+        seen.append(similarity_threshold)
+        return real(articles, similarity_threshold, title_field)
+
+    monkeypatch.setattr(nm.clustering, "cluster_articles", _recording)
+    low = await nm.fetch_news_market_reaction(
+        fast_fetcher, min_cluster_size=1, threshold=0, max_age_hours=0, now=_SATURDAY)
+    high = await nm.fetch_news_market_reaction(
+        fast_fetcher, min_cluster_size=1, threshold=7, max_age_hours=10**6, now=_SATURDAY)
+    assert seen == [0.01, 1.0]
+    assert (low["summary"]["threshold"], low["summary"]["max_age_hours"]) == (0.01, 1)
+    assert (high["summary"]["threshold"], high["summary"]["max_age_hours"]) == (1.0, 2160)
+    assert low["summary"]["stories_dropped_by_age"] == 1  # 28 h old against a 1 h limit
+
+
+def test_method_describes_what_the_module_reads():
+    story_time = nm.METHOD["story_time"]
+    # Feed timestamps are read as sources/news.py reports them; nothing
+    # here can vouch that the feed or its parsing got them right.
+    assert "as the RSS feeds state it" not in story_time
+    assert "sources/news.py" in story_time and "UTC" in story_time
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous company names and country names
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("headline, feeds, phrase", [
+    ("Pan-Amazon summit ends without deforestation deal", {("finance", "CNBC")}, "pan-amazon"),
+    ("Lula vows to end illegal Amazon deforestation by 2030", {("finance", "CNBC")}, "deforestation"),
+    ("Big Apple office vacancies hit record as hybrid work sticks", {("finance", "CNBC")}, "big apple"),
+    ("Apple Hospitality REIT raises monthly dividend", {("finance", "MarketWatch")}, "apple hospitality"),
+    ("Post-Chevron, utilities challenge FERC transmission rule", {("energy", "Oil Price")}, "post-chevron"),
+    ("Supreme Court's Chevron ruling unleashes oil industry lawsuits against EPA",
+     {("energy", "Rigzone")}, "chevron ruling"),
+    ("Alphabet soup of rescue facilities confuses bond traders", {("finance", "WSJ Markets")}, "alphabet soup"),
+    ("Shell strikes Zaporizhzhia nuclear plant's power line", {("energy", "Oil Price")}, "shell strikes"),
+    ("A new meta analysis of AI coding tools finds small gains",
+     {("technology", "MIT Tech Review")}, "meta analysis"),
+    ("Oil majors slip as Fed signals 50 bp hike", {("energy", "Oil Price")}, "50 bp"),
+])
+def test_other_sense_phrases_exclude_ambiguous_names(headline, feeds, phrase):
+    mapped, _, excluded = nm.classify_companies(nm._clean_title(headline), feeds=feeds)
+    assert mapped == []
+    assert f"'{phrase}' in the headlines points to the other sense" in excluded[0]["reason"]
+
+
+@pytest.mark.parametrize("headline, feeds, ticker, admitted_by", [
+    ("Shell profit beats forecasts on strong LNG trading", {("energy", "Oil Price")}, "SHEL",
+     "article from an energy feed (Oil Price)"),
+    ("Chevron completes Hess takeover after arbitration win", {("finance", "FT World")}, "CVX",
+     "corroborating term 'hess'"),
+    ("Meta signs nuclear power deal for AI data centers", {("technology", "The Verge")}, "META",
+     "article from a technology feed (The Verge)"),
+    ("Samsung Electronics profit jumps on memory demand", {("asia_pacific", "Nikkei Asia")}, "005930.KS",
+     "corroborating term 'samsung electronics'"),
+    ("Amazon to cut 14,000 corporate jobs", {("finance", "WSJ Markets")}, "AMZN",
+     "article from a finance feed (WSJ Markets)"),
+])
+def test_company_sense_still_admitted(headline, feeds, ticker, admitted_by):
+    mapped, _, excluded = nm.classify_companies(headline, feeds=feeds)
+    assert excluded == []
+    assert (mapped[0]["ticker"], mapped[0]["admitted_by"]) == (ticker, admitted_by)
+
+
+def test_feed_context_counts_only_from_the_listed_feeds():
+    apple_terms = "iphone, ipad, macbook, app store, tim cook, apple inc, airpods, ios"
+    mapped, _, excluded = nm.classify_companies(
+        "Apple to open new campus in Texas", feeds={("finance", "FT World"), ("finance", "Zero Hedge")})
+    assert mapped == []
+    assert excluded[0]["reason"].endswith(
+        f"no corroborating term ({apple_terms}) in the headlines; finance articles count only from "
+        "CNBC, MarketWatch or WSJ Markets, and this story's are from FT World and Zero Hedge")
+    mapped, _, _ = nm.classify_companies("Apple to open new campus in Texas", feeds={("finance", "CNBC")})
+    assert mapped[0]["admitted_by"] == "article from a finance feed (CNBC)"
+    # Categories alone name no feed, so a finance category admits nothing
+    mapped, _, excluded = nm.classify_companies("Apple to open new campus in Texas", {"finance"})
+    assert mapped == []
+    assert excluded[0]["reason"].endswith(
+        "in the headlines; finance articles count only from CNBC, MarketWatch or WSJ Markets")
+    # Chevron: energy context only from Oil Price and Rigzone; "chevron's",
+    # "oil", "crude" and "refinery" no longer corroborate
+    _, _, excluded = nm.classify_companies(
+        "Chevron's demise leaves agencies exposed in court", feeds={("energy", "Utility Dive")})
+    assert excluded[0]["reason"].endswith(
+        "in the headlines; energy articles count only from Oil Price or Rigzone, and this story's "
+        "are from Utility Dive")
+    _, _, excluded = nm.classify_companies("Chevron's demise leaves agencies exposed in court", {"government"})
+    assert excluded[0]["entity"]["name"] == "Chevron"
+
+
+def test_name_hyphen_joined_on_either_side_is_not_admitted_by_a_feed():
+    mapped, _, excluded = nm.classify_companies(
+        "Anti-Amazon protests spread across French warehouses", feeds={("technology", "Wired")})
+    assert mapped == []
+    assert excluded[0]["reason"].endswith(
+        "; the technology feed does not count because 'amazon' only appears hyphen-joined")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_passes_feed_names_to_the_ambiguity_rule(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [_item("Apple to open new campus in Texas", "2026-10-16T12:00:00Z",
+                              "finance", "FT World")])
+    out = await nm.fetch_news_market_reaction(fast_fetcher, min_cluster_size=1, now=_SATURDAY)
+    assert out["company_reactions"] == []
+    assert out["excluded"][0]["reason"].endswith("and this story's are from FT World")
+
+
+def test_company_without_a_ticker_says_so():
+    _, unmapped, _ = nm.classify_companies("Gazprom export revenue slumps")
+    assert unmapped == [{"entity": {"type": "company", "name": "Gazprom", "sector": "energy"},
+                         "reason": "no ticker in the entity table"}]
+
+
+def test_country_index_rows_need_the_country_name():
+    excluded = []
+    mapped, unmapped = nm.classify_countries("American Airlines pilots vote to strike", excluded=excluded)
+    assert mapped == [] and unmapped == []
+    assert excluded == [{
+        "entity": {"type": "country", "iso3": "USA", "name": "United States"},
+        "reason": ("named only as 'american', not by the country's name (United States or USA); "
+                   "an index row needs the name itself"),
+    }]
+    for headline, iso3, form in [
+        ("Indian Ocean cyclone forces port closures", "IND", "'indian'"),
+        ("Tex-Mex chain files for bankruptcy", "MEX", "'mex'"),
+        ("New Mexico wildfire forces evacuations", "MEX", "'new mexico'"),
+        ("Gulf of Mexico output recovers after storm", "MEX", "'gulf of mexico'"),
+        ("Beijing hosts trade envoys", "CHN", "'beijing'"),
+    ]:
+        excluded = []
+        mapped, _ = nm.classify_countries(headline, excluded=excluded)
+        assert mapped == [], headline
+        assert excluded[0]["entity"]["iso3"] == iso3
+        assert excluded[0]["reason"].startswith(f"named only as {form}, not by the country's name")
+    mapped, _ = nm.classify_countries("USA and Mexico agree on steel quotas")
+    assert [m["index"] for m in mapped] == ["^GSPC", "^MXX"]
+    # Without a collector the row goes to unmapped: listed, never dropped
+    mapped, unmapped = nm.classify_countries("American Airlines pilots vote to strike")
+    assert mapped == [] and unmapped[0]["reason"].startswith("named only as 'american'")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_composite_lists_countries_named_only_by_a_demonym(fast_fetcher, monkeypatch):
+    _feed(monkeypatch, [_item("American Airlines pilots vote to strike", "2026-10-16T12:00:00Z",
+                              "geopolitics", "BBC World")])
+    out = await nm.fetch_news_market_reaction(fast_fetcher, min_cluster_size=1, now=_SATURDAY)
+    assert out["country_reactions"] == []
+    [row] = out["excluded"]
+    assert row["story"] == "American Airlines pilots vote to strike"
+    assert row["entity"]["iso3"] == "USA"
+    assert (out["summary"]["excluded"], out["summary"]["stories_with_entities"]) == (1, 1)

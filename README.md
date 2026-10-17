@@ -264,7 +264,7 @@ From the shell, `intel guide` prints the same guide markdown and
 ### News vs Market Reaction (1)
 | Tool | Description |
 |------|-------------|
-| `intel_news_market_reaction` | Companies and countries named in recent story clusters, mapped to tickers (SEC-confirmed for US listings) and country indices; the move on the story's market session (stock, benchmark, excess return; index return with a trailing z-score). After-close stories map to the next session, weekends and holidays to the next trading day, in the exchange's timezone. Unmapped and ambiguous names are listed with reasons; a failed quote is a data gap, never 0%. Co-movement, not causation; not a trading signal |
+| `intel_news_market_reaction` | Companies and countries named in recent story clusters, mapped to tickers from the entity table (US tickers annotated with their SEC registrant) and country indices; the move on the story's market session (stock, benchmark, excess return; index return with a trailing z-score). After-close stories map to the next session, weekends and holidays to the next trading day, in the exchange's timezone; a session not yet closed or not yet final is pending. Unmapped and ambiguous names are listed with reasons; a failed quote or an expired cached copy is a data gap, never 0%. Co-movement, not causation; not a trading signal |
 
 ### Macro Composite (1)
 | Tool | Description |

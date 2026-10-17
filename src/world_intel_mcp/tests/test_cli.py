@@ -2827,3 +2827,39 @@ def test_news_reaction_error_dict_and_json_mode(monkeypatch: pytest.MonkeyPatch)
     assert result.exit_code == 0
     assert '"excess_return_pct": -0.8196' in result.output
     assert "Companies" not in result.output
+
+
+def test_news_reaction_shows_window_story_time_and_age_cut(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prior session and the story's exchange-local time are on the
+    row, so a return over more than one session cannot pass unseen."""
+    import world_intel_mcp.analysis.news_market as news_market
+
+    apple = {
+        "story": {"headline": "Apple foldable iPhones sell out in hours",
+                  "first_published": "2026-10-15T20:30:00Z"},
+        "entity": {"type": "company", "name": "Apple"},
+        "symbol": "AAPL",
+        "benchmark": "SPY",
+        "published_local": "2026-10-15T16:30:00-04:00",
+        "session_date": "2026-10-16",
+        "prior_session_date": "2026-10-15",
+        "status": "measured",
+        "stock_return_pct": 0.4269,
+        "benchmark_return_pct": -1.1065,
+        "excess_return_pct": 1.5334,
+    }
+    data = {
+        **_NEWS_REACTION,
+        "company_reactions": [apple],
+        "summary": {**_NEWS_REACTION["summary"], "stories_dropped_by_age": 3, "max_age_hours": 168.0},
+    }
+    calls: list = []
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(data, calls))
+    result = _invoke("news-reaction", "--max-age-hours", "24")
+    assert result.exit_code == 0
+    assert calls[0]["max_age_hours"] == 24.0
+    out = result.output
+    assert "from 2026-10-15" in out
+    assert "story 2026-10-15T16:30:00-04:00" in out
+    assert "3 stories older than 168 h left out" in out
+    assert "+0.43%" in out and "+1.53%" in out
