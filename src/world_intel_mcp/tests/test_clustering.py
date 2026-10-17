@@ -4,7 +4,9 @@ Similarity values in comments are hand-computed from the token sets after
 stopword removal (e.g. "new" is a stopword and must not count).
 """
 
+import httpx
 import pytest
+import respx
 
 from world_intel_mcp.analysis.clustering import (
     cluster_articles,
@@ -175,6 +177,33 @@ async def test_fetch_news_clusters_reads_the_real_producer_outlet_key(
         ["Al Jazeera", "BBC", "Dawn Pakistan", "NPR World", "The Guardian World",
          "Times of Israel", "SCMP"]
     )
+
+
+@respx.mock
+async def test_fetch_news_clusters_through_the_real_feed_parser(fetcher) -> None:
+    # No hand-made items: every multilingual feed serves the same RSS
+    # document through the real fetch_news_feed, so a producer key the
+    # clusterer does not read (feed_name vs source_name) fails here.
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Feed</title>
+<item><title>Pope Leo leaves hospital after lung cancer surgery</title>
+<link>https://news.example/pope</link><pubDate>Sat, 17 Oct 2026 16:47:52 GMT</pubDate></item>
+</channel></rss>"""
+    respx.route().mock(return_value=httpx.Response(200, text=rss))
+
+    result = await fetch_news_clusters(fetcher, category="multilingual")
+    assert result["cluster_count"] == 1
+    cluster = result["clusters"][0]
+    assert cluster["size"] == 7
+    assert sorted(cluster["sources"]) == [
+        "BBC Mundo", "DW Deutsch", "DW Español", "France24 Français",
+        "RFI Français", "UN News Español", "UN News Français",
+    ]
+    # Seven feeds, five publishers: the two DW feeds and the two UN News
+    # feeds each count once; BBC Mundo and France24 Français report as
+    # their publishers.
+    assert cluster["outlets"] == ["BBC", "DW", "France 24", "RFI Français", "UN News"]
+    assert cluster["outlet_count"] == 5
 
 
 async def test_fetch_news_clusters_marks_an_rss_outage(

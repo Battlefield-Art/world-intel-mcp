@@ -512,7 +512,8 @@ def _parse_published(entry: dict) -> str | None:
     feedparser stores the parsed time struct in ``published_parsed``, in
     UTC. ``calendar.timegm`` reads it as UTC; ``time.mktime`` (used before
     2026-10-17) read it as local time and shifted every stamp by the host's
-    UTC offset. Falls back to the raw ``published`` string if parsing fails.
+    standard UTC offset (the struct carries tm_isdst=0). Falls back to the
+    raw ``published`` string if parsing fails.
     """
     from calendar import timegm
 

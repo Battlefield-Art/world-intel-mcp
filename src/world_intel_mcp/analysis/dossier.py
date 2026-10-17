@@ -112,7 +112,7 @@ async def fetch_country_dossier(
         _safe(fetch_country_stocks(fetcher, country=iso3), "country_stocks"),
         _safe(fetch_election_calendar(fetcher, country=iso3), "elections"),
         _safe(fetch_sanctions_search(fetcher, query=iso3, limit=10), "sanctions"),
-        _safe(fetch_news_feed(fetcher, category="all", limit=200), "news_feed"),
+        _safe(fetch_news_feed(fetcher, category=None, limit=200), "news_feed"),
     )
 
     # --- Section 1: Overview ---
@@ -175,21 +175,57 @@ async def fetch_country_dossier(
         sanctions = {"_error": sanctions_data["_error"]}
 
     # --- Section 6: News ---
+    # Every RSS feed (category=None), headlines matched on the country's
+    # keywords. Until 2026-10-17 this asked for category="all" (not a
+    # category, so the feed answered with an error dict), read "articles"
+    # and "source" (the producer emits "items" and "feed_name") and checked
+    # only "_error": the section was always empty, with no marker. A failed
+    # feed is now a gap with mention_count None, never zero mentions.
     news_mentions = []
-    if "_error" not in news_data:
-        country_keywords = country_config.get("keywords", [country_name.lower()])
-        for article in news_data.get("articles", []):
+    news_gaps: list[str] = []
+    news_marker: dict = {}
+    country_keywords = country_config.get("keywords")
+    if "_error" in news_data:
+        news_gaps.append(f"news feed failed: {news_data['_error']}; mentions not measured")
+        news_marker = {
+            "error": news_data["_error"],
+            "degraded": True,
+            "reason": "news_feed_exception",
+        }
+    elif news_data.get("error"):
+        news_gaps.append(f"news feed: {news_data['error']}; mentions not measured")
+        news_marker = {k: news_data[k] for k in ("error", "degraded", "reason") if k in news_data}
+    elif not country_keywords:
+        news_gaps.append(
+            f"no headline keywords for {iso3} (only the {len(TIER1_COUNTRIES)} tier-1 "
+            "countries have them); mentions not searched"
+        )
+    else:
+        for article in news_data.get("items", []):
             title = (article.get("title") or "").lower()
             if any(kw in title for kw in country_keywords):
                 news_mentions.append({
                     "title": article.get("title"),
-                    "source": article.get("source"),
+                    "source": article.get("feed_name"),
                     "published": article.get("published"),
                     "link": article.get("link"),
                     "category": article.get("category"),
                 })
                 if len(news_mentions) >= 15:
                     break
+        failed_feeds = news_data.get("feeds_failed") or []
+        if failed_feeds:
+            news_gaps.append(
+                f"{len(failed_feeds)} of {news_data.get('feeds_attempted')} RSS feeds failed "
+                f"or timed out; their items are missing: {', '.join(failed_feeds)}"
+            )
+        stale_feeds = news_data.get("feeds_stale") or []
+        if stale_feeds:
+            news_gaps.append(
+                f"{len(stale_feeds)} RSS feeds were served from an expired cache copy: "
+                f"{', '.join(stale_feeds)}"
+            )
+    news_measured = not news_marker and bool(country_keywords)
 
     # --- Section 7: Security (hotspots + conflict zones) ---
     associated_hotspots = []
@@ -223,7 +259,9 @@ async def fetch_country_dossier(
         "sanctions": sanctions,
         "news": {
             "mentions": news_mentions,
-            "mention_count": len(news_mentions),
+            "mention_count": len(news_mentions) if news_measured else None,
+            **news_marker,
+            "data_gaps": news_gaps,
         },
         "security": security,
         "sections": ["overview", "economy", "markets", "elections", "sanctions", "news", "security"],

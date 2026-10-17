@@ -14,9 +14,8 @@
   15-minute buckets for 3 days and hourly buckets for 7) are flagged
   `partial`, judged from the first category series that answered when the
   base call failed, and today's unfinished UTC day is flagged
-  `in_progress`. The
-  module spaces its own GDELT calls 5.5 s apart and retries a failed call
-  once.
+  `in_progress`. A
+  failed call is retried once.
 - `intel_situations`: country pairs ("between": a headline naming two or
   more countries) and single countries ("inside": a headline naming one)
   ranked over a recent RSS window by most covered, most hostile (headline
@@ -43,6 +42,12 @@
   (4 of 4 sources ok, 9.8 s). Each caller still gets its own limit and
   its own item copies, and a caller's timeout does not cancel the read
   the others are waiting on.
+- Live GDELT calls are spaced at least 5 s apart by the fetcher
+  (`_SOURCE_RATE_LIMITS["gdelt"]`), for every GDELT caller: GDELT's 429
+  body asks for "one every 5 seconds" (measured 2026-10-17). Cache hits are
+  not delayed. The limiter is per process, so the MCP server and the
+  collector do not share it, and the fetcher's own retries inside one call
+  are not spaced by it.
 
 ### Fixed
 - RSS outage read as a slow news day (ROADMAP Phase 24.5):
@@ -70,7 +75,25 @@
   `intel_world_brief` top-story sources).
 - RSS `published` times were shifted by the host's UTC offset:
   `_parse_published` read feedparser's UTC struct with `time.mktime`
-  (local time). On a UTC-4 host every stamp was four hours in the future.
+  (local time) instead of `calendar.timegm`. The struct carries
+  `tm_isdst=0`, so the shift is the zone's standard offset: on mac-studio
+  (US Eastern) an item published 14:43:52 UTC came out `19:43:52Z`, five
+  hours ahead (measured 2026-10-17). The amount depends on the host zone
+  (none on a UTC host). It skewed every RSS-based time window and any
+  ordering against non-RSS times. The regression test sets its own zone,
+  so it fails on the old code on a UTC CI runner too.
+- Country dossier news was always empty, with no marker (ROADMAP Phase
+  24.5), for three reasons: it asked `fetch_news_feed` for
+  `category="all"`, which is not a category (the feed answered with an
+  error dict); it read `articles` and `source`, while the feed emits
+  `items` and `feed_name`; and it checked only its own `_error`, never the
+  feed's `error`. It now reads every feed, passes a feed error or outage
+  through as `error` / `degraded` / `reason` with `mention_count: null`
+  and a `data_gaps` entry, and names failed or stale feeds. A fourth
+  quiet zero: 28 of the 50 accepted country codes (GB, DE, JP and others)
+  have no headline keywords, so the search could never match; the section
+  now says "mentions not searched" instead of reporting zero.
+  `intel dossier` prints `News: not measured` and the gaps in that case.
 
 ## 0.11.0 - 2026-10-12
 

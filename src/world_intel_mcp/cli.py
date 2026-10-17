@@ -1518,9 +1518,14 @@ def dossier(ctx: click.Context, country: str) -> None:
 
     # News
     news = data.get("news", {})
-    console.print(f"[blue]News:[/blue] {news.get('mention_count', 0)} recent mentions")
+    if "mention_count" in news and news["mention_count"] is None:
+        # A failed feed (or a country without keywords) is not zero mentions.
+        console.print("[blue]News:[/blue] not measured")
+    else:
+        console.print(f"[blue]News:[/blue] {news.get('mention_count', 0)} recent mentions")
     for art in news.get("mentions", [])[:3]:
         console.print(f"  - {escape(art.get('title', 'N/A')[:80])}")
+    _print_data_gaps(news)
 
     # Security
     sec = data.get("security", {})

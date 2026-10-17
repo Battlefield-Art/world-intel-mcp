@@ -462,10 +462,12 @@ def test_parse_published_fallbacks() -> None:
 def test_parse_published_is_utc_on_a_non_utc_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """feedparser's *_parsed structs are UTC. time.mktime read them as
-    local time, so on mac-studio (EDT) every published stamp came out
-    four hours in the future (measured live 2026-10-17: a feed's newest
-    item stamped 20:18Z at 16:20Z)."""
+    """feedparser's *_parsed structs are UTC with tm_isdst=0. time.mktime
+    read them as local standard time, so on mac-studio (US Eastern) every
+    published stamp came out five hours ahead, daylight time or not
+    (measured 2026-10-17: an item published 14:43:52 UTC was emitted as
+    19:43:52Z). The test sets its own zone, so it fails on the old code
+    on a UTC host too."""
     import time as time_mod
 
     monkeypatch.setenv("TZ", "America/New_York")

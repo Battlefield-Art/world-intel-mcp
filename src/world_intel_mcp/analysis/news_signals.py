@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
@@ -291,12 +290,11 @@ GDELT_HOSTILITY_TERMS: dict[str, list[str]] = {
     ],
 }
 
-# GDELT asks for at most one request per 5 s per client (its 429 body,
-# measured 2026-10-17). The shared Fetcher has no GDELT floor, so this
-# module spaces its own live calls; cache hits are not delayed.
-_GDELT_SPACING_S = 5.5
+# GDELT asks for at most one request per 5 s (its 429 body, measured
+# 2026-10-17). The fetcher enforces that floor for every source="gdelt"
+# call (fetcher._SOURCE_RATE_LIMITS; cache hits are not delayed). This is
+# the extra pause before the one retry pass over failed calls.
 _GDELT_RETRY_WAIT_S = 10.0
-_gdelt_last_call = 0.0
 
 # The DOC API serves roughly the last three months.
 _MAX_DAYS = 90
@@ -327,16 +325,9 @@ def _resolve_country(value: str) -> tuple[str, str | None]:
 
 
 async def _gdelt_timeline(fetcher, query: str, mode: str, days: int) -> dict | None:
-    """One GDELT timeline call, spaced from this module's previous one."""
-    global _gdelt_last_call
+    """One GDELT timeline call (the fetcher spaces live GDELT calls)."""
     digest = hashlib.sha1(f"{mode}|{days}|{query}".encode()).hexdigest()[:16]
     cache_key = f"news_signals:gdelt:{mode}:{days}:{digest}"
-    live_call = fetcher.cache.get(cache_key) is None and fetcher.breaker.is_available("gdelt")
-    if live_call:
-        wait = _GDELT_SPACING_S - (time.monotonic() - _gdelt_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _gdelt_last_call = time.monotonic()
     data = await fetcher.get_json(
         news._GDELT_DOC_URL,
         source="gdelt",
@@ -549,7 +540,13 @@ async def fetch_hostility_timeline(
                 "whom, negation, or quotation, and one article can count in several "
                 "categories. 'all_monitored_articles' is GDELT's per-bucket total "
                 "('norm'). tone is GDELT timelinetone average tone, weighted by "
-                "the day's per-bucket article counts when those are available."
+                "the day's per-bucket article counts when those are available. "
+                "Unmeasured: the bucket resolution GDELT uses for spans over 7 "
+                "days, and whether it holds buckets before 2026-10-15T10Z (a 7-day "
+                "call returned none earlier). Every probe of either drew HTTP 429 "
+                "on 2026-10-17 (timespan=14d at 16:42Z, 16:51:16Z and 16:51:55Z; "
+                "Oct 11 to 13 by start and end date at 16:52:15Z and 16:52:53Z); "
+                "30 days was not probed."
             ),
             "definitions": {
                 "partial": (

@@ -25,6 +25,7 @@ import httpx
 import pytest
 import respx
 
+from world_intel_mcp import fetcher as fetcher_mod
 from world_intel_mcp.analysis import news_signals as ns
 from world_intel_mcp.analysis.classifier import classify_hostility
 from world_intel_mcp.sources import news
@@ -126,8 +127,9 @@ def _fast(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _no_sleep(*args, **kwargs) -> None:
         return None
 
+    # Also silences the fetcher's per-source GDELT floor, which sleeps
+    # through asyncio.sleep.
     monkeypatch.setattr(asyncio_mod, "sleep", _no_sleep)
-    monkeypatch.setattr(ns, "_GDELT_SPACING_S", 0.0)
     monkeypatch.setattr(ns, "_GDELT_RETRY_WAIT_S", 0.0)
 
 
@@ -437,7 +439,6 @@ async def test_hostility_timeline_spaces_live_calls_and_not_cache_hits(
         waits.append(delay)
 
     monkeypatch.setattr(asyncio_mod, "sleep", _record)
-    monkeypatch.setattr(ns, "_gdelt_last_call", 0.0)
     route, calls = _gdelt_router()
     respx.get(url__regex=r".*api\.gdeltproject\.org.*").mock(side_effect=route)
 
@@ -446,11 +447,37 @@ async def test_hostility_timeline_spaces_live_calls_and_not_cache_hits(
     # GDELT's one-per-5-s floor.
     assert len(calls) == 6
     assert len(waits) == 5
-    assert all(5.0 < w <= ns._GDELT_SPACING_S for w in waits)
+    assert all(4.5 < w <= fetcher_mod._SOURCE_RATE_LIMITS["gdelt"] for w in waits)
 
     again = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
     assert len(calls) == 6 and len(waits) == 5
     assert again["days"][1]["articles"] == _DAY_ARTICLES["2026-10-16"]
+
+
+@respx.mock
+async def test_gdelt_search_and_timeline_share_one_rate_limit(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every GDELT caller goes through the fetcher's per-source floor, so an
+    # intel_gdelt_search call and the timeline's calls cannot burst
+    # together (GDELT's 429 text: "one every 5 seconds").
+    waits: list[float] = []
+
+    async def _record(delay, *args, **kwargs) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio_mod, "sleep", _record)
+    route, _ = _gdelt_router()
+    respx.get(url__regex=r".*api\.gdeltproject\.org.*").mock(side_effect=route)
+
+    assert fetcher_mod._SOURCE_RATE_LIMITS["gdelt"] == 5.0
+    await news.fetch_gdelt_search(fetcher, "Iran")
+    assert waits == []
+    await ns.fetch_hostility_timeline(fetcher, "Iran", days=3, now=_NOW_GDELT)
+    # All six timeline calls wait, the first one included: it follows the
+    # search.
+    assert len(waits) == 6
+    assert all(4.5 < w <= 5.0 for w in waits)
 
 
 def test_parse_ts_rejects_naive_and_garbage() -> None:
