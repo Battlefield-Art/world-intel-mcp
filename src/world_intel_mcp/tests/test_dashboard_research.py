@@ -889,6 +889,56 @@ def test_failed_refresh_keeps_the_earlier_copy_and_says_how_old(tmp_path) -> Non
     assert "Israel and Iran trade warnings" in m.text
 
 
+def test_kept_copy_age_is_measured_to_now(tmp_path) -> None:
+    """Reopened an hour after a failed refresh: the banner states how old
+    the copy is now, not only how old it was at the failed attempt; an
+    old loaded copy says how long ago it loaded."""
+    st = {
+        "lastAttempt": {"at": _T_MS + 61_000, "http": 503, "data": {"error": "boom"}, "error": "boom"},
+        "lastGood": {"at": _T_MS, "http": 200, "data": _SITUATIONS, "error": None},
+    }
+    hour_later = _T_MS + 3_720_000
+    failed_now, old_loaded, fresh_loaded = _js(tmp_path, [
+        ["renderResearch", "situations", st, hour_later],
+        ["renderResearch", "situations", _loaded(_SITUATIONS), hour_later],
+        ["renderResearch", "situations", _loaded(_SITUATIONS), _T_MS + 30_000],
+    ])
+    text = _Markup(failed_now).text
+    assert f"Showing the copy loaded {_CLOCK}, 61 s before that attempt. That copy is 62 min old now." in text
+    assert f"Loaded {_CLOCK}, 62 min ago; refreshes every 60 s" in _Markup(old_loaded).text
+    assert f"Loaded {_CLOCK}; refreshes every 60 s" in _Markup(fresh_loaded).text
+
+
+def test_no_comparable_feed_reads_as_not_measurable_never_as_no_growth(tmp_path) -> None:
+    """7 d window: the prior window starts 14 d back and no feed keeps that
+    much history, so feeds_comparable is 0 and the function reports change 0
+    and no attention. The panels say change cannot be measured."""
+    coverage = {**_COVERAGE, "feeds_comparable": 0, "items_current_window_comparable": 0}
+    window = {"hours": 168.0, "current": {"start": "2026-10-10T19:04:08Z", "end": "2026-10-17T19:04:08Z"},
+              "prior": {"start": "2026-10-03T19:04:08Z", "end": "2026-10-10T19:04:08Z"}}
+    sit = copy.deepcopy(_SITUATIONS)
+    sit.update(coverage=coverage, window=window, sort="change")
+    sit["situations"][0].update(current_comparable=0, prior=0, change=0, change_ratio=1.0)
+    top = {**_TOP, "attention": [], "coverage": coverage, "window": window}
+    html_sit, html_top, html_sit_ok = _js(tmp_path, [
+        ["renderResearch", "situations", _loaded(sit)],
+        ["renderResearch", "stories", _loaded(top)],
+        ["renderResearch", "situations", _loaded(_SITUATIONS)],
+    ])
+    s = _assert_inert(html_sit).text
+    assert ("Change against the prior window cannot be measured over this window: no feed keeps history back to "
+            "2026-10-03T19:04:08Z, so no feed is comparable. This is not a finding that nothing changed.") in s
+    assert "Sorted by change, but no change is measurable, so the order is by article count." in s
+    assert "change not measurable (no comparable feed)" in s
+    assert "(change 0" not in s and "ratio 1" not in s
+    t = _assert_inert(html_top).text
+    assert "Growth in mentions cannot be measured over this window" in t
+    assert "grew against the prior window;" not in t and "No named country" not in t
+    ok = _Markup(html_sit_ok).text  # comparable feeds: change shown as measured
+    assert "comparable feeds 9 now vs 4 prior (change +5, ratio 2)" in ok
+    assert "cannot be measured" not in ok
+
+
 def test_empty_result_states_its_threshold_and_coverage(tmp_path) -> None:
     sit, top = _js(tmp_path, [
         ["renderResearch", "situations", _loaded({**_SITUATIONS, "situations": [], "count": 0})],
