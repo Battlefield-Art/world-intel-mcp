@@ -37,6 +37,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -365,6 +366,82 @@ def test_top_stories_arguments_are_parsed_and_validated(client, fetcher, monkeyp
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("route", "func", "query", "kwargs"),
+    [
+        # The page's own 7 d requests, exactly as the controller builds them.
+        ("situations", "fetch_situations", "hours=168&sort=covered&kind=all",
+         {"hours": 168.0, "sort": "covered", "kind": "all", "limit": 20, "min_articles": 2}),
+        ("top-stories", "fetch_top_stories", "hours=168&min_outlets=3",
+         {"hours": 168.0, "min_outlets": 3, "limit": 10, "attention_limit": 10}),
+        ("situations", "fetch_situations", "hours=1&limit=1&min_articles=1",
+         {"hours": 1.0, "sort": "covered", "kind": "all", "limit": 1, "min_articles": 1}),
+        ("situations", "fetch_situations", "hours=168&limit=100&min_articles=1000",
+         {"hours": 168.0, "sort": "covered", "kind": "all", "limit": 100, "min_articles": 1000}),
+        ("top-stories", "fetch_top_stories", "hours=1&min_outlets=1&limit=1&attention_limit=1",
+         {"hours": 1.0, "min_outlets": 1, "limit": 1, "attention_limit": 1}),
+        ("top-stories", "fetch_top_stories", "hours=168&min_outlets=50&limit=50&attention_limit=50",
+         {"hours": 168.0, "min_outlets": 50, "limit": 50, "attention_limit": 50}),
+    ],
+)
+def test_inclusive_edges_are_accepted(client, fetcher, monkeypatch, route, func, query, kwargs) -> None:
+    calls = _stub(monkeypatch, news_signals, func, _SITUATIONS if route == "situations" else _TOP)
+    r = client.get(f"/api/{route}?{query}")
+    assert r.status_code == 200, r.text
+    assert calls == [(fetcher, kwargs)]
+
+
+@pytest.mark.parametrize(
+    ("route", "query", "error"),
+    [
+        ("situations", "limit=101", "limit must be between 1 and 100, got '101'"),
+        ("situations", "min_articles=1001", "min_articles must be between 1 and 1000, got '1001'"),
+        ("situations", "hours=0.99", "hours must be between 1 and 168, got '0.99'"),
+        ("top-stories", "hours=168.01", "hours must be between 1 and 168, got '168.01'"),
+        ("top-stories", "min_outlets=51", "min_outlets must be between 1 and 50, got '51'"),
+        ("top-stories", "limit=0", "limit must be between 1 and 50, got '0'"),
+        ("top-stories", "limit=51", "limit must be between 1 and 50, got '51'"),
+        ("top-stories", "attention_limit=0", "attention_limit must be between 1 and 50, got '0'"),
+    ],
+)
+def test_just_outside_the_edges_is_400(client, fetcher, monkeypatch, route, query, error) -> None:
+    calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    calls += _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    r = client.get(f"/api/{route}?{query}")
+    assert (r.status_code, r.json()) == (400, {"error": error})
+    assert calls == []
+
+
+def _schema(tools, name: str) -> dict:
+    (tool,) = [t for t in tools if t.name == name]
+    return tool.inputSchema["properties"]
+
+
+def test_route_choices_and_defaults_are_the_tool_schemas(client, fetcher, monkeypatch) -> None:
+    """The accepted sorts and kinds, and every default, are those the MCP
+    tool schemas declare. The schemas state no numeric ranges except hours
+    (1 to 168, in its description); the ranges for limit, min_articles,
+    min_outlets and attention_limit are the route's own."""
+    from world_intel_mcp.tools import liquidity as liquidity_tools
+    from world_intel_mcp.tools import news_signals as news_tools
+
+    sit = _schema(news_tools.TOOLS, "intel_situations")
+    top = _schema(news_tools.TOOLS, "intel_top_stories")
+    board = _schema(liquidity_tools.TOOLS, "intel_liquidity_board")
+    assert dashboard_app._SITUATION_SORTS == tuple(sit["sort"]["enum"])
+    assert dashboard_app._SITUATION_KINDS == tuple(sit["kind"]["enum"])
+    assert dashboard_app._LIQUIDITY_SORTS == tuple(board["sort"]["enum"])
+    assert "1 to 168" in sit["hours"]["description"] and "1 to 168" in top["hours"]["description"]
+    sit_calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    top_calls = _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    board_calls = _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD)
+    for path in ("/api/situations", "/api/top-stories", "/api/liquidity-board"):
+        assert client.get(path).status_code == 200, path
+    assert sit_calls[0][1] == {k: v["default"] for k, v in sit.items()}
+    assert top_calls[0][1] == {k: v["default"] for k, v in top.items()}
+    assert board_calls[0][1] == {k: v["default"] for k, v in board.items()}
+
+
 def test_top_stories_outage_exception_and_timeout(client, fetcher, monkeypatch) -> None:
     degraded = {"stories": [], "count": 0, "attention": [], "min_outlets": 3,
                 "error": "RSS feed read failed", "degraded": True, "reason": "rss_unavailable",
@@ -532,6 +609,38 @@ def test_collection_health_reads_the_store_and_returns_the_report_unchanged(clie
     assert by["legacy_feed"]["in_collector_roster"] is False
     assert by["tides"]["attempts"] == 0
     assert body["cannot_prove"] and body["storage"]["db_path"] == str(health_db)
+
+
+async def test_collection_health_opens_reads_and_closes_its_store_in_a_worker_thread(health_db, monkeypatch) -> None:
+    """Each request opens its own store, reads and closes it, all on one
+    thread that is not the event loop's (the test runs on the loop thread)."""
+    _populate(health_db)
+    loop_thread = threading.get_ident()
+    events: list[tuple[str, int]] = []
+
+    class Recording(HistoryStore):
+        def __init__(self, *args, **kwargs) -> None:
+            events.append(("open", threading.get_ident()))
+            super().__init__(*args, **kwargs)
+
+        def collection_health(self, *args, **kwargs):
+            events.append(("read", threading.get_ident()))
+            return super().collection_health(*args, **kwargs)
+
+        def close(self) -> None:
+            events.append(("close", threading.get_ident()))
+            super().close()
+
+    monkeypatch.setattr(dashboard_app, "HistoryStore", Recording)
+    transport = httpx.ASGITransport(app=dashboard_app.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+        for _ in range(2):
+            r = await c.get("/api/collection-health")
+            assert r.status_code == 200
+    assert [e for e, _ in events] == ["open", "read", "close"] * 2
+    assert loop_thread not in {t for _, t in events}
+    for i in (0, 3):  # within one request, one thread
+        assert len({t for _, t in events[i:i + 3]}) == 1
 
 
 def test_collection_health_one_source_and_unknown_source(client, health_db) -> None:
@@ -717,11 +826,17 @@ _SCRIPT = "<script>alert(2)</script>"
 
 
 def _js_command() -> list[str]:
+    """node, deno or bun. Without one the page tests skip locally, but fail
+    under CI (the CI variable set), where a skip would pass the run with
+    the renderers and the controller untested."""
     for name, args in (("node", []), ("deno", ["run", "--quiet", "--no-prompt"]), ("bun", ["run"])):
         path = shutil.which(name)
         if path:
             return [path, *args]
-    pytest.skip("no JavaScript runtime (node, deno or bun) on PATH")
+    reason = "no JavaScript runtime (node, deno or bun) on PATH"
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason}; CI must run the page tests")
+    pytest.skip(reason)
 
 
 def _js(tmp_path: Path, calls: list) -> list:
@@ -886,6 +1001,14 @@ def _poison(value, mark: str):
     if isinstance(value, dict):
         return {k: _poison(v, mark) for k, v in value.items()}
     return value
+
+
+@pytest.mark.parametrize(("ci", "outcome"), [("true", pytest.fail.Exception), ("", pytest.skip.Exception)])
+def test_missing_runtime_fails_under_ci_and_skips_locally(monkeypatch, ci, outcome) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setenv("CI", ci)
+    with pytest.raises(outcome, match="no JavaScript runtime"):
+        _js_command()
 
 
 def test_escape_helper_and_link_filter(tmp_path) -> None:
