@@ -10,8 +10,9 @@
   August 2026 when written). Nationwide or one land border region, all
   components or USBP / OFO, optionally one citizenship as CBP names it;
   with the latest month against the same month a year earlier, fiscal-year
-  totals (the year in progress compared with the same months of the prior
-  year, only when every one is published), breakdowns by component,
+  totals (the year in progress ends at the file's last month and is
+  compared with the same months of the prior year, only when every one is
+  published), breakdowns by component,
   encounter type and demographic, and the top citizenships with CBP's
   OTHER bucket reported apart and never ranked. CBP's fiscal months are
   mapped to calendar months (FY2026 October is October 2025).
@@ -19,10 +20,13 @@
   migrants and boats detected crossing the English Channel in small boats,
   with uncontrolled landings and the weekly migrants and events prevented
   by French authorities; month and year sums of the daily rows, and the
-  year to date against the same span a year earlier. Read through the
+  year to date against the same calendar dates a year earlier, compared
+  only when every day of both spans is in the file (`year_to_date` gives
+  `complete`, `days_reported` and `days_in_period`). Read through the
   GOV.UK Content API and the published ODS time series, parsed with the
-  standard library (zipfile + ElementTree, no new dependency). The
-  publisher's numbered notes are quoted from the file on every refresh.
+  standard library (zipfile and the expat streaming parser, no new
+  dependency). The publisher's numbered notes are quoted from the file on
+  every refresh.
 - Both are flows (events per period), stated in every response with units,
   date semantics and the publisher's caveats, and kept apart from the
   UNHCR and World Bank year-end stocks. Neither file has a person
@@ -34,10 +38,30 @@
   because CBP lists only non-zero cells, and months outside it are never
   invented. Weekly UK totals are checked against their seven days and any
   mismatch is named in `data_gaps`.
+- Downloaded files are untrusted input. The ODS reader refuses a DTD,
+  reads only the sheets the tool uses (SB_01, SB_02 and Notes), and
+  refuses a file past one budget for those sheets together (200,000 rows,
+  1,000,000 cells, 4,194,304 characters of text), checked before a repeat
+  count is expanded, or past 16 MiB of content.xml, 10,000 levels of
+  nesting, 2,000 distinct names or a tag (or text run) longer than 1 MiB;
+  a member compressed other than stored or deflated is not opened. A file
+  that cannot be read, whatever the parser fault, gives a degraded
+  response with a reason (or the last good copy, marked stale), and a
+  degraded response names its missing figures in `data_gaps` too. Rows
+  and cells that cannot be read outside the columns the tool uses are
+  named in `data_gaps` instead of failing the file; a CBP row with bytes
+  that are not UTF-8 in a column the tool reads is counted as unreadable.
 - Requests use an identifying User-Agent, two per refresh (the listing,
-  then the file), cached 12 h (CBP) and 3 h (UK). Paths that robots.txt
-  disallows are never requested; a newer-looking CBP file at such a path
-  is named in `data_gaps` instead.
+  then the file), cached 12 h (CBP) and 3 h (UK). Only https links on the
+  publishers' own hosts (www.cbp.gov; assets.publishing.service.gov.uk or
+  www.gov.uk), on the standard port and without credentials, are
+  requested. CBP's robots.txt rule is checked on the path as normalized
+  for the request (dot segments removed, escapes of unreserved characters
+  decoded), so paths it disallows are never requested; a newer-looking CBP
+  file at such a path is named in `data_gaps` instead, as is any
+  encounters link the tool cannot read. Redirects are followed, and the
+  download size caps apply after the body is read, both in the shared
+  fetcher (see the module's gaps).
 - Frontex is not built: its only data file is an XLSX under `/assets/`,
   which its robots.txt disallows (measured 2026-10-17, see ROADMAP Phase 28).
 - Tools 139 -> 141.

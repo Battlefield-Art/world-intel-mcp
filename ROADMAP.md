@@ -561,11 +561,15 @@ identifying User-Agent:
 | Publisher | Measured | Status |
 |-----------|----------|--------|
 | U.S. CBP | Dataset page `cbp.gov/document/stats/nationwide-encounters` 200; newest file a 6.7 MB CSV under `/sites/default/files/2026-09/` (200); robots.txt 200, disallows `/sites/default/files/assets/documents/` (the FY20-FY23 files and data dictionary, never requested); public domain, cite CBP | :white_check_mark: `intel_us_border_encounters`, monthly from October 2022 |
-| UK Home Office | GOV.UK Content API 200 (keyless, 10 requests/s); time series published only as ODS on `assets.publishing.service.gov.uk` (200, robots.txt 404), read with zipfile + ElementTree, no new dependency; Open Government Licence v3.0 | :white_check_mark: `intel_uk_small_boat_arrivals`, daily from 2018, weekly preventions from May 2024 |
+| UK Home Office | GOV.UK Content API 200 (keyless, 10 requests/s); time series published only as ODS on `assets.publishing.service.gov.uk` (200, robots.txt 404), read with zipfile and the expat streaming parser (DTDs refused; only the three sheets used are read, under one row, cell and text budget), no new dependency; Open Government Licence v3.0 | :white_check_mark: `intel_uk_small_boat_arrivals`, daily from 2018, weekly preventions from May 2024 |
 | Frontex | Migratory map page 200; its only data file is an XLSX under `/assets/`, which robots.txt (200) disallows for every user agent; not requested, no workaround | :red_circle: blocked by robots.txt (and XLSX only) |
 
 Not exposed yet: CBP sector and field-office (area of responsibility) and
 by-state detail, and CBP years before FY2023 (robots-disallowed path).
+Open (shared fetcher): redirects are followed, and the download size caps
+apply only after the body is read; the fix is for both tools to request
+with `Fetcher.get_bytes(..., follow_redirects=False)` once the fetcher
+offers it.
 
 ---
 
