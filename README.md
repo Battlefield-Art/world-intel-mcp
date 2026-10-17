@@ -135,6 +135,7 @@ intel liquidity            # Fed balance sheet, TGA, RRP, net liquidity, US M2, 
 intel net-liquidity -n 0   # full weekly history, components and RRP date per week
 intel news-reaction -c finance  # same-session moves of companies in the news
 intel status               # cache + circuit breaker health
+intel guide                # the research guide (also served as intel://guide)
 ```
 
 ---
@@ -156,6 +157,57 @@ collector.py  (daemon)    ─┘
 - **Sources** (`sources/*.py`): 30+ modules, each exports `async def fetch_*(fetcher, **kwargs) -> dict`.
 - **Analysis** (`analysis/*.py`): Cross-domain synthesis — signal aggregation, instability indexing, NLP, company enrichment, macro composite.
 - **Config** (`config/*.py`): Curated datasets — 22 hotspots, 70+ bases, 40 ports, 24 pipelines, 24 nuclear facilities, 34 cables, 48 datacenters, 27 spaceports, 82 exchanges.
+
+---
+
+## Research Guide: MCP Prompts and Resources
+
+Besides its tools, the server answers the MCP `resources` and `prompts`
+requests and advertises both capabilities at initialize. A connecting
+model can read which tool answers which question, and what the data
+cannot support, before it calls anything.
+
+| Resource | Type | What it holds |
+|----------|------|---------------|
+| `intel://guide` | Markdown | How to ask a strong question (name the period, the comparison, the measure and the place), what an answer contains, what this server will not do, the worked prompts, and every tool grouped by domain. Built from the live tool registry on each read, so it always matches `tools/list`. |
+| `intel://guide/source-health` | JSON | Open circuit breakers, stale serves, cache freshness per source prefix, and which keyed sources have their variables set (names only, never values). Reading it starts no fetch. Breaker state covers this server process only; the collector keeps its own. |
+| `intel://guide/measures` | Markdown | Amount outstanding versus flow, growth versus acceleration, percentage points, seasonal adjustment, observation versus publication versus collection dates, revisions, correlation and timing offsets, composite scores, and why missing data is not zero. |
+
+**29 prompts**, each a worked research question that names the tools to
+call and the limits an honest answer respects (arguments marked * are
+required):
+
+| Domain | Prompts |
+|--------|---------|
+| conflict | `conflict-trend` (country*, days), `hotspot-escalation` |
+| markets | `market-risk-snapshot`, `yield-curve-check`, `central-bank-compare`, `fx-move` (symbol*, base, days), `company-events` (ticker*), `energy-pressure`, `crypto-structure` |
+| hazards | `earthquake-exposure` (min_magnitude, hours), `severe-weather` (us_area, europe_country), `wildfire-situation` (region), `space-weather-impact` |
+| migration | `displacement-history` (country*, role), `migration-surges` (year) |
+| aviation | `airspace-anomaly` (cohort, region), `airport-disruption` |
+| cyber | `cyber-landscape` |
+| infrastructure | `internet-disruption` (country*, resource), `cloud-incidents` |
+| maritime | `maritime-chokepoints` |
+| aoi | `aoi-watch-setup` (name*, lat*, lon*, radius_km*), `aoi-review` (name*) |
+| news | `story-breadth` (topic*) |
+| politics | `election-watch` (country) |
+| finance | `sanctions-screen` (query*) |
+| health | `disease-watch` |
+| history | `history-recall` (topic*, hours) |
+| country | `country-overview` (country*) |
+
+`prompts/get` with `conflict-trend` and `{"country": "Sudan"}` returns one
+user message: the question with Sudan and the default 30-day window
+filled in, the numbered tools (`intel_ucdp_events`, `intel_acled_events`,
+`intel_unrest_events`) with what each call is for, the limits (recent
+days are the least complete; count events and fatalities separately;
+compare each source only with itself), and the shape of a complete
+answer. A missing required argument, an unknown argument or an unknown
+prompt is an `invalid params` error, never a guess. The tests fail if a
+prompt names a tool that is not registered, or if the guide leaves out a
+registered tool.
+
+From the shell, `intel guide` prints the same guide markdown and
+`intel guide --measures` prints the glossary.
 
 ---
 

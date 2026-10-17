@@ -82,6 +82,38 @@ source here, and no proxy is substituted for any of these measures.
   company sense dominates (a hyphen-joined use such as "meta-analysis" does
   not count). Responses say they describe same-session co-movement, not
   causation, and are not a trading signal. Tools 139 -> 140.
+### Added: research guide over MCP (prompts and resources)
+- The server now answers `resources/list`, `resources/read`, `prompts/list`
+  and `prompts/get`, and advertises the resources and prompts capabilities
+  at initialize. Before this it exposed tools only. No tools were added or
+  changed.
+- `intel://guide` (markdown): how to ask a strong question (period,
+  comparison, measure, place), what an answer contains, what this server
+  will not do, the worked prompts, and every registered tool grouped by
+  domain module. Built from the live registry on every read; a test fails
+  if a registered tool is missing or listed twice.
+- `intel://guide/source-health` (JSON): open circuit breakers, stale
+  serves, stale cache prefixes, cache freshness, and which keyed sources
+  have their variables set (names only, never values). Reads in-process
+  state and the cache database only; reading it starts no fetch. It says
+  that breaker state covers this server process only. The keyed-source
+  list is checked against the credentials `sources/*.py` actually read.
+- `intel://guide/measures` (markdown): stock versus flow, growth versus
+  acceleration, percentage points, seasonal adjustment, the three dates
+  (observation, publication, collection), revisions, correlation and
+  timing offsets, composite scores, missing data versus zero.
+- 29 prompts across conflict, markets, hazards, migration, aviation, cyber,
+  infrastructure, maritime, areas of interest, news, politics, sanctions,
+  health, stored history and country views. Each names the tools to call
+  and the limits to respect; arguments (country, topic, period and so on)
+  are validated, and a missing, unknown or invalid one is an
+  `invalid params` error. A test fails if any prompt names a tool that is
+  not registered.
+- `intel guide` prints the guide markdown; `intel guide --measures` prints
+  the glossary.
+- A test spawns the installed `world-intel-mcp` console script and drives
+  initialize, resources/list, resources/read, prompts/list, prompts/get
+  and tools/list over stdio.
 
 ## 0.11.0 - 2026-10-12
 

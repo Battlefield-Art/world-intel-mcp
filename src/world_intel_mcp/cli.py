@@ -2469,6 +2469,27 @@ def status(ctx: click.Context) -> None:
         console.print("\n[dim]No circuit breaker data yet (no requests made)[/dim]")
 
 
+@main.command(name="guide")
+@click.option(
+    "--measures", is_flag=True, help="Print the measures glossary instead of the guide"
+)
+@click.pass_context
+def guide_cmd(ctx: click.Context, measures: bool) -> None:
+    """Print the research guide the MCP server serves as intel://guide."""
+    from . import guide
+
+    if measures:
+        uri, text = guide.MEASURES_URI, guide.MEASURES
+    else:
+        uri, text = guide.GUIDE_URI, guide.render_guide()
+    if ctx.obj.get("json"):
+        _print_json({"uri": uri, "mime_type": "text/markdown", "text": text})
+        return
+    # click.echo, not console.print: tool descriptions contain brackets
+    # that Rich would parse as markup, and the output is meant to pipe.
+    click.echo(text, nl=False)
+
+
 @main.command(name="sync")
 @click.argument("source", required=False)
 def sync_cmd(source: str | None) -> None:
