@@ -53,10 +53,13 @@ responses say so. `limit=0` returns the full history.
   `fetch_failure`, and name the failure in `data_gaps`: the HTTP status, no
   response, an open circuit or an unexpected payload. Each stale copy served
   counts in the circuit breaker's `total_stale_serves` (`intel_status`), and none
-  is re-cached as fresh. Only parsed bodies enter the cache. ECB 404 responses
-  are final no-data answers, without outage retries. An empty ECB response is
-  one only when a start was requested; without one it is an unexpected payload
-  and takes the outage path, as does JSON that is not an object.
+  is re-cached as fresh. Only parsed bodies enter the cache. An ECB 404 whose
+  body is empty or a JSON object (the portal's problem answer) is a final
+  no-data answer, without outage retries; any other 404, such as an HTML or
+  plain-text error page, is retried, counted as a breaker failure and takes the
+  outage path. An empty ECB response is one only when a start was requested;
+  without one it is an unexpected payload and takes the outage path, as does
+  JSON that is not an object.
   Missing ECB roles and board rows are named; index bases, provisional status
   and percentage-point change units are retained. ECB keys must specify every
   dimension and request at most 50 series combinations.

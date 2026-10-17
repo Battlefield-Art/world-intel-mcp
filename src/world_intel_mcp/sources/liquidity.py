@@ -813,6 +813,24 @@ def parse_sdmx_json(data: dict, dataset: str) -> list[dict]:
 _JSON_KINDS = {list: "array", str: "string", int: "number", float: "number", bool: "boolean", type(None): "null"}
 
 
+def _ecb_404_is_no_data(body: bytes) -> bool:
+    """Whether an ECB 404 is the portal's own answer to a key that matches
+    no series: an empty body or a JSON object (its problem+json, e.g.
+    "No Series was returned for the query"). A 404 with any other body
+    (an HTML or plain-text error page, JSON that is not an object) came
+    from something in front of the portal and takes the outage path.
+
+    Residual risk: a JSON-object 404 from a moved gateway would still
+    read as no-data.
+    """
+    if not body.strip():
+        return True
+    try:
+        return isinstance(json.loads(body), dict)
+    except (ValueError, RecursionError):  # UnicodeError is a ValueError
+        return False
+
+
 async def _ecb_fetch(
     fetcher: Fetcher, dataset: str, key: str, last_n: int, start: date | None
 ) -> tuple[list[dict] | None, str | None]:
@@ -828,9 +846,9 @@ async def _ecb_fetch(
     if fetched:
         result = await fetcher.get_bytes(
             f"{_ECB_DATA_URL.format(dataset=dataset, key=key)}?{urlencode(params)}",
-            source=ECB_SOURCE, headers=_HEADERS, timeout=30.0,
+            source=ECB_SOURCE, headers=_HEADERS, timeout=30.0, accept_404=_ecb_404_is_no_data,
         )
-        if result.status == 404:
+        if result.status == 404 and result.error is None:
             return None, f"ECB Data Portal: no series matches the key {dataset}/{key}"
         # An unexpected payload takes the outage path (last good copy,
         # marked) without a circuit-breaker failure: the transport worked.
