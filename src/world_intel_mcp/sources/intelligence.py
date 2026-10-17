@@ -1490,30 +1490,58 @@ async def fetch_military_surge(fetcher: Fetcher) -> dict:
     2. Build temporal baselines for each region
     3. Run analysis.surge.detect_surges()
 
+    A theater that no military flight source answered for (posture's
+    unavailable_theaters) has unknown traffic, not zero: its regions go
+    unchecked and nothing is recorded in their baselines. With the posture
+    itself unavailable the response is an error.
+
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
 
     Returns:
-        Dict with surges list, regions checked, source, and timestamp.
+        Dict with surges list, regions checked, data_gaps, source, and
+        timestamp; unchecked_regions and degraded when some theaters had no
+        source; error / degraded / reason when the posture is unavailable.
     """
     now = datetime.now(timezone.utc)
 
     from . import military as mil_mod
+    from ..analysis.surge import _THEATER_REGION_MAP
 
     posture = await mil_mod.fetch_theater_posture(fetcher)
+    if posture.get("error"):
+        # An outage used to record a zero in every region's baseline and
+        # report no surges, the reading of an empty sky.
+        return {
+            "surges": [],
+            "surge_count": 0,
+            "regions_checked": 0,
+            "data_gaps": [
+                f"theater posture unavailable ({posture['error']}): no region was "
+                "checked and nothing was recorded in the surge baselines"
+            ],
+            "error": f"Theater posture unavailable: {posture['error']}",
+            "degraded": True,
+            "reason": posture.get("reason") or "theater_posture_unavailable",
+            "source": "military-surge-detection",
+            "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
     theater_data = posture.get("theaters", {})
+    unavailable_theaters = set(posture.get("unavailable_theaters") or [])
 
     # Build temporal baselines for each region
     temporal_baselines: dict[str, dict] = {}
+    unchecked: list[str] = []
     for region_name in SENSITIVE_REGIONS:
+        theaters = [
+            name for name, regions in _THEATER_REGION_MAP.items() if region_name in regions
+        ]
+        if unavailable_theaters.intersection(theaters):
+            unchecked.append(region_name)
+            continue
+
         # Record total aircraft count in the region's matching theaters
-        total = 0
-        from ..analysis.surge import _THEATER_REGION_MAP
-
-        for theater_name, mapped_regions in _THEATER_REGION_MAP.items():
-            if region_name in mapped_regions:
-                total += theater_data.get(theater_name, {}).get("count", 0)
-
+        total = sum(theater_data.get(name, {}).get("count", 0) for name in theaters)
         result = _temporal.record_and_check("surge_aircraft", region_name, total)
         if result is not None:
             temporal_baselines[region_name] = {
@@ -1523,13 +1551,23 @@ async def fetch_military_surge(fetcher: Fetcher) -> dict:
 
     surges = detect_surges(theater_data, temporal_baselines)
 
-    return {
+    response = {
         "surges": surges,
         "surge_count": len(surges),
-        "regions_checked": len(SENSITIVE_REGIONS),
+        "regions_checked": len(SENSITIVE_REGIONS) - len(unchecked),
+        "data_gaps": [],
         "source": "military-surge-detection",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if unchecked:
+        response["unchecked_regions"] = unchecked
+        response["degraded"] = True
+        response["data_gaps"].append(
+            "no military flight source answered for "
+            f"{', '.join(sorted(unavailable_theaters))}, so {', '.join(unchecked)} "
+            "went unchecked and nothing was recorded in their baselines"
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1549,32 +1587,23 @@ _NAVAL_KEYWORDS = re.compile(
 # models the long GIUK Gap and Strait of Malacca only near that point.
 _WATERWAY_PROXIMITY_KM = 300.0
 
-# NAVAREAs a waterway lies in, used only for warnings that state no
-# position. Only areas the NGA feed emits as single-NAVAREA codes can place
-# such a warning (code 4 is NAVAREA IV, code 12 is NAVAREA XII; see
-# maritime.NGA_AREA_CODES), and of the nine waterways only the Panama Canal
-# lies in either. NGA's own limits (IHO WWNWS13/3/2/IV-XII, 27 July 2021)
-# run the IV/XII boundary across the isthmus between 09-08-41N 078-44-03W
-# and 08-21-53N 081-39-33W, so the canal's Caribbean end is in IV and its
-# Pacific end in XII. IV lies west of 035W in the Atlantic and XII between
-# the Americas and the date line, so the other eight waterways are in
-# neither.
-_WATERWAY_NAVAREAS: dict[str, tuple[str, ...]] = {
-    "Panama Canal": ("IV", "XII"),
-}
-
+# A warning that states no readable position is credited to no waterway,
+# whatever its area code. Crediting one by NAVAREA (IV and XII both contain
+# the Panama Canal) gave Panama warnings from Hawaii, California and
+# Virginia: all 5 such credits in the 2026-10-17 capture were wrong, and
+# none of the 200 among the 3,480 warnings of 2024 named Panama. Requiring
+# the name would not fix it: 4:2024-468 names "PANAMA CITY", in Florida.
 _VESSEL_MATCHING_RULE = (
-    "A warning is credited to a waterway when any position stated in its "
-    "text lies within proximity_km of the waterway's reference point. A "
-    "warning that states no position is credited by NAVAREA only when its "
-    "area code names a single NAVAREA (4 is NAVAREA IV, 12 is NAVAREA XII) "
-    "that contains the waterway (waterway_navareas). HYDROLANT (A), HYDROPAC "
-    "(P) and HYDROARC (C) each span several NAVAREAs (area_codes), so a "
-    "positionless warning in those series is credited to no waterway, nor "
-    "is one whose only stated positions are malformed; naval ones are "
-    "listed in unplaced_naval_warnings. status counts the naval-keyword "
-    "warnings credited to the waterway; total_nearby counts credited "
-    "warnings of any topic, split by match in nearby_by_match."
+    "A warning is credited to a waterway only when a position stated in its "
+    "text (read in full, before the 500-character cut) lies within "
+    "proximity_km of the waterway's reference point. A warning that states "
+    "no readable position is credited to no waterway: its area code names "
+    "at least a whole NAVAREA (area_codes), far wider than proximity_km. "
+    "Naval ones are listed in unplaced_naval_warnings with the reason. "
+    "status counts the naval-keyword warnings credited to the waterway; it "
+    "reads stale when the feed's newest warning is older than "
+    "stale_after_days and unknown when the feed is unavailable. "
+    "total_nearby counts credited warnings of any topic."
 )
 
 
@@ -1582,14 +1611,16 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     """Naval activity snapshot at strategic waterways using NGA warnings.
 
     Uses NGA MSI (maritime.fetch_nav_warnings) filtered for naval/vessel
-    keywords. Each warning is credited only to the STRATEGIC_WATERWAYS it
-    concerns: a stated position within _WATERWAY_PROXIMITY_KM, or, for a
-    warning that states no position, a single-NAVAREA area code that
-    contains the waterway. The response states the rule (matching_rule).
+    keywords. Each warning is credited only to the STRATEGIC_WATERWAYS
+    within _WATERWAY_PROXIMITY_KM of a position it states; one that states
+    no readable position is credited nowhere and, if naval, listed in
+    unplaced_naval_warnings. The response states the rule (matching_rule).
     Before 2026-10-17 every warning counted at all nine waterways, so three
     naval warnings anywhere on Earth marked Panama and Hormuz critical alike.
-    Scores each waterway: clear/advisory/elevated/critical, or unknown when
-    the warning feed itself is unavailable.
+    Scores each waterway: clear/advisory/elevated/critical; stale when the
+    feed's newest warning is past its staleness threshold (the counts then
+    describe the feed's last update, status_as_of, not today); unknown when
+    the feed itself is unavailable.
 
     Note: Real-time AIS requires paid API.  This uses NGA MSI as a
     free proxy for naval activity indicators.
@@ -1599,9 +1630,9 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
 
     Returns:
         Dict with waterways list (each with total_nearby, the warnings of
-        any topic credited to it, and how each was matched), the matching
-        rule, naval warnings no rule could place, the feed's newest issue
-        date, data_gaps, source, and timestamp.
+        any topic credited to it, and status_as_of), the matching rule,
+        naval warnings no rule could place, the feed's newest issue date,
+        feed_stale, data_gaps, source, and timestamp.
     """
     now = datetime.now(timezone.utc)
 
@@ -1610,10 +1641,10 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     nav_data = await maritime.fetch_nav_warnings(fetcher)
     all_warnings = nav_data.get("warnings", []) or []
     feed_error = nav_data.get("error")
+    feed_stale = nav_data.get("feed_stale") is True
 
     credited: dict[str, dict] = {
-        ww["name"]: {"naval": [], "nearby": {"proximity": 0, "navarea": 0}}
-        for ww in STRATEGIC_WATERWAYS
+        ww["name"]: {"naval": [], "nearby": 0} for ww in STRATEGIC_WATERWAYS
     }
     unplaced_naval: list[dict] = []
     naval_total = 0
@@ -1623,11 +1654,18 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         text = warning.get("text") or ""
         is_naval = bool(_NAVAL_KEYWORDS.search(text))
         naval_total += is_naval
-        if len(text) > maritime._MAX_TEXT_LENGTH and text.endswith("..."):
-            truncated += 1
-        positions = maritime.extract_positions(text)
+        if isinstance(warning.get("positions"), list):
+            # fetch_nav_warnings read these from the full text, before the
+            # 500-character cut that used to hide later positions.
+            positions = [(p[0], p[1]) for p in warning["positions"]]
+            states_position = bool(positions) or bool(warning.get("mentions_position"))
+        else:
+            positions = maritime.extract_positions(text)
+            states_position = maritime.mentions_position(text)
+            if len(text) > maritime._MAX_TEXT_LENGTH and text.endswith("..."):
+                truncated += 1
 
-        matches: list[tuple[str, str, float | None]] = []
+        matches: list[tuple[str, float]] = []
         if positions:
             for ww in STRATEGIC_WATERWAYS:
                 distance = min(
@@ -1635,38 +1673,33 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
                     for lat, lon in positions
                 )
                 if distance <= _WATERWAY_PROXIMITY_KM:
-                    matches.append((ww["name"], "proximity", round(distance, 1)))
-        else:
+                    matches.append((ww["name"], round(distance, 1)))
+        elif is_naval:
             area = maritime.NGA_AREA_CODES.get(str(warning.get("navarea") or "").upper())
-            unplaced_reason = None
-            if maritime.mentions_position(text):
-                # Its only stated positions are malformed; crediting it by
-                # NAVAREA would place it at a waterway it does not concern.
-                unplaced_reason = "position_unreadable"
+            if states_position:
+                # Its only stated positions are malformed or not points.
+                reason = "position_unreadable"
             elif area is None:
-                unplaced_reason = "unknown_area_code"
-            elif not area["single_navarea"]:
-                unplaced_reason = "multi_navarea_series"
+                reason = "unknown_area_code"
+            elif area["single_navarea"]:
+                # One NAVAREA (XII) is still an ocean wide.
+                reason = "navarea_too_broad"
             else:
-                navarea = area["navareas"][0]
-                for ww in STRATEGIC_WATERWAYS:
-                    if navarea in _WATERWAY_NAVAREAS.get(ww["name"], ()):
-                        matches.append((ww["name"], "navarea", None))
-            if unplaced_reason and is_naval:
-                unplaced_naval.append(
-                    {
-                        "id": warning.get("id"),
-                        "navarea": warning.get("navarea"),
-                        "series": area["series"] if area else None,
-                        "issue_date": warning.get("issue_date"),
-                        "reason": unplaced_reason,
-                        "text_snippet": text[:200],
-                    }
-                )
+                reason = "multi_navarea_series"
+            unplaced_naval.append(
+                {
+                    "id": warning.get("id"),
+                    "navarea": warning.get("navarea"),
+                    "series": area["series"] if area else None,
+                    "issue_date": warning.get("issue_date"),
+                    "reason": reason,
+                    "text_snippet": text[:200],
+                }
+            )
 
-        for name, basis, distance in matches:
+        for name, distance in matches:
             entry = credited[name]
-            entry["nearby"][basis] += 1
+            entry["nearby"] += 1
             if is_naval:
                 entry["naval"].append(
                     {
@@ -1674,7 +1707,7 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
                         "text_snippet": text[:200],
                         "navarea": warning.get("navarea"),
                         "issue_date": warning.get("issue_date"),
-                        "match": basis,
+                        "match": "proximity",
                         "distance_km": distance,
                     }
                 )
@@ -1683,15 +1716,16 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
 
     for ww in STRATEGIC_WATERWAYS:
         entry = credited[ww["name"]]
-        # Nearest stated positions first, then NAVAREA-only matches.
-        naval_warnings = sorted(
-            entry["naval"],
-            key=lambda d: (d["match"] != "proximity", d["distance_km"] or 0.0),
-        )
+        # Nearest stated positions first.
+        naval_warnings = sorted(entry["naval"], key=lambda d: d["distance_km"])
         naval_count = len(naval_warnings)
 
         if feed_error:
             status = "unknown"
+        elif feed_stale:
+            # A frozen feed's warnings describe its last update, not today:
+            # three 2024 warnings near Hormuz used to read "critical".
+            status = "stale"
         elif naval_count >= 3:
             status = "critical"
         elif naval_count >= 2:
@@ -1709,25 +1743,30 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
                 "throughput": ww.get("throughput"),
                 "naval_warnings": naval_count,
                 "status": status,
+                "status_as_of": nav_data.get("newest_issue_date"),
                 "warning_details": naval_warnings[:5],
-                "total_nearby": sum(entry["nearby"].values()),
-                "nearby_by_match": dict(entry["nearby"]),
-                "naval_by_match": {
-                    basis: sum(1 for d in naval_warnings if d["match"] == basis)
-                    for basis in ("proximity", "navarea")
-                },
+                "total_nearby": entry["nearby"],
+                "nearby_by_match": {"proximity": entry["nearby"]},
+                "naval_by_match": {"proximity": naval_count},
             }
         )
 
     data_gaps = [f"NGA feed: {gap}" for gap in nav_data.get("data_gaps") or []]
     if feed_error and not data_gaps:
         data_gaps.append(f"NGA feed: {feed_error}")
+    if feed_stale and not feed_error:
+        data_gaps.append(
+            "every waterway reads stale, not a threat level: naval_warnings "
+            "counts warnings from a feed last updated "
+            f"{nav_data.get('newest_issue_date')} (status_as_of)"
+        )
     if unplaced_naval:
         data_gaps.append(
-            f"{len(unplaced_naval)} naval warning(s) state no readable position "
-            "and no single-NAVAREA area code, so no waterway is credited with "
-            "them (unplaced_naval_warnings): "
-            + ", ".join(f"{w['id']} ({w['reason']})" for w in unplaced_naval)
+            f"{len(unplaced_naval)} naval warning(s) state no readable position, "
+            "so no waterway is credited with them (unplaced_naval_warnings): "
+            + ", ".join(
+                f"{maritime._warning_label(w)} ({w['reason']})" for w in unplaced_naval
+            )
         )
     if truncated:
         data_gaps.append(
@@ -1744,12 +1783,12 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         "matching_rule": {
             "proximity_km": _WATERWAY_PROXIMITY_KM,
             "rule": _VESSEL_MATCHING_RULE,
-            "waterway_navareas": {k: list(v) for k, v in _WATERWAY_NAVAREAS.items()},
             "area_codes": maritime.area_codes_view(),
         },
         "newest_issue_date": nav_data.get("newest_issue_date"),
         "newest_issue_age_days": nav_data.get("newest_issue_age_days"),
         "stale_after_days": nav_data.get("stale_after_days"),
+        "feed_stale": nav_data.get("feed_stale"),
         "data_gaps": data_gaps,
         "source": "nga-msi-vessel-snapshot",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

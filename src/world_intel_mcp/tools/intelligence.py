@@ -146,7 +146,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_vessel_snapshot",
-        description="Naval activity snapshot at 9 strategic waterways (Hormuz, Malacca, Suez, etc.) from NGA navigational warnings. Each waterway scored clear/advisory/elevated/critical.",
+        description="Naval activity snapshot at 9 strategic waterways (Hormuz, Malacca, Suez, etc.) from NGA navigational warnings. A warning counts at a waterway only when a position it states lies within 300 km; naval warnings with no readable position are listed as unplaced. Each waterway scored clear/advisory/elevated/critical, stale when the feed's newest warning is past the staleness threshold (status_as_of gives the feed's date), or unknown when the feed is down.",
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(

@@ -7,7 +7,7 @@ No API key required.
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..fetcher import Fetcher
 
@@ -44,8 +44,11 @@ NAVAREAS = {
 # codes, the set the API's own GET /api/publications/broadcast-warn/navareas
 # lists ({"NAVAREA IV": "4", "HYDROLANT": "A", "NAVAREA XII": "12",
 # "HYDROPAC": "P", "HYDROARC": "C"}). Where each code's areas come from:
-#   4, 12    that endpoint names them NAVAREA IV and NAVAREA XII: one area
-#            each, so single_navarea is True.
+#   4, 12    that endpoint names them NAVAREA IV and NAVAREA XII. 12 carries
+#            only XII (single_navarea True). 4 also carries Canadian Arctic
+#            warnings: live 4:2023-808 "HUDSON BAY. CANADA." names "NAVAREA
+#            XVIII 56/23" in its authority field (2026-10-17 capture), so
+#            XVIII is listed for it and single_navarea is False.
 #   A, P, C  NGA's HYDROLANT, HYDROPAC and HYDROARC series, which rebroadcast
 #            other coordinators' warnings (Federal Register 2018-10215: the
 #            Atlantic edition carries HYDROLANT, the Pacific edition
@@ -67,8 +70,8 @@ NGA_AREA_CODES: dict[str, dict] = {
     "4": {
         "series": "NAVAREA IV",
         "navareas": ("IV",),
-        "unlisted_navareas": (),
-        "single_navarea": True,
+        "unlisted_navareas": ("XVIII",),
+        "single_navarea": False,
     },
     "12": {
         "series": "NAVAREA XII",
@@ -103,6 +106,11 @@ NGA_AREA_CODES: dict[str, dict] = {
 # (HYDROARC, the slowest), so 14 days is twice the slowest series' worst gap.
 STALE_AFTER_DAYS = 14
 
+# An issue date further ahead than this is a typo (one "MAY 2042" among
+# 2024 warnings used to make a frozen feed read 5,684 days fresh), so it is
+# left out of the freshness check and named in data_gaps.
+_FUTURE_TOLERANCE = timedelta(days=1)
+
 _MAX_TEXT_LENGTH = 500
 
 
@@ -126,6 +134,8 @@ def _extract_coords(text: str) -> tuple[float | None, float | None]:
     """Extract first lat/lon pair from NGA warning text.
 
     Parses formats like '22-16.65N 097-44.48W' into decimal degrees.
+    Degrees-minutes only and unvalidated; _parse_warning takes its lat/lon
+    from extract_positions instead.
     """
     m = _COORD_RE.search(text)
     if not m:
@@ -139,57 +149,73 @@ def _extract_coords(text: str) -> tuple[float | None, float | None]:
     return round(lat, 4), round(lon, 4)
 
 
-# Degrees-minutes-seconds positions ('20-03-44N 072-58-02W'), which NGA uses
-# in some light and buoy warnings. _COORD_RE never matches them: it needs a
-# hemisphere letter straight after the minutes.
-_COORD_DMS_RE = re.compile(
-    r"(\d{1,3})-(\d{1,2})-(\d{1,2}(?:\.\d+)?)\s*([NS])\s+"
-    r"(\d{1,3})-(\d{1,2})-(\d{1,2}(?:\.\d+)?)\s*([EW])",
+# One coordinate: degrees-minutes ('22-16.65') or degrees-minutes-seconds
+# ('20-03-44'). Latitude and longitude are read separately, so a mixed pair
+# ('20-03-44N 072-58.00W') parses as written. The lookbehind keeps a match
+# from starting inside a longer number: two separate patterns used to read
+# the '03-44N' of that mixed pair as latitude 3.73, about 1,800 km off.
+_COORD_PART = r"(\d{1,3})-(\d{1,2}(?:\.\d+)?)(?:-(\d{1,2}(?:\.\d+)?))?"
+
+# A lat/lon pair. Latitude and longitude may be separated by whitespace, a
+# comma or a slash: live HYDROLANT 2024-473, 479 and 488 write
+# '60-17.40S, 050-16.80W', which a whitespace-only separator never read.
+_POSITION_RE = re.compile(
+    rf"(?<![\d.-]){_COORD_PART}\s*([NS])(?:\s*[,/]\s*|\s+){_COORD_PART}\s*([EW])"
 )
+
+# Any single latitude or longitude ('24-30N', '080-00W', '65-07.80 S'),
+# paired or not: a warning that gives its area as latitude bands or
+# meridians does state a position, just not one point.
+_COORD_TOKEN_RE = re.compile(
+    r"(?<![\d.-])\d{1,3}-\d{1,2}(?:\.\d+)?(?:-\d{1,2}(?:\.\d+)?)?\s*[NSEW]\b"
+)
+
+
+def _decimal_degrees(degrees: str, minutes: str, seconds: str | None) -> float | None:
+    """Decimal degrees from NGA's degree, minute and optional second fields,
+    or None when the fields are malformed: minutes or seconds of 60 or
+    more, or decimal minutes followed by seconds."""
+    if seconds is None:
+        whole_minutes = float(minutes)
+        if whole_minutes >= 60:
+            return None
+        return int(degrees) + whole_minutes / 60
+    if "." in minutes or int(minutes) >= 60 or float(seconds) >= 60:
+        return None
+    return int(degrees) + int(minutes) / 60 + float(seconds) / 3600
 
 
 def extract_positions(text: str) -> list[tuple[float, float]]:
     """Every lat/lon position stated in NGA warning text, in text order.
 
-    Reads degrees-minutes ('22-16.65N 097-44.48W') and
-    degrees-minutes-seconds ('20-03-44N 072-58-02W'). A pair with minutes
-    or seconds of 60 or more, a latitude past 90 or a longitude past 180 is
-    skipped as malformed rather than guessed at.
+    Reads degrees-minutes ('22-16.65N 097-44.48W'),
+    degrees-minutes-seconds ('20-03-44N 072-58-02W') and the two mixed,
+    with whitespace, a comma or a slash between latitude and longitude. A
+    pair with minutes or seconds of 60 or more, a latitude past 90 or a
+    longitude past 180 is skipped as malformed rather than guessed at.
     """
-    found: list[tuple[int, float, float]] = []
-    for m in _COORD_RE.finditer(text):
-        lat_min, lon_min = float(m.group(2)), float(m.group(5))
-        if lat_min >= 60 or lon_min >= 60:
+    positions: list[tuple[float, float]] = []
+    for m in _POSITION_RE.finditer(text):
+        lat = _decimal_degrees(m.group(1), m.group(2), m.group(3))
+        lon = _decimal_degrees(m.group(5), m.group(6), m.group(7))
+        if lat is None or lon is None or lat > 90 or lon > 180:
             continue
-        lat = int(m.group(1)) + lat_min / 60
-        lon = int(m.group(4)) + lon_min / 60
-        found.append(
-            (m.start(), -lat if m.group(3) == "S" else lat, -lon if m.group(6) == "W" else lon)
+        positions.append(
+            (
+                round(-lat if m.group(4) == "S" else lat, 4),
+                round(-lon if m.group(8) == "W" else lon, 4),
+            )
         )
-    for m in _COORD_DMS_RE.finditer(text):
-        lat_m, lat_s = int(m.group(2)), float(m.group(3))
-        lon_m, lon_s = int(m.group(6)), float(m.group(7))
-        if max(lat_m, lat_s, lon_m, lon_s) >= 60:
-            continue
-        lat = int(m.group(1)) + lat_m / 60 + lat_s / 3600
-        lon = int(m.group(5)) + lon_m / 60 + lon_s / 3600
-        found.append(
-            (m.start(), -lat if m.group(4) == "S" else lat, -lon if m.group(8) == "W" else lon)
-        )
-    found.sort()
-    return [
-        (round(lat, 4), round(lon, 4))
-        for _, lat, lon in found
-        if abs(lat) <= 90 and abs(lon) <= 180
-    ]
+    return positions
 
 
 def mentions_position(text: str) -> bool:
-    """True when the text holds a lat/lon pair in either notation, readable
-    or not, so a warning whose only stated position is malformed (a live
-    2023 HYDROPAC text gives '10-52.0N 154-84.0W') is not mistaken for one
-    that states no position at all."""
-    return bool(_COORD_RE.search(text) or _COORD_DMS_RE.search(text))
+    """True when the text holds any latitude or longitude, readable or not,
+    so a warning whose only stated position is malformed (a live 2023
+    HYDROPAC text gives '10-52.0N 154-84.0W') or given as bands ('BETWEEN
+    24-30N AND 25-00N, WEST OF 080-00W') is not mistaken for one that
+    states no position at all."""
+    return bool(_COORD_TOKEN_RE.search(text))
 
 
 _ISSUE_DATE_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})Z\s+([A-Z]{3})\s+(\d{4})$")
@@ -228,17 +254,64 @@ def _parse_issue_date(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _freshness(warnings: list[dict], now: datetime) -> tuple[str | None, float | None]:
-    """(newest issue date as ISO 8601, its age in days) over the warnings
-    whose issue date parses; (None, None) when none does."""
-    dates = [
-        d for d in (_parse_issue_date(w.get("issue_date")) for w in warnings) if d
-    ]
+def _freshness(
+    warnings: list[dict], now: datetime
+) -> tuple[str | None, float | None, list[dict]]:
+    """(newest issue date as ISO 8601, its age in days, future-dated
+    warnings) over the warnings whose issue date parses. A date more than
+    _FUTURE_TOLERANCE ahead of now is left out of the newest date and
+    returned in the third item; (None, None, ...) when no date is usable."""
+    dates: list[datetime] = []
+    future: list[dict] = []
+    for w in warnings:
+        issued = _parse_issue_date(w.get("issue_date"))
+        if issued is None:
+            continue
+        if issued - now > _FUTURE_TOLERANCE:
+            future.append(w)
+        else:
+            dates.append(issued)
     if not dates:
-        return None, None
+        return None, None, future
     newest = max(dates)
     age_days = (now - newest).total_seconds() / 86400
-    return newest.strftime("%Y-%m-%dT%H:%M:%SZ"), round(age_days, 1)
+    return newest.strftime("%Y-%m-%dT%H:%M:%SZ"), round(age_days, 1), future
+
+
+def _warning_label(warning: dict) -> str:
+    """'<area code>:<id>' for data_gaps text. The id alone is ambiguous:
+    NGA numbers each series separately, so one YEAR-NUMBER can name two
+    active warnings (live 2024-12 is both a NAVAREA IV and a HYDROPAC one)."""
+    return f"{warning.get('navarea') or '?'}:{warning.get('id')}"
+
+
+# navarea filter values, mapped to the NGA area code each selects: the code
+# itself, its series name from the navareas endpoint, and the Roman numeral
+# of the two NAVAREAs that have a code of their own. The API sends only the
+# codes, so the numerals the tool documented used to match nothing.
+_NAVAREA_FILTER_CODES: dict[str, str] = {
+    **{code: code for code in NGA_AREA_CODES},
+    **{entry["series"]: code for code, entry in NGA_AREA_CODES.items()},
+    "IV": "4",
+    "XII": "12",
+}
+
+
+def _navarea_not_carried(requested: str) -> str:
+    """data_gaps text for a navarea filter value that selects no area code."""
+    numeral = requested.removeprefix("NAVAREA ")
+    carriers = [
+        f"{code} ({entry['series']})"
+        for code, entry in NGA_AREA_CODES.items()
+        if numeral in entry["navareas"] + entry["unlisted_navareas"]
+    ]
+    if carriers:
+        return (
+            f"NAVAREA {numeral} has no area code of its own in the NGA feed: its "
+            "warnings arrive inside series that also carry other NAVAREAs "
+            f"({', '.join(carriers)}; see area_codes)"
+        )
+    return f"no NGA area code, series or NAVAREA is called {requested!r} (see area_codes)"
 
 
 def area_codes_view() -> dict[str, dict]:
@@ -263,11 +336,15 @@ def _parse_warning(warning: dict) -> dict:
     cancel_date = warning.get("cancelDate")
     status = "cancelled" if cancel_date else "active"
 
-    text = warning.get("text", "") or ""
+    full_text = warning.get("text", "") or ""
+    # Positions come from the full text: reading them after the cut lost
+    # any stated past character 500.
+    positions = extract_positions(full_text)
+    text = full_text
     if len(text) > _MAX_TEXT_LENGTH:
         text = text[:_MAX_TEXT_LENGTH] + "..."
 
-    lat, lon = _extract_coords(text)
+    lat, lon = positions[0] if positions else (None, None)
 
     return {
         "id": warning_id,
@@ -280,6 +357,8 @@ def _parse_warning(warning: dict) -> dict:
         "authority": warning.get("authority", "NGA"),
         "lat": lat,
         "lon": lon,
+        "positions": [[p_lat, p_lon] for p_lat, p_lon in positions],
+        "mentions_position": mentions_position(full_text),
     }
 
 
@@ -295,16 +374,24 @@ async def fetch_nav_warnings(
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
-        navarea: Optional NAVAREA identifier (e.g. "IV", "XII") to filter by.
+        navarea: Optional NGA area code to filter by ("4", "12", "A", "P",
+            "C"), its series name ("HYDROPAC"), or "IV" / "XII" for codes 4
+            and 12. A value that selects no area the feed carries returns
+            error / reason "navarea_not_carried" and a data_gaps line,
+            never a bare count of 0.
 
     Returns:
-        Dict with warnings list, count, per-navarea breakdown, NAVAREA
-        definitions, the NGA area-code table (area_codes), the newest
-        warning's issue date and age in days, data_gaps, source, and
-        timestamp. A failed fetch or an unrecognized payload carries
-        error / degraded / reason, so an outage never reads as a quiet sea;
-        a response whose newest warning is older than STALE_AFTER_DAYS is
-        degraded, with the age named in data_gaps.
+        Dict with warnings list (each with every position its full text
+        states), count, per-navarea breakdown, NAVAREA definitions, the NGA
+        area-code table (area_codes), the newest active warning's issue date
+        and age in days, feed_stale, data_gaps, source, and timestamp. A
+        failed fetch or an unrecognized payload carries error / degraded /
+        reason, so an outage never reads as a quiet sea; a feed whose newest
+        active warning is older than STALE_AFTER_DAYS has feed_stale True and
+        the response is degraded, with the age named in data_gaps. The
+        freshness fields describe the whole active feed, before any navarea
+        filter. feed_stale is None when no usable issue date says how current
+        the feed is.
     """
     cache_label = navarea.upper() if navarea else "all"
     cache_key = f"maritime:warnings:{cache_label}"
@@ -326,6 +413,7 @@ async def fetch_nav_warnings(
         "newest_issue_date": None,
         "newest_issue_age_days": None,
         "stale_after_days": STALE_AFTER_DAYS,
+        "feed_stale": None,
         "data_gaps": [],
         "source": "nga-msi",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -385,19 +473,36 @@ async def fetch_nav_warnings(
             f"{data.get('_stale_age_seconds')} s old"
         )
 
-    # Filter to active warnings only
-    active_raw = [w for w in raw_warnings if _is_active(w)]
+    # Parse the active warnings into structured format
+    feed = [_parse_warning(w) for w in raw_warnings if _is_active(w)]
+    warnings = feed
 
     # Filter by NAVAREA if specified
     if navarea is not None:
-        navarea_upper = navarea.upper()
-        active_raw = [
-            w for w in active_raw
-            if str(w.get("navArea", "")).upper() == navarea_upper
+        requested = " ".join(navarea.upper().split())
+        code = _NAVAREA_FILTER_CODES.get(requested)
+        accepted = (
+            {value for value, c in _NAVAREA_FILTER_CODES.items() if c == code}
+            if code
+            else {requested}
+        )
+        warnings = [
+            w for w in feed
+            if " ".join(str(w.get("navarea", "")).upper().split()) in accepted
         ]
-
-    # Parse each warning into structured format
-    warnings = [_parse_warning(w) for w in active_raw]
+        response["navarea_filter"] = {"requested": navarea, "area_code": code}
+        if code is None and not warnings:
+            # "IV" used to return count 0 with no marker, which read as a
+            # NAVAREA with no active warnings.
+            response.update(
+                error=(
+                    f"navarea {navarea!r} matches no area the NGA feed carries; "
+                    "filter by an area code (4, 12, A, P, C) or by IV or XII"
+                ),
+                reason="navarea_not_carried",
+            )
+            response["data_gaps"].append(_navarea_not_carried(requested))
+            return response
 
     # Sort by issue date descending (most recent first)
     def _issue_sort_key(w: dict) -> str:
@@ -411,7 +516,10 @@ async def fetch_nav_warnings(
         na = w.get("navarea", "UNKNOWN")
         by_navarea[na] = by_navarea.get(na, 0) + 1
 
-    newest, age_days = _freshness(warnings, now)
+    # Freshness is the feed's, not the filtered slice's: a frozen feed is
+    # frozen for every area, and an area with nothing in force used to come
+    # back as a count of 0 dated by nothing.
+    newest, age_days, future = _freshness(feed, now)
     response.update(
         warnings=warnings,
         count=len(warnings),
@@ -419,20 +527,34 @@ async def fetch_nav_warnings(
         newest_issue_date=newest,
         newest_issue_age_days=age_days,
     )
-    if warnings and newest is None:
-        response["degraded"] = True
+    if future:
         response["data_gaps"].append(
-            "no warning carries a parseable issue date, so how current this "
-            "list is cannot be checked"
+            f"{len(future)} warning(s) carry an issue date more than "
+            f"{_FUTURE_TOLERANCE.days} day ahead, left out of the freshness check: "
+            + ", ".join(f"{_warning_label(w)} ({w.get('issue_date')})" for w in future)
         )
-    elif age_days is not None and age_days > STALE_AFTER_DAYS:
-        # Measured 2026-10-17: the live API's newest warning was issued
-        # 10 May 2024 and it holds none from 2025 or 2026 (status=all),
-        # yet this response looked current. Name the age instead.
+    if feed and newest is None:
         response["degraded"] = True
-        response["data_gaps"].append(
-            f"newest active warning was issued {newest}, {age_days:.0f} days "
-            f"ago, past the {STALE_AFTER_DAYS}-day staleness threshold: these "
-            "are historical warnings, not current conditions"
-        )
+        if future:
+            response["data_gaps"].append(
+                "no warning carries a usable issue date, so how current this "
+                "list is cannot be checked"
+            )
+        else:
+            response["data_gaps"].append(
+                "no warning carries a parseable issue date, so how current this "
+                "list is cannot be checked"
+            )
+    elif age_days is not None:
+        response["feed_stale"] = age_days > STALE_AFTER_DAYS
+        if response["feed_stale"]:
+            # Measured 2026-10-17: the live API's newest warning was issued
+            # 10 May 2024 and it holds none from 2025 or 2026 (status=all),
+            # yet this response looked current. Name the age instead.
+            response["degraded"] = True
+            response["data_gaps"].append(
+                f"newest active warning was issued {newest}, {age_days:.0f} days "
+                f"ago, past the {STALE_AFTER_DAYS}-day staleness threshold: these "
+                "are historical warnings, not current conditions"
+            )
     return response
