@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -55,7 +55,8 @@ class BinaryResult:
     ``status`` is the final HTTP status (None when no response arrived),
     ``content`` the body on 2xx, ``error`` a short reason otherwise. A
     404 is reported as ``status=404`` with no error so callers can tell
-    "not published (yet)" apart from "the fetch failed".
+    "not published (yet)" apart from "the fetch failed"; a 404 rejected
+    by ``accept_404`` carries an error like any failed fetch.
     """
 
     status: int | None
@@ -278,6 +279,7 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         max_bytes: int = 256 * 1024 * 1024,
+        accept_404: Callable[[bytes], bool] | None = None,
     ) -> BinaryResult:
         """Fetch a binary body with rate limiting, retries and circuit breaking.
 
@@ -285,6 +287,13 @@ class Fetcher:
         SQLite TTL cache, so callers own any on-disk caching. A 404 is a
         definitive answer (not retried, not a breaker failure). A body
         larger than ``max_bytes`` is refused rather than buffered.
+
+        ``accept_404`` (a predicate on the 404 body that must not raise)
+        separates the API's own "not found" from a 404 sent by something
+        in front of it, such as a proxy error page. A 404 it rejects is
+        handled like any other HTTP error: retried, then counted as a
+        breaker failure and returned as ``BinaryResult(404, None, error)``.
+        Without it, every 404 is a definitive answer.
         """
         if not self.breaker.is_available(source):
             return BinaryResult(None, None, f"circuit open for {source}")
@@ -300,7 +309,7 @@ class Fetcher:
                     url, headers=headers, timeout=timeout or self.default_timeout
                 )
                 last_status = resp.status_code
-                if resp.status_code == 404:
+                if resp.status_code == 404 and (accept_404 is None or accept_404(resp.content)):
                     self.breaker.record_success(source)
                     return BinaryResult(404, None, None)
                 resp.raise_for_status()
