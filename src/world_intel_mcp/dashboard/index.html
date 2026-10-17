@@ -623,6 +623,39 @@ a { color: var(--accent); text-decoration: none; }
 .cluster-conflict div { background: rgba(245,158,11,0.3) !important; color: var(--amber) !important; }
 .cluster-fire div { background: rgba(240,184,64,0.3) !important; color: var(--gold) !important; }
 .cluster-military div { background: rgba(96,165,250,0.3) !important; color: var(--blue) !important; }
+/* ═══════════════ RESEARCH PANELS ═══════════════ */
+#researchPanel {
+    /* right: clears the open drawer and its toggle tab */
+    position: fixed; top: var(--layers-top, 66px); left: 220px; right: 396px; bottom: 46px; z-index: 48;
+    display: flex; flex-direction: column; padding: 10px 14px;
+}
+#researchPanel[hidden] { display: none; }
+.rs-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.rs-tabs, .rs-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.rs-ctl { display: none; align-items: center; gap: 4px; font-family: var(--mono); font-size: 0.6rem; color: var(--dim); }
+.rs-ctl.on { display: inline-flex; }
+.rs-ctl select {
+    background: rgba(0,0,0,0.35); color: var(--bright); border: 1px solid var(--border); border-radius: 4px;
+    font-family: var(--mono); font-size: 0.6rem; padding: 2px 4px;
+}
+#rsClose { position: static; float: none; padding: 0 4px 0 8px; font-size: 1.2rem; line-height: 1; }
+.rs-body { flex: 1; overflow-y: auto; padding-top: 8px; font-size: 0.7rem; }
+.rs-body .sub { margin-top: 12px; }
+.rs-banner { padding: 6px 10px; margin: 4px 0 8px; border-radius: 6px; border: 1px solid var(--border); font-family: var(--mono); font-size: 0.64rem; line-height: 1.45; color: var(--bright); }
+.rs-banner.err { background: rgba(255,59,59,0.08); border-color: rgba(255,59,59,0.28); }
+.rs-banner.warn { background: rgba(255,159,28,0.07); border-color: rgba(255,159,28,0.25); }
+.rs-banner.info { background: rgba(0,229,255,0.05); border-color: rgba(0,229,255,0.15); }
+.rs-badge { display: inline-block; padding: 0 5px; margin-right: 2px; border-radius: 3px; border: 1px solid var(--border); font-family: var(--mono); font-size: 0.55rem; letter-spacing: 0.5px; color: var(--text); }
+.rs-badge.err { color: var(--red); border-color: rgba(255,59,59,0.35); }
+.rs-badge.warn { color: var(--amber); border-color: rgba(255,159,28,0.35); }
+.rs-note { margin: 2px 0 6px; color: var(--dim); font-size: 0.62rem; line-height: 1.45; }
+.rs-list > div { padding: 2px 0; border-top: 1px solid rgba(255,255,255,0.03); line-height: 1.4; }
+.rs-story { padding: 6px 0; border-top: 1px solid rgba(255,255,255,0.05); line-height: 1.45; }
+.rs-body .dtable td { vertical-align: top; }
+.rs-num { text-align: right; white-space: nowrap; }
+@media (max-width: 900px) {
+    #researchPanel { left: 10px; right: 10px; }
+}
     </style>
 </head>
 <body>
@@ -646,6 +679,7 @@ a { color: var(--accent); text-decoration: none; }
     <div class="search-box">
         <input class="search-input" id="searchInput" type="text" placeholder="/ Search..." spellcheck="false" autocomplete="off" />
     </div>
+    <button class="rgn-btn" id="researchToggle" title="Research panels: liquidity board, situations, top stories, collection health (key p)">RESEARCH</button>
     <div class="hud-stats" id="hudStats"></div>
     <div class="hud-status">
         <span class="conn-dot" id="connDot"></span>
@@ -822,6 +856,41 @@ a { color: var(--accent); text-decoration: none; }
         <div class="vec-results" id="vecResults"></div>
     </div>
 </div>
+
+<!-- RESEARCH PANELS -->
+<section id="researchPanel" class="glass" hidden aria-label="Research panels">
+    <div class="rs-head">
+        <div class="rs-tabs">
+            <button class="rgn-btn rs-tab" data-rs-tab="liquidity">Liquidity board</button>
+            <button class="rgn-btn rs-tab" data-rs-tab="situations">Situations</button>
+            <button class="rgn-btn rs-tab" data-rs-tab="stories">Top stories</button>
+            <button class="rgn-btn rs-tab" data-rs-tab="health">Collection health</button>
+        </div>
+        <div class="rs-controls">
+            <label class="rs-ctl" data-rs-for="liquidity">sort
+                <select id="rsLiqSort"><option value="biggest_move">biggest move</option><option value="newest">newest</option></select>
+            </label>
+            <label class="rs-ctl" data-rs-for="situations">window
+                <select id="rsSitHours"><option value="6">6 h</option><option value="24" selected>24 h</option><option value="72">72 h</option><option value="168">7 d</option></select>
+            </label>
+            <label class="rs-ctl" data-rs-for="situations">sort
+                <select id="rsSitSort"><option value="covered">most covered</option><option value="hostile">most hostile</option><option value="change">biggest change</option></select>
+            </label>
+            <label class="rs-ctl" data-rs-for="situations">kind
+                <select id="rsSitKind"><option value="all">all</option><option value="between">between countries</option><option value="inside">inside one country</option></select>
+            </label>
+            <label class="rs-ctl" data-rs-for="stories">window
+                <select id="rsTopHours"><option value="6">6 h</option><option value="24" selected>24 h</option><option value="72">72 h</option><option value="168">7 d</option></select>
+            </label>
+            <label class="rs-ctl" data-rs-for="stories">min outlets
+                <select id="rsTopOutlets"><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select>
+            </label>
+            <button class="rgn-btn" id="rsRefresh" title="Reload this panel now">Refresh</button>
+            <button class="detail-close" id="rsClose" title="Close (Esc)">&times;</button>
+        </div>
+    </div>
+    <div class="rs-body" id="rsBody"></div>
+</section>
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
@@ -1561,6 +1630,7 @@ function _buildHelpOverlay() {
         ['__section', 'Actions'],
         ['a', 'Toggle all layers on/off'],
         ['f', 'Toggle fullscreen'],
+        ['p', 'Research panels (liquidity, situations, stories, collection health)'],
     ];
     rows.forEach(function(r) {
         var tr = document.createElement('tr');
@@ -3548,6 +3618,458 @@ function connectVectorSSE() {
     source.onopen = function() { vecReconnectDelay = 1000; };
 }
 connectVectorSSE();
+
+// ════════════ RESEARCH PANELS ════════════
+// research-render:begin
+// Pure renderers: (panel request state, payload) -> HTML string. They touch
+// no DOM and no page globals, so the test suite runs this block under a
+// JavaScript runtime and checks the markup. Every payload string passes
+// through rEsc and every link through rHref (http and https only); the
+// controller below still assigns the result through safe().
+var RESEARCH_REFRESH_MS = 60000;
+
+function rEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function rHref(u) {
+    var s = String(u == null ? '' : u).trim();
+    return /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : null;
+}
+function rLink(text, url) {
+    var h = rHref(url);
+    return h ? '<a href="' + rEsc(h) + '" data-external="1">' + rEsc(text) + '</a>' : rEsc(text);
+}
+function rNum(v, maxDigits) {
+    if (typeof v !== 'number' || !isFinite(v)) return 'n/a';
+    return v.toLocaleString('en-US', { maximumFractionDigits: maxDigits == null ? 2 : maxDigits });
+}
+function rSigned(v, maxDigits) {
+    if (typeof v !== 'number' || !isFinite(v)) return 'n/a';
+    return (v > 0 ? '+' : '') + rNum(v, maxDigits);
+}
+function rClock(ms) { return new Date(ms).toISOString().slice(11, 19) + 'Z'; }
+function rAge(seconds) {
+    if (typeof seconds !== 'number' || !isFinite(seconds)) return 'n/a';
+    var s = Math.max(0, Math.round(seconds));
+    if (s < 120) return s + ' s';
+    if (s < 7200) return Math.round(s / 60) + ' min';
+    if (s < 172800) return Math.round(s / 3600) + ' h';
+    return Math.round(s / 86400) + ' d';
+}
+function rPlural(n, word) { return rNum(n, 0) + ' ' + word + (n === 1 ? '' : 's'); }
+function rArr(v) { return Array.isArray(v) ? v : []; }
+function rList(items) {
+    return '<div class="rs-list">' + items.map(function(t) { return '<div>' + rEsc(t) + '</div>'; }).join('') + '</div>';
+}
+function rGaps(d) {
+    var gaps = rArr(d.data_gaps);
+    return gaps.length ? '<div class="sub">Data gaps</div>' + rList(gaps) : '';
+}
+function rNotes(d) {
+    var h = '';
+    var defs = d.definitions && typeof d.definitions === 'object' ? d.definitions : {};
+    var keys = Object.keys(defs);
+    if (keys.length) h += '<div class="sub">Definitions</div>' + rList(keys.map(function(k) { return k + ': ' + defs[k]; }));
+    if (d.method) h += '<div class="sub">Method</div><div class="rs-note">' + rEsc(d.method) + '</div>';
+    return h + rGaps(d);
+}
+
+// Null when the response is a usable payload; otherwise the reason, in the
+// server's words when it gave any. The HTTP status is shown separately.
+function researchAttemptError(http, data) {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return http ? 'response was not JSON' : 'no response';
+    if (data.error) return typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+    if (!(http >= 200 && http < 300)) return 'no error message in the response';
+    return null;
+}
+
+// Liquidity board. Rows are grouped by what they measure and never mixed:
+// an amount outstanding is a level, a flow is a transaction total, and a
+// change between two levels is not a flow. Values keep the units the
+// payload states; nothing is converted.
+var R_MEASURES = [
+    ['amount_outstanding', 'Amounts outstanding (stocks)',
+        'Level at the end of each period, in the units each row states; nothing is converted between units or currencies. A change is the difference between two levels, in the row’s units: it is not a flow.'],
+    ['flow', 'Flows (transactions within the period)',
+        'Transactions during the period. A flow is not a level: it is never added to or netted against the amounts outstanding.'],
+    ['growth_rate', 'Growth rates (percent)', 'Annual growth rates; a change in a rate is in percentage points.'],
+    ['index', 'Indices', 'Index levels, not amounts.']
+];
+function rLiqRow(r) {
+    var f = r.freshness && typeof r.freshness === 'object' ? r.freshness : {};
+    var fresh = (typeof f.latest_age_days === 'number' ? rNum(f.latest_age_days, 0) + ' d old' : 'age unknown') +
+        (typeof f.expected_max_age_days === 'number' ? ' (expected within ' + rNum(f.expected_max_age_days, 0) + ' d)' : '');
+    if (f.stale) fresh += ' <span class="rs-badge warn">STALE</span>';
+    if (r.served_from_stale_cache || f.served_from_stale_cache) {
+        var age = typeof r.cache_age_seconds === 'number' ? r.cache_age_seconds : f.cache_age_seconds;
+        fresh += ' <span class="rs-badge warn">STALE CACHE' + (typeof age === 'number' ? ', ' + rAge(age) + ' old' : '') + '</span>';
+    }
+    return '<tr><td><span class="bright">' + rEsc(r.label || r.indicator) + '</span>' +
+        (r.status ? ' <span class="rs-badge">' + rEsc(r.status) + '</span>' : '') +
+        '<br><span class="dim">' + rEsc([r.dataset, r.source, r.frequency].filter(Boolean).join(' · ')) + '</span></td>' +
+        '<td class="rs-num">' + rNum(r.latest_value) + '</td>' +
+        '<td>' + rEsc(r.units || 'units not stated') + '</td>' +
+        '<td>' + rEsc(r.observed_at || 'n/a') + (r.period_end ? '<br><span class="dim">period end ' + rEsc(r.period_end) + '</span>' : '') + '</td>' +
+        '<td class="rs-num">' + rSigned(r.change) + (typeof r.change_pct === 'number' ? '<br><span class="dim">' + rSigned(r.change_pct) + '%</span>' : '') + '</td>' +
+        '<td class="rs-num">' + rNum(r.previous_value) + (r.previous_observed_at ? '<br><span class="dim">' + rEsc(r.previous_observed_at) + '</span>' : '') + '</td>' +
+        '<td>' + fresh + '</td></tr>';
+}
+function rLiqGroup(rows, title, note) {
+    if (!rows.length) return '';
+    var bases = [];
+    rows.forEach(function(r) { if (r.change_basis && bases.indexOf(r.change_basis) < 0) bases.push(r.change_basis); });
+    return '<div class="sub">' + rEsc(title) + '</div><div class="rs-note">' + rEsc(note) +
+        (bases.length ? ' Change: ' + rEsc(bases.join('; ')) + '.' : '') + '</div>' +
+        '<table class="dtable"><thead><tr><th>Indicator</th><th>Latest</th><th>Units</th><th>Observed</th><th>Change</th><th>Previous</th><th>Freshness</th></tr></thead><tbody>' +
+        rows.map(rLiqRow).join('') + '</tbody></table>';
+}
+function rLiqMethod(d) {
+    var m = d.net_liquidity_method && typeof d.net_liquidity_method === 'object' ? d.net_liquidity_method : {};
+    var formula = d.net_liquidity_formula || m.formula;
+    var comps = m.components && typeof m.components === 'object' ? m.components : {};
+    var keys = Object.keys(comps);
+    if (!formula && !keys.length && !m.alignment && !m.tga_choice) return '';
+    var h = '<div class="sub">How net liquidity is computed</div>';
+    if (formula) h += '<div class="rs-note">' + rEsc(formula) + '</div>';
+    if (keys.length) {
+        h += '<table class="dtable"><thead><tr><th>Series</th><th>Term</th><th>Observed</th><th>Units</th><th>Conversion</th></tr></thead><tbody>';
+        keys.forEach(function(k) {
+            var c = comps[k] && typeof comps[k] === 'object' ? comps[k] : {};
+            h += '<tr><td>' + rEsc(k) + '</td><td>' + rEsc(c.term) + '</td><td>' + rEsc(c.observed) +
+                (c.alignment ? '<br><span class="dim">' + rEsc(c.alignment) + '</span>' : '') + '</td><td>' + rEsc(c.units) + '</td><td>' + rEsc(c.conversion) + '</td></tr>';
+        });
+        h += '</tbody></table>';
+    }
+    if (m.alignment) h += '<div class="rs-note">Alignment: ' + rEsc(m.alignment) + '</div>';
+    if (m.tga_choice) h += '<div class="rs-note">TGA series: ' + rEsc(m.tga_choice) + '</div>';
+    return h;
+}
+function renderLiquidity(d, failed) {
+    var h = '';
+    if (!failed) {
+        var rows = rArr(d.indicators);
+        if (!rows.length) h += '<div class="rs-banner warn">The board answered with no indicator rows and no error.</div>';
+        var typed = {};
+        R_MEASURES.forEach(function(g) {
+            typed[g[0]] = true;
+            h += rLiqGroup(rows.filter(function(r) { return r.measure === g[0]; }), g[1], g[2]);
+        });
+        h += rLiqGroup(rows.filter(function(r) { return !typed[r.measure]; }), 'Measure not typed',
+            'The payload did not type these rows as a stock, flow, growth rate or index; read each on its own.');
+        if (d.ranking_rule) h += '<div class="rs-note">Sorted by ' + rEsc(d.sort || 'the order returned') + '. ' + rEsc(d.ranking_rule) + '</div>';
+        if (d.note) h += '<div class="rs-note">' + rEsc(d.note) + '</div>';
+    }
+    var un = rArr(d.unavailable);
+    if (un.length) {
+        h += '<div class="rs-banner warn">' + rPlural(un.length, 'indicator') + ' unavailable: shown as missing, never as zero.</div>' +
+            '<table class="dtable"><thead><tr><th>Indicator</th><th>Dataset</th><th>Reason</th></tr></thead><tbody>' +
+            un.map(function(u) { u = u || {}; return '<tr><td>' + rEsc(u.indicator) + '</td><td>' + rEsc(u.dataset || 'n/a') + '</td><td>' + rEsc(u.error) + '</td></tr>'; }).join('') +
+            '</tbody></table>';
+    }
+    h += rLiqMethod(d);
+    var blocked = rArr(d.blocked);
+    if (blocked.length) {
+        h += '<div class="sub">Not served: blocked upstreams</div>' +
+            '<table class="dtable"><thead><tr><th>Measure</th><th>Publisher</th><th>Status</th><th>Measured</th></tr></thead><tbody>' +
+            blocked.map(function(b) { b = b || {}; return '<tr><td>' + rEsc(b.measure) + '</td><td>' + rEsc(b.publisher) + '</td><td><span class="rs-badge warn">' + rEsc(b.status || 'blocked') + '</span></td><td>' + rEsc(b.measured) + '</td></tr>'; }).join('') +
+            '</tbody></table>';
+    }
+    return h + rGaps(d);
+}
+
+// Situations and top stories read the same RSS feeds; coverage says how
+// much of them could be read, so an empty list is a stated result.
+function rCoverage(d) {
+    var h = '';
+    var w = d.window && typeof d.window === 'object' ? d.window : null;
+    if (w && w.current) {
+        h += '<div class="rs-note">Window: last ' + rNum(w.hours, 1) + ' h, ' + rEsc(w.current.start) + ' to ' + rEsc(w.current.end) +
+            (w.prior ? '; compared with ' + rEsc(w.prior.start) + ' to ' + rEsc(w.prior.end) : '') + '.</div>';
+    }
+    var c = d.coverage && typeof d.coverage === 'object' ? d.coverage : null;
+    if (c) {
+        h += '<div class="rs-note">Read ' + rNum(c.items_read, 0) + ' items from ' + rPlural(c.feeds_ok, 'feed') + '; ' +
+            rNum(c.items_current_window, 0) + ' in the current window, ' + rNum(c.items_current_window_comparable, 0) + ' of them from the ' +
+            rNum(c.feeds_comparable, 0) + ' feeds comparable with the prior window, which had ' + rNum(c.items_prior_window, 0) + '.</div>';
+        var failedFeeds = rArr(c.feeds_failed), staleFeeds = rArr(c.feeds_stale);
+        if (failedFeeds.length) {
+            h += '<div class="rs-banner warn">Partial coverage: ' + rPlural(failedFeeds.length, 'feed') + ' failed or timed out and ' +
+                (failedFeeds.length === 1 ? 'is' : 'are') + ' absent: ' + rEsc(failedFeeds.join(', ')) + '.</div>';
+        }
+        if (staleFeeds.length) {
+            h += '<div class="rs-banner warn">' + rPlural(staleFeeds.length, 'feed') + ' failed live and came from an earlier copy: ' + rEsc(staleFeeds.join(', ')) + '.</div>';
+        }
+    }
+    return h;
+}
+function rFailedNews(d) {
+    return (d.reason ? '<div class="rs-note">Reason: ' + rEsc(d.reason) + '</div>' : '') + rCoverage(d) + rGaps(d);
+}
+function rHeadline(item) {
+    item = item || {};
+    var meta = [item.outlet, item.published].concat(rArr(item.hostility).length ? ['hostility: ' + rArr(item.hostility).join(', ')] : []);
+    return '<div>' + rLink(item.title || '(untitled)', item.link) + ' <span class="dim">' + rEsc(meta.filter(Boolean).join(', ')) + '</span></div>';
+}
+function renderSituations(d, failed) {
+    if (failed) return rFailedNews(d);
+    var list = rArr(d.situations);
+    var h = rCoverage(d);
+    if (!list.length) {
+        h += '<div class="rs-banner info">No situation' + (d.kind && d.kind !== 'all' ? ' (' + rEsc(d.kind) + ')' : '') + ' reached ' +
+            rNum(d.min_articles, 0) + ' articles in this window, over the coverage stated above.</div>';
+    }
+    list.forEach(function(s) {
+        s = s || {};
+        var names = rArr(s.countries).map(function(c) { return c && (c.name || c.iso3); }).filter(Boolean);
+        var cats = s.by_category && typeof s.by_category === 'object' ? s.by_category : {};
+        var catText = Object.keys(cats).filter(function(k) { return cats[k]; }).map(function(k) { return k + ' ' + cats[k]; }).join(', ');
+        h += '<div class="rs-story"><div><span class="bright">' + rEsc(names.join(s.kind === 'between' ? ' ↔ ' : ', ') || s.key) + '</span> ' +
+            '<span class="rs-badge">' + rEsc(s.kind) + '</span></div>' +
+            '<div class="dim">' + rPlural(s.articles, 'article') + ' from ' + rPlural(s.outlet_count, 'outlet') + '; hostile ' + rNum(s.hostile_articles, 0) +
+            (typeof s.hostile_share === 'number' ? ' (' + rNum(s.hostile_share * 100, 0) + '%)' : '') + (catText ? ': ' + rEsc(catText) : '') +
+            '; comparable feeds ' + rNum(s.current_comparable, 0) + ' now vs ' + rNum(s.prior, 0) + ' prior (change ' + rSigned(s.change, 0) +
+            ', ratio ' + rNum(s.change_ratio, 3) + ')</div>' +
+            '<div class="rs-list">' + rArr(s.sample_headlines).map(rHeadline).join('') + '</div></div>';
+    });
+    return h + rNotes(d);
+}
+function renderTopStories(d, failed) {
+    if (failed) return rFailedNews(d);
+    var stories = rArr(d.stories), att = rArr(d.attention);
+    var h = rCoverage(d) + '<div class="sub">Stories carried by at least ' + rPlural(d.min_outlets, 'outlet') + '</div>';
+    if (!stories.length) {
+        h += '<div class="rs-banner info">No story was carried by ' + rNum(d.min_outlets, 0) + ' or more distinct outlets in this window, over the coverage stated above.</div>';
+    }
+    stories.forEach(function(s) {
+        s = s || {};
+        h += '<div class="rs-story"><div class="bright">' + rEsc(s.headline) + '</div>' +
+            '<div class="dim">' + rPlural(s.outlet_count, 'outlet') + ', ' + rPlural(s.articles, 'article') + '; first seen ' + rEsc(s.first_seen) + ', last seen ' + rEsc(s.last_seen) + '</div>' +
+            '<div class="dim">Outlets: ' + rEsc(rArr(s.outlets).join(', ')) + '</div>' +
+            (rArr(s.keywords).length ? '<div class="tags">' + rArr(s.keywords).map(function(k) { return '<span class="tag">' + rEsc(k) + '</span>'; }).join('') + '</div>' : '') +
+            '<div class="rs-list">' + rArr(s.items).map(rHeadline).join('') + '</div></div>';
+    });
+    h += '<div class="sub">Attention: named entities that grew against the prior window</div>';
+    if (!att.length) {
+        h += '<div class="rs-banner info">No named country or organization grew against the prior window; only growth is listed.</div>';
+    } else {
+        h += '<table class="dtable"><thead><tr><th>Entity</th><th>Type</th><th>Now</th><th>Prior</th><th>Change</th><th>Ratio</th></tr></thead><tbody>' +
+            att.map(function(a) {
+                a = a || {};
+                return '<tr><td>' + rEsc(a.name) + (a.iso3 ? ' <span class="dim">' + rEsc(a.iso3) + '</span>' : '') + '</td><td>' + rEsc(a.type) + '</td>' +
+                    '<td class="rs-num">' + rNum(a.current_comparable, 0) + '</td><td class="rs-num">' + rNum(a.prior, 0) + '</td>' +
+                    '<td class="rs-num">' + rSigned(a.change, 0) + '</td><td class="rs-num">' + rNum(a.change_ratio, 3) + '</td></tr>';
+            }).join('') + '</tbody></table>';
+    }
+    return h + rNotes(d);
+}
+
+// Collection health: problems first; never_run is listed, not hidden, and
+// the report's own cannot_prove text is shown as given.
+var R_HEALTH_STATES = ['failing', 'degraded', 'not_attempted_recently', 'never_run', 'ok'];
+function rHealthRow(s) {
+    var reason = [s.last_reason, s.last_extract_error ? 'extraction: ' + s.last_extract_error : null].filter(Boolean).join('; ');
+    var overdue = s.overdue === true ? '<span class="rs-badge err">OVERDUE</span>' : (s.overdue === false ? 'no' : 'n/a');
+    return '<tr><td>' + rEsc(s.source) + (s.in_collector_roster === false ? ' <span class="rs-badge warn">not in roster</span>' : '') + '</td>' +
+        '<td>' + rEsc(s.last_attempt_at || 'n/a') + (typeof s.last_attempt_age_s === 'number' ? '<br><span class="dim">' + rAge(s.last_attempt_age_s) + ' before check</span>' : '') + '</td>' +
+        '<td>' + rEsc(s.last_success_at || 'never') + (typeof s.last_success_age_s === 'number' ? '<br><span class="dim">' + rAge(s.last_success_age_s) + ' before check</span>' : '') + '</td>' +
+        '<td class="rs-num">' + rNum(s.consecutive_failures, 0) + '</td>' +
+        '<td>' + overdue + (typeof s.overdue_after_s === 'number' ? '<br><span class="dim">after ' + rAge(s.overdue_after_s) + '</span>' : '') + '</td>' +
+        '<td>' + rEsc(reason || 'n/a') + '</td>' +
+        '<td>' + rEsc(s.latest_observed_at || 'n/a') + '</td></tr>';
+}
+function renderCollectionHealth(d, failed) {
+    if (failed) {
+        return (d.db_path ? '<div class="rs-note">Database: ' + rEsc(d.db_path) + '</div>' : '') +
+            (rArr(d.known_sources).length ? '<div class="rs-note">Known sources: ' + rEsc(rArr(d.known_sources).join(', ')) + '</div>' : '');
+    }
+    var sources = rArr(d.sources);
+    var counts = d.state_counts && typeof d.state_counts === 'object' ? d.state_counts : {};
+    var st = d.storage && typeof d.storage === 'object' ? d.storage : {};
+    var states = R_HEALTH_STATES.slice();
+    sources.forEach(function(s) { if (s && states.indexOf(s.state) < 0) states.push(s.state); });
+    var h = '<div class="rs-note">Checked ' + rEsc(d.checked_at) + ' in ' + rEsc(st.db_path || 'the dashboard cache database') +
+        '. Expected cadence ' + rNum(d.default_cadence_s, 0) + ' s unless a source overrides it; overdue past ' + rNum(d.overdue_multiple, 1) + ' cadences.</div>';
+    h += '<div class="mini-row">' + states.map(function(k) {
+        return '<div class="mini-box"><div class="v">' + rNum(typeof counts[k] === 'number' ? counts[k] : 0, 0) + '</div><div class="l">' + rEsc(String(k).replace(/_/g, ' ')) + '</div></div>';
+    }).join('') + '</div>';
+    if (!sources.length) {
+        h += '<div class="rs-banner warn">The report lists no sources.</div>';
+    } else if (sources.every(function(s) { return s && s.state === 'never_run'; })) {
+        h += '<div class="rs-banner warn">No collector capture is recorded in this database: every source reads never_run, which is not healthy. ' +
+            'History accrues only while intel-collector runs against this cache database (WORLD_INTEL_CACHE_DB); a collector writing to another database does not show here.</div>';
+    }
+    states.forEach(function(state) {
+        var rows = sources.filter(function(s) { return s && s.state === state; });
+        if (!rows.length) return;
+        h += '<div class="sub">' + rEsc(String(state).replace(/_/g, ' ')) + ' (' + rNum(rows.length, 0) + ')</div>';
+        if (state === 'never_run') {
+            h += '<div class="tags">' + rows.map(function(s) {
+                return '<span class="tag">' + rEsc(s.source) + (s.in_collector_roster === false ? ' (not in roster)' : '') + '</span>';
+            }).join('') + '</div>';
+            return;
+        }
+        h += '<table class="dtable"><thead><tr><th>Source</th><th>Last attempt</th><th>Last success</th><th>Failures in a row</th><th>Overdue</th><th>Reason</th><th>Latest observed</th></tr></thead><tbody>' +
+            rows.map(rHealthRow).join('') + '</tbody></table>';
+    });
+    var ret = st.retention && typeof st.retention === 'object' ? st.retention : {};
+    h += '<div class="sub">Storage</div><div class="rs-note">' + rNum(st.captures, 0) + ' captures since ' + rEsc(st.first_capture_at || 'never') + '; ' +
+        rNum(st.payload_bodies, 0) + ' payload bodies (' + rNum(st.payload_bytes_compressed, 0) + ' bytes compressed, ' + rNum(st.payload_bytes_raw, 0) + ' raw); ' +
+        rNum(st.observations, 0) + ' observations in ' + rNum(st.series, 0) + ' series. Retention in days (0 keeps forever): ' +
+        rEsc(Object.keys(ret).map(function(k) { return k + ' ' + ret[k]; }).join(', ') || 'not stated') + '.</div>';
+    var cannot = rArr(d.cannot_prove);
+    if (cannot.length) h += '<div class="sub">What this report cannot prove</div>' + rList(cannot);
+    var ex = d.states_explained && typeof d.states_explained === 'object' ? d.states_explained : {};
+    var exKeys = Object.keys(ex);
+    if (exKeys.length) h += '<div class="sub">States</div>' + rList(exKeys.map(function(k) { return k + ': ' + ex[k]; }));
+    return h;
+}
+
+var RESEARCH_RENDERERS = { liquidity: renderLiquidity, situations: renderSituations, stories: renderTopStories, health: renderCollectionHealth };
+
+function rMarked(d) {
+    var h = '';
+    if (d.degraded === true) h += '<div class="rs-banner warn"><span class="rs-badge warn">DEGRADED</span> ' + rEsc(d.reason || 'the source marked this result degraded') + '</div>';
+    if (d._stale) h += '<div class="rs-banner warn"><span class="rs-badge warn">STALE COPY</span> served from cache' + (typeof d._stale_age_seconds === 'number' ? ', ' + rAge(d._stale_age_seconds) + ' old' : '') + '</div>';
+    return h;
+}
+
+// st: {inFlight, requestedAt, lastAttempt: {at, http, data, error}, lastGood}.
+// A panel never shows figures it has not received: before the first answer
+// it says so, a failure with no earlier copy shows the reason and the
+// payload's diagnostics only, and a failed refresh keeps the earlier copy
+// under a banner naming the failure and when that copy was loaded.
+function renderResearch(name, st) {
+    var render = RESEARCH_RENDERERS[name];
+    if (!render) return '<div class="rs-banner err">Unknown panel: ' + rEsc(name) + '</div>';
+    if (!st || (!st.lastAttempt && !st.inFlight)) {
+        return '<div class="rs-banner info">Not loaded yet: no request has been made for this panel, so nothing is shown.</div>';
+    }
+    if (!st.lastAttempt) {
+        return '<div class="rs-banner info">Loading: first request sent ' + rClock(st.requestedAt) + '. Nothing has loaded yet, so no figures are shown.</div>';
+    }
+    var a = st.lastAttempt, g = st.lastGood;
+    var status = a.http ? 'HTTP ' + a.http + ': ' : '';
+    if (a.error && !g) {
+        var diag = a.data && typeof a.data === 'object' && !Array.isArray(a.data) ? a.data : {};
+        return '<div class="rs-banner err"><span class="rs-badge err">UNAVAILABLE</span> ' + rEsc(status + a.error) +
+            '<br><span class="dim">Attempted ' + rClock(a.at) + '. Nothing has loaded for this query, so no figures are shown.</span></div>' +
+            (st.inFlight ? '<div class="rs-note">Retrying: request sent ' + rClock(st.requestedAt) + '.</div>' : '') + render(diag, true);
+    }
+    var head = a.error
+        ? '<div class="rs-banner warn"><span class="rs-badge warn">REFRESH FAILED</span> ' + rEsc(status + a.error) + ' (' + rClock(a.at) + ').<br>' +
+            'Showing the copy loaded ' + rClock(g.at) + ', ' + rAge((a.at - g.at) / 1000) + ' before that attempt.</div>'
+        : '<div class="rs-note">Loaded ' + rClock(g.at) + '; refreshes every ' + RESEARCH_REFRESH_MS / 1000 + ' s while this panel is open.</div>';
+    if (st.inFlight) head += '<div class="rs-note">Refreshing: request sent ' + rClock(st.requestedAt) + '.</div>';
+    return head + rMarked(g.data) + render(g.data, false);
+}
+// research-render:end
+
+// research-panel:begin
+// Controller: opens the panel, loads the active tab from its route when it
+// is opened, refreshes it every RESEARCH_REFRESH_MS while open and visible,
+// and drops answers to a query the controls have since changed.
+var RESEARCH_URLS = {
+    liquidity: function() { return '/api/liquidity-board?sort=' + encodeURIComponent($('#rsLiqSort').value); },
+    situations: function() {
+        return '/api/situations?hours=' + encodeURIComponent($('#rsSitHours').value) + '&sort=' + encodeURIComponent($('#rsSitSort').value) +
+            '&kind=' + encodeURIComponent($('#rsSitKind').value);
+    },
+    stories: function() { return '/api/top-stories?hours=' + encodeURIComponent($('#rsTopHours').value) + '&min_outlets=' + encodeURIComponent($('#rsTopOutlets').value); },
+    health: function() { return '/api/collection-health'; }
+};
+var researchState = {};
+var researchActive = 'liquidity';
+
+function researchIsOpen() { return !$('#researchPanel').hidden; }
+
+function researchRender() {
+    var name = researchActive, html;
+    $$('.rs-tab').forEach(function(b) { b.classList.toggle('active', b.getAttribute('data-rs-tab') === name); });
+    $$('.rs-ctl').forEach(function(c) { c.classList.toggle('on', c.getAttribute('data-rs-for') === name); });
+    try { html = renderResearch(name, researchState[name]); }
+    catch (e) {
+        console.error('research panel render failed:', e);
+        html = '<div class="rs-banner err">This panel failed to render: ' + rEsc(String(e)) + '</div>';
+    }
+    $('#rsBody').innerHTML = safe(html);
+}
+
+function researchLoad(name) {
+    var url = RESEARCH_URLS[name]();
+    var st = researchState[name];
+    if (!st || st.url !== url) {
+        // A different question: an answer to the previous one is not shown for it.
+        st = researchState[name] = { seq: st ? st.seq : 0, url: url };
+    }
+    if (st.inFlight) return;
+    var seq = ++st.seq;
+    st.inFlight = true;
+    st.requestedAt = Date.now();
+    if (name === researchActive && researchIsOpen()) researchRender();
+    fetch(url, { cache: 'no-store' })
+        .then(function(r) {
+            return r.text().then(function(text) {
+                var data = null;
+                try { data = JSON.parse(text); } catch (e) { data = null; }
+                return { http: r.status, data: data, error: researchAttemptError(r.status, data) };
+            });
+        })
+        .catch(function(e) { return { http: null, data: null, error: 'request failed: ' + e }; })
+        .then(function(res) {
+            if (researchState[name] !== st || st.seq !== seq) return;
+            st.inFlight = false;
+            st.lastAttempt = { at: Date.now(), http: res.http, data: res.data, error: res.error };
+            if (!res.error) st.lastGood = st.lastAttempt;
+            if (name === researchActive && researchIsOpen()) researchRender();
+        });
+}
+
+function researchDue(name) {
+    var st = researchState[name];
+    if (!st || st.url !== RESEARCH_URLS[name]()) return true;
+    if (st.inFlight) return false;
+    return !st.lastAttempt || Date.now() - st.lastAttempt.at >= RESEARCH_REFRESH_MS;
+}
+
+function researchShow(name) {
+    researchActive = name;
+    researchRender();
+    if (researchDue(name)) researchLoad(name);
+}
+
+function researchToggle(open) {
+    var panel = $('#researchPanel');
+    panel.hidden = open === undefined ? !panel.hidden : !open;
+    $('#researchToggle').classList.toggle('active', !panel.hidden);
+    if (!panel.hidden) researchShow(researchActive);
+}
+
+$('#researchToggle').addEventListener('click', function() { researchToggle(); });
+$('#rsClose').addEventListener('click', function() { researchToggle(false); });
+$('#rsRefresh').addEventListener('click', function() { researchLoad(researchActive); });
+$$('.rs-tab').forEach(function(b) { b.addEventListener('click', function() { researchShow(b.getAttribute('data-rs-tab')); }); });
+$$('.rs-ctl select').forEach(function(s) {
+    s.addEventListener('change', function() { researchLoad(s.closest('.rs-ctl').getAttribute('data-rs-for')); });
+});
+// Capture phase: runs before the map shortcuts, so Esc closes this panel
+// too while the help overlay, when open, keeps Esc for itself.
+document.addEventListener('keydown', function(e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Escape') { if (!_helpOverlay && researchIsOpen()) researchToggle(false); return; }
+    var tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.key === 'p') researchToggle();
+}, true);
+// Keys typed into a panel control pick an option; they must not reach the map shortcuts.
+$('#researchPanel').addEventListener('keydown', function(e) {
+    if (e.target.tagName === 'SELECT' && e.key !== 'Escape') e.stopPropagation();
+});
+setInterval(function() {
+    if (researchIsOpen() && !document.hidden && researchDue(researchActive)) researchLoad(researchActive);
+}, 5000);
+// research-panel:end
 </script>
 </body>
 </html>
