@@ -697,6 +697,35 @@ async def test_composite_default_needs_multi_article_clusters(fast_fetcher, monk
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_composite_independent_of_cluster_sources_shape(fast_fetcher, monkeypatch):
+    """Outlets are counted from the items' feed_name, so a cluster's
+    "sources" being empty (as live before the clustering fix) or holding
+    outlet names, with or without an outlet count, changes nothing."""
+    items = [
+        _item("Apple foldable iPhones sell out in hours", "2026-10-15T21:00:00Z", feed="The Verge"),
+        _item("Apple foldable iPhones sell out within hours", "2026-10-15T20:30:00Z", "finance", "CNBC"),
+    ]
+    _feed(monkeypatch, items)
+    _mock_markets()
+    respx.get(_SEC).mock(return_value=httpx.Response(200, json=_SEC_SUBSET))
+    real = nm.clustering.cluster_articles
+    outs = []
+    for extra in ({"sources": []}, {"sources": ["The Verge", "CNBC"], "outlet_count": 2}):
+        def _shaped(articles, similarity_threshold=0.3, title_field="title", _extra=extra):
+            return [{**c, **_extra} for c in real(articles, similarity_threshold, title_field)]
+
+        monkeypatch.setattr(nm.clustering, "cluster_articles", _shaped)
+        outs.append(await nm.fetch_news_market_reaction(fast_fetcher, now=_SATURDAY))
+    empty, named = outs
+    assert empty["company_reactions"] == named["company_reactions"]
+    assert empty["summary"] == named["summary"]
+    [row] = named["company_reactions"]
+    assert row["story"]["outlets"] == 2
+    assert row["status"] == "measured" and row["excess_return_pct"] == 1.5334
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_composite_story_time_problems_are_gaps(fast_fetcher, monkeypatch):
     items = [
         _item("Apple foldable iPhones sell out in hours", "2026-10-17T21:18:34Z"),  # after "now"
