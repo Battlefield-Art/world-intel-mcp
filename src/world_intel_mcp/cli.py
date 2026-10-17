@@ -851,6 +851,151 @@ def gdelt(ctx: click.Context, query: str, mode: str, limit: int) -> None:
         _print_json(data)
 
 
+def _na(value: Any) -> str:
+    """A null measurement renders as n/a, never as 0."""
+    return "n/a" if value is None else str(value)
+
+
+@main.command(name="hostility")
+@click.argument("country")
+@click.argument("other", required=False)
+@click.option("--days", "-d", default=14, help="Days back including today (max 90)")
+@click.pass_context
+def hostility_cmd(ctx: click.Context, country: str, other: str | None, days: int) -> None:
+    """Daily coverage and hostile coverage of a country or pair (GDELT)."""
+    from .analysis import news_signals
+
+    f = _get_fetcher()
+    data = _run(news_signals.fetch_hostility_timeline(f, country=country, other=other, days=days))
+
+    if _bail_on_error(ctx, data):
+        return
+
+    names = " / ".join(p["name"] for p in data.get("parties", []))
+    console.print(
+        f"[bold]Hostility timeline: {escape(names)}[/bold] "
+        f"({data.get('days_requested')} days, resolution {escape(str(data.get('date_resolution')))})\n"
+    )
+    table = Table(box=box.SIMPLE_HEAVY)
+    for col in ("Date", "Articles", "Threat", "Sanction", "Force", "Criticism", "Tone"):
+        table.add_column(col, justify="left" if col == "Date" else "right")
+    for d in data.get("days", []):
+        h = d.get("hostile", {})
+        date = d["date"] + (" *" if d.get("partial") else "") + (" ~" if d.get("in_progress") else "")
+        table.add_row(
+            date,
+            _na(d.get("articles")),
+            _na(h.get("threat")),
+            _na(h.get("sanction")),
+            _na(h.get("force")),
+            _na(h.get("criticism")),
+            _na(d.get("tone")),
+        )
+    console.print(table)
+    console.print(
+        "[dim]* partial day (GDELT returned fewer hours than elapsed); ~ day in progress; "
+        "n/a = not measured (fetch failed or day not returned)[/dim]"
+    )
+    _print_data_gaps(data)
+
+
+@main.command(name="situations")
+@click.option("--hours", "-H", default=24.0, help="Window length in hours (1 to 168)")
+@click.option(
+    "--sort", "-s", default="covered", type=click.Choice(["covered", "hostile", "change"])
+)
+@click.option(
+    "--kind", "-k", default="all", type=click.Choice(["all", "between", "inside"])
+)
+@click.option("--limit", "-n", default=20, help="Max situations")
+@click.pass_context
+def situations_cmd(ctx: click.Context, hours: float, sort: str, kind: str, limit: int) -> None:
+    """Ranked situations between and inside countries (RSS headlines)."""
+    from .analysis import news_signals
+
+    f = _get_fetcher()
+    data = _run(news_signals.fetch_situations(f, hours=hours, sort=sort, kind=kind, limit=limit))
+
+    if _bail_on_error(ctx, data):
+        return
+
+    win = data.get("window", {})
+    console.print(
+        f"[bold]Situations[/bold] by {sort}, window {win.get('current', {}).get('start', '?')} "
+        f".. {win.get('current', {}).get('end', '?')}\n"
+    )
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("#", justify="right")
+    table.add_column("Kind")
+    table.add_column("Countries", style="bold")
+    table.add_column("Articles", justify="right")
+    table.add_column("Hostile", justify="right")
+    table.add_column("Change", justify="right")
+    table.add_column("Outlets", justify="right")
+    table.add_column("Headline")
+    for i, s in enumerate(data.get("situations", []), 1):
+        heads = s.get("sample_headlines") or [{}]
+        table.add_row(
+            str(i),
+            s["kind"],
+            _cell(" / ".join(c["name"] for c in s.get("countries", []))),
+            str(s["articles"]),
+            str(s["hostile_articles"]),
+            _signed(s["change"]),
+            str(s["outlet_count"]),
+            _cell((heads[0].get("title") or "")[:70]),
+        )
+    console.print(table)
+    _print_data_gaps(data)
+
+
+@main.command(name="top-stories")
+@click.option("--hours", "-H", default=24.0, help="Window length in hours (1 to 168)")
+@click.option("--min-outlets", "-m", default=3, help="Minimum distinct outlets per story")
+@click.option("--limit", "-n", default=10, help="Max stories")
+@click.pass_context
+def top_stories_cmd(ctx: click.Context, hours: float, min_outlets: int, limit: int) -> None:
+    """Stories carried by many outlets, plus who gained attention."""
+    from .analysis import news_signals
+
+    f = _get_fetcher()
+    data = _run(
+        news_signals.fetch_top_stories(f, hours=hours, min_outlets=min_outlets, limit=limit)
+    )
+
+    if _bail_on_error(ctx, data):
+        return
+
+    console.print(f"[bold]Top stories[/bold] (>= {min_outlets} outlets)\n")
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("#", justify="right")
+    table.add_column("Outlets", justify="right")
+    table.add_column("Articles", justify="right")
+    table.add_column("Headline", style="bold")
+    for i, s in enumerate(data.get("stories", []), 1):
+        table.add_row(str(i), str(s["outlet_count"]), str(s["articles"]), _cell(s["headline"][:90]))
+    console.print(table)
+
+    attention = data.get("attention", [])
+    if attention:
+        att = Table(title="Attention (growth vs prior window)", box=box.SIMPLE_HEAVY)
+        att.add_column("Name", style="bold")
+        att.add_column("Type")
+        att.add_column("Now", justify="right")
+        att.add_column("Prior", justify="right")
+        att.add_column("Change", justify="right")
+        for a in attention:
+            att.add_row(
+                _cell(a["name"]),
+                a["type"],
+                str(a["current_comparable"]),
+                str(a["prior"]),
+                _signed(a["change"]),
+            )
+        console.print(att)
+    _print_data_gaps(data)
+
+
 # ---------------------------------------------------------------------------
 # Prediction
 # ---------------------------------------------------------------------------
@@ -1374,9 +1519,14 @@ def dossier(ctx: click.Context, country: str) -> None:
 
     # News
     news = data.get("news", {})
-    console.print(f"[blue]News:[/blue] {news.get('mention_count', 0)} recent mentions")
+    if "mention_count" in news and news["mention_count"] is None:
+        # A failed feed (or a country without keywords) is not zero mentions.
+        console.print("[blue]News:[/blue] not measured")
+    else:
+        console.print(f"[blue]News:[/blue] {news.get('mention_count', 0)} recent mentions")
     for art in news.get("mentions", [])[:3]:
         console.print(f"  - {escape(art.get('title', 'N/A')[:80])}")
+    _print_data_gaps(news)
 
     # Security
     sec = data.get("security", {})

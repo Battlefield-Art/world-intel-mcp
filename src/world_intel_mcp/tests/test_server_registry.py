@@ -234,3 +234,44 @@ def test_readme_documents_every_registered_tool(server) -> None:
     n = len(server.TOOLS)
     assert f"**{n} MCP tools**" in readme
     assert f"**Total: {n} tools**" in readme
+
+
+@pytest.mark.asyncio
+async def test_dispatch_news_signal_tools_pass_arguments_and_mark_outages(
+    server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Phase 29 news-signal tools through the real dispatcher, with
+    RSS and GDELT failing at the source boundary: the arguments reach the
+    analysis, and an outage comes back marked, never as an empty ranking
+    or a zero-hostility timeline."""
+    from world_intel_mcp.analysis import news_signals as ns
+    from world_intel_mcp.sources import news
+
+    async def _rss_down(fetcher, category=None, limit=50):
+        return {
+            "items": [], "count": 0, "feeds_attempted": 119, "feeds_ok": 0,
+            "feeds_failed": ["BBC World"], "error": "All 119 RSS feeds failed or timed out",
+            "degraded": True, "reason": "all_feeds_failed",
+        }
+
+    async def _gdelt_down(fetcher, query, mode, days):
+        return None
+
+    monkeypatch.setattr(news, "fetch_news_feed", _rss_down)
+    monkeypatch.setattr(ns, "_gdelt_timeline", _gdelt_down)
+    monkeypatch.setattr(ns, "_GDELT_RETRY_WAIT_S", 0.0)
+
+    sit = await server._dispatch("intel_situations", {"sort": "hostile", "kind": "between"})
+    assert (sit["sort"], sit["kind"], sit["situations"]) == ("hostile", "between", [])
+    assert sit["degraded"] is True and sit["reason"] == "all_feeds_failed"
+
+    top = await server._dispatch("intel_top_stories", {"min_outlets": 4})
+    assert top["min_outlets"] == 4 and top["stories"] == []
+    assert top["degraded"] is True
+
+    host = await server._dispatch(
+        "intel_hostility_timeline", {"country": "IRN", "other": "Israel", "days": 3}
+    )
+    assert [p["iso3"] for p in host["parties"]] == ["IRN", "ISR"]
+    assert host["days_requested"] == 3
+    assert host["days"] == [] and host["reason"] == "gdelt_fetch_failed"

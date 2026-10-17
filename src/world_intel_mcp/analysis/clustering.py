@@ -117,7 +117,11 @@ async def fetch_news_clusters(
         threshold: Jaccard similarity threshold (0.0 - 1.0).
 
     Returns:
-        Dict with clusters[], cluster_count, total_items, singleton_count, source.
+        Dict with clusters[], cluster_count, total_items, singleton_count,
+        source. Each cluster carries ``outlet_count``: distinct publishers
+        among ALL its members (sister feeds of one publisher count once,
+        see ``news.FEED_OUTLETS``). An RSS outage is passed through as
+        ``degraded``/``reason``/``error``, never a quiet cluster-free day.
     """
     from datetime import datetime, timezone
     from ..sources import news
@@ -140,7 +144,14 @@ async def fetch_news_clusters(
             all_tokens |= _tokenize(art.get("title", ""))
             member_items.append({
                 "title": art.get("title", ""),
-                "source": art.get("source_name", art.get("source", "")),
+                # fetch_news_feed names the outlet "feed_name"; the
+                # source_name/source fallbacks serve other article shapes.
+                "source": (
+                    art.get("feed_name")
+                    or art.get("source_name")
+                    or art.get("source")
+                    or ""
+                ),
                 "link": art.get("link", ""),
             })
 
@@ -151,17 +162,22 @@ async def fetch_news_clusters(
                 word_freq[w] = word_freq.get(w, 0) + 1
         top_kw = sorted(word_freq, key=word_freq.get, reverse=True)[:8]  # type: ignore[arg-type]
 
+        outlets = sorted(
+            {news.outlet_for(m["source"]) for m in member_items if m["source"]}
+        )
         out_clusters.append({
             "headline": rep.get("title", ""),
             "size": c["member_count"],
             "keywords": top_kw,
             "sources": list({m["source"] for m in member_items if m["source"]}),
+            "outlets": outlets,
+            "outlet_count": len(outlets),
             "items": member_items[:5],
         })
 
     singletons = sum(1 for c in raw_clusters if c["member_count"] == 1)
 
-    return {
+    result = {
         "clusters": out_clusters,
         "cluster_count": len(out_clusters),
         "total_items": len(items),
@@ -170,3 +186,7 @@ async def fetch_news_clusters(
         "source": "jaccard-clustering",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    for key in ("feeds_ok", "feeds_failed", "feeds_stale", "error", "degraded", "reason"):
+        if key in feed_data:
+            result[key] = feed_data[key]
+    return result

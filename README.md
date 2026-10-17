@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **149 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **152 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -37,6 +37,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Maritime** | 2 | NGA navigation warnings, vessel snapshots |
 | **Aviation** | 5 | FAA airport delays, domestic flight snapshot, business-jet/military cohort early warning (adsb.lol live + globe_history heatmaps) |
 | **News & Media** | 3 | 119 RSS feeds (4-tier), GDELT, trending keywords |
+| **News Signals** | 3 | GDELT DOC timelines (daily volume, hostile-term volume, tone) per country or pair; RSS situations ranked by coverage, hostility or change; top stories by distinct-outlet count with attention growth |
 | **Intelligence Analysis** | 8 | Signal convergence, focal points, instability index, risk scores, escalation |
 | **NLP Intelligence** | 4 | Entity extraction, event classification, news clustering, keyword spikes |
 | **Strategic Synthesis** | 4 | Strategic posture, world brief, fleet report, population exposure |
@@ -67,7 +68,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 | **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
 
-**Total: 149 tools** across 30+ intelligence domains.
+**Total: 152 tools** across 30+ intelligence domains.
 
 ---
 
@@ -135,6 +136,9 @@ intel migration-flows -o Sudan
 intel liquidity            # Fed balance sheet, TGA, RRP, net liquidity, US M2, euro area M1-M3
 intel net-liquidity -n 0   # full weekly history, components and RRP date per week
 intel news-reaction -c finance  # same-session moves of companies in the news
+intel hostility Iran Israel --days 7   # daily hostile coverage (GDELT)
+intel situations --sort change         # ranked situations (RSS)
+intel top-stories -m 4                 # stories carried by 4+ outlets
 intel status               # cache + circuit breaker health
 intel guide                # the research guide (also served as intel://guide)
 intel history health       # per-source collection health from the collector's run log
@@ -364,6 +368,13 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 | `intel_trending_keywords` | Trending terms with spike detection |
 | `intel_gdelt_search` | GDELT 2.0 global news search |
 
+### News Signals (3)
+| Tool | Description |
+|------|-------------|
+| `intel_hostility_timeline` | Per-day GDELT coverage of a country or a pair: article count, articles using threat / sanction / force / criticism terms (GDELT keyword match, terms listed in the response), average tone. A failed call or a day GDELT did not return is null and listed in `data_gaps`, never zero |
+| `intel_situations` | Situations between countries (headlines naming two or more) and inside a country (headlines naming one), ranked by most covered, most hostile (headline keyword heuristic) or biggest change against the prior window; the response defines each measure and names the feeds excluded from change figures |
+| `intel_top_stories` | Stories carried by at least `min_outlets` distinct outlets (sister feeds of one publisher count once), plus the countries and organizations whose headline mentions grew most |
+
 ### Intelligence Analysis (8)
 | Tool | Description |
 |------|-------------|
@@ -381,7 +392,7 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 |------|-------------|
 | `intel_extract_entities` | Named entity extraction (countries, leaders, orgs, CVEs, APTs) |
 | `intel_classify_event` | Event classification into 14 threat categories |
-| `intel_news_clusters` | Topic clustering by Jaccard similarity |
+| `intel_news_clusters` | Topic clustering by Jaccard similarity, with each cluster's distinct-outlet count |
 | `intel_keyword_spikes` | Keyword spike detection with Welford's algorithm |
 
 ### Strategic Synthesis (4)

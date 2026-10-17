@@ -229,6 +229,99 @@ source here, and no proxy is substituted for any of these measures.
   history capture is an error.
 - Tools 139 -> 143.
 
+### Added: news signals (ROADMAP Phase 29)
+- `intel_hostility_timeline`: per UTC day, GDELT DOC 2.0 coverage of a
+  country or a pair of countries (`timelinevolraw`): matching articles,
+  articles that also use threat / sanction / force / criticism terms (one
+  GDELT query per category, every term listed in `queries`), GDELT's total
+  monitored articles, and average tone (`timelinetone`, weighted by the
+  per-bucket article counts). A failed call leaves its column null for
+  every day; a day GDELT did not return is null in every column; both are
+  listed in `data_gaps`. Partial days (GDELT answered 2026-10-17 in
+  15-minute buckets for 3 days and hourly buckets for 7) are flagged
+  `partial`, judged from the first category series that answered when the
+  base call failed, and today's unfinished UTC day is flagged
+  `in_progress`. A
+  failed call is retried once.
+- `intel_situations`: country pairs ("between": a headline naming two or
+  more countries) and single countries ("inside": a headline naming one)
+  ranked over a recent RSS window by most covered, most hostile (headline
+  keyword heuristic, `classifier.classify_hostility`) or biggest change.
+  Change is defined in the response: current minus prior window, counted
+  only over feeds whose retained history reaches back past the prior
+  window's start; the feeds that do not are named.
+- `intel_top_stories`: story clusters in the window carried by at least
+  `min_outlets` distinct outlets, plus attention: the countries and
+  organizations whose headline mentions grew most against the prior window.
+- `intel_news_clusters` clusters gain `outlets` and `outlet_count`
+  (distinct publishers among all members; sister feeds such as BBC World
+  and BBC Mundo count once). Existing keys are unchanged.
+- CLI: `intel hostility COUNTRY [OTHER]`, `intel situations`,
+  `intel top-stories`. Nulls render as `n/a`, never 0; partial days are
+  marked `*` and today `~`.
+- Collector: `situations` and `top_stories` (57 sources).
+
+### Changed
+- Concurrent `fetch_news_feed` reads of the same feed set share one
+  request per feed. The collector starts its four news sources in one
+  gather, and each used to request every feed itself; measured live
+  2026-10-17, a news-group cycle made 119 feed requests for 119 feeds
+  (4 of 4 sources ok, 9.8 s). Each caller still gets its own limit and
+  its own item copies, and a caller's timeout does not cancel the read
+  the others are waiting on.
+- Live GDELT calls are spaced at least 5 s apart by the fetcher
+  (`_SOURCE_RATE_LIMITS["gdelt"]`), for every GDELT caller: GDELT's 429
+  body asks for "one every 5 seconds" (measured 2026-10-17). Cache hits are
+  not delayed. The limiter is per process, so the MCP server and the
+  collector do not share it, and the fetcher's own retries inside one call
+  are not spaced by it.
+
+### Fixed
+- RSS outage read as a slow news day (ROADMAP Phase 24.5):
+  `fetch_news_feed` returned `count: 0` with no marker when every feed
+  failed. It now reports `feeds_attempted`, `feeds_ok`, `feeds_failed` and
+  `feeds_stale` on every call, and `error` / `degraded` /
+  `reason: all_feeds_failed` when no feed answered live;
+  `intel_news_clusters` and `intel_trending_keywords` pass the marker
+  through, so `intel trending` prints an error instead of an empty
+  keyword table.
+- RSS outage behind a warm cache read as healthy news: a feed whose fetch
+  failed came back as its expired cached copy (the fetcher's stale
+  fallback, which marks only dict payloads), so in a running deployment
+  an outage counted every feed as fine until the expired copies were
+  evicted (the collector evicts about hourly; a server running without
+  the collector keeps them until `intel sync`). Such feeds are now listed
+  in `feeds_stale`, never counted in `feeds_ok`, and kept out of
+  situation and attention change figures.
+  Verified live 2026-10-17: with an expired copy seeded for DW Europe
+  (its feed answers 404), the europe category reported
+  `feeds_stale: ["DW Europe"]`.
+- Cluster `sources` was always empty: the clusterer read `source_name` /
+  `source`, but RSS items name their outlet `feed_name` (measured live
+  2026-10-17: 23 of 23 clusters had `sources: []`, which also emptied
+  `intel_world_brief` top-story sources).
+- RSS `published` times were shifted by the host's UTC offset:
+  `_parse_published` read feedparser's UTC struct with `time.mktime`
+  (local time) instead of `calendar.timegm`. The struct carries
+  `tm_isdst=0`, so the shift is the zone's standard offset: on mac-studio
+  (US Eastern) an item published 14:43:52 UTC came out `19:43:52Z`, five
+  hours ahead (measured 2026-10-17). The amount depends on the host zone
+  (none on a UTC host). It skewed every RSS-based time window and any
+  ordering against non-RSS times. The regression test sets its own zone,
+  so it fails on the old code on a UTC CI runner too.
+- Country dossier news was always empty, with no marker (ROADMAP Phase
+  24.5), for three reasons: it asked `fetch_news_feed` for
+  `category="all"`, which is not a category (the feed answered with an
+  error dict); it read `articles` and `source`, while the feed emits
+  `items` and `feed_name`; and it checked only its own `_error`, never the
+  feed's `error`. It now reads every feed, passes a feed error or outage
+  through as `error` / `degraded` / `reason` with `mention_count: null`
+  and a `data_gaps` entry, and names failed or stale feeds. A fourth
+  quiet zero: 28 of the 50 accepted country codes (GB, DE, JP and others)
+  have no headline keywords, so the search could never match; the section
+  now says "mentions not searched" instead of reporting zero.
+  `intel dossier` prints `News: not measured` and the gaps in that case.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

@@ -45,6 +45,9 @@ _SOURCE_RATE_LIMITS: dict[str, float] = {
     # adsb.lol globe_history heatmaps are ~14 MB each; one at a time,
     # spaced, so a cold baseline never bursts the community server.
     "adsblol-history": 2.0,
+    # GDELT DOC API 429 body (2026-10-17): "Please limit requests to one
+    # every 5 seconds". Every GDELT caller passes source="gdelt".
+    "gdelt": 5.0,
 }
 
 
