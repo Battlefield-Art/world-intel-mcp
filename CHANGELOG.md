@@ -60,15 +60,18 @@ responses say so. `limit=0` returns the full history.
   included, is retried, counted as a breaker failure and takes the outage path.
   An empty ECB response is one only when a start was requested;
   without one it is an unexpected payload and takes the outage path, as does
-  JSON that is not an object.
+  JSON that is not an object. An observation value that is not a finite number
+  makes the response a parse error.
   Missing ECB roles and board rows are named; index bases, provisional status
   and percentage-point change units are retained. ECB keys must specify every
-  dimension and request at most 50 series combinations.
+  dimension, request at most 50 series combinations and be at most 200
+  characters long. An ECB start after today (UTC) is refused before any
+  request, so a caller's input is never counted as a source failure.
 - CLI: `intel liquidity`, `intel net-liquidity`, `intel money-supply`,
   `intel fed-liquidity`, `intel ecb-series`. Collector: `liquidity_board` and
   `net_liquidity` (group `liquidity`). `intel liquidity` prints the ranking
-  rule and each row's status; a terminal too narrow for the table gets one
-  entry per indicator instead, so no value, date or unit is cut.
+  rule of the chosen sort and each row's status; a terminal too narrow for the
+  table gets one entry per indicator instead, so no value, date or unit is cut.
 - Live reading 2026-10-17: net liquidity for Wednesday 2026-10-14 was
   USD 5,869.615 billion (WALCL 6,755,639 million, WDTGAL 885,823 million,
   RRPONTSYD 0.201 billion, all observed 2026-10-14).

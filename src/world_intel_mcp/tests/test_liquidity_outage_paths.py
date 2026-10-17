@@ -1,30 +1,46 @@
 """Liquidity outage paths: what each failure kind does to a response.
 
 Every failure that leaves a series without a fresh body is named in the
-response (HTTP status, no response, open circuit, unexpected payload,
-parse error); a stale copy is served marked, never re-cached as fresh,
+response (HTTP status, no response, open circuit, an oversized body,
+unexpected payload, parse error, including an observation that is not a
+finite number); a stale copy is served marked, never re-cached as fresh,
 and counted on the circuit breaker. Also pins the ECB key cap and the
-"." blank in FRED CSVs.
+"." blank in FRED CSVs. Every fetcher a test opens is closed when it
+ends.
 
 Gaps / not covered: live upstreams (fixtures and respx only); concurrent
 requests racing the breaker threshold (each test drives one sequence).
 """
 
 import copy
+import json
 from datetime import date
 
 import httpx
 import pytest
 import respx
 
+from world_intel_mcp.cache import Cache
+from world_intel_mcp.circuit_breaker import CircuitBreaker
+from world_intel_mcp.fetcher import BinaryResult, Fetcher
 from world_intel_mcp.sources import liquidity
 from world_intel_mcp.tests.test_sources_liquidity import (
     _BSI, _ECB_BSI_URL, _ECB_ILM_URL, _FRED_URL,
-    _fixed_clock_and_no_throttle, _fred_router, _mock_all, fetcher,
+    _fixed_clock_and_no_throttle, _fred_router, _mock_all,
 )
 
 _ECB_ROWS = {"euro_area_m1", "euro_area_m2", "euro_area_m3", "eurosystem_total_assets"}
 _CIRCUIT_OPEN = "upstream fetch failed (circuit open: request not sent after repeated failures)"
+
+
+@pytest.fixture
+async def fetcher(tmp_path):
+    """Like test_sources_liquidity's fetcher (no retries), but closes its client and cache."""
+    f = Fetcher(cache=Cache(db_path=tmp_path / "liq.db"), breaker=CircuitBreaker(), default_timeout=5.0,
+                max_retries=0)
+    yield f
+    await f.close()
+    f.cache.close()
 
 
 def _expire(fetcher, key=None):
@@ -331,3 +347,89 @@ async def test_fred_dot_cell_is_a_missing_observation(fetcher):
     out = await liquidity.fetch_fed_liquidity_series(fetcher, "RRPONTSYD", limit=0)
     assert out["blank_observations"] == 2
     assert [p["value"] for p in out["points"]] == [0.25, 1.5]
+
+
+# ---------------------------------------------------------------------------
+# A whitespace-only ECB body, an oversized body, a value that is no number
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_ecb_whitespace_only_body_reads_as_an_empty_one(fetcher):
+    key = liquidity._ECB_MONEY_KEY
+    empty = "unexpected payload (empty body, no start requested)"
+    route = respx.get(_ECB_BSI_URL).respond(200, content=b" \n")
+    with_start = await liquidity.fetch_ecb_series(fetcher, key=key, start="2026-10-01")
+    assert with_start["error"] == f"ECB Data Portal: no observations on or after 2026-10-01 for BSI/{key}"
+    cold = await liquidity.fetch_ecb_series(fetcher, key=key)
+    assert cold["error"] == f"ECB Data Portal returned no data for BSI/{key}: {empty}, no cached copy"
+
+    route.mock(return_value=httpx.Response(200, json=_BSI))
+    await liquidity.fetch_ecb_series(fetcher, key=key)
+    _expire(fetcher)
+    route.mock(return_value=httpx.Response(200, content=b" \n"))
+    warm = await liquidity.fetch_ecb_series(fetcher, key=key)
+    assert warm["series"] and all(s["served_from_stale_cache"] and s["fetch_failure"] == empty for s in warm["series"])
+    assert fetcher.breaker.status()[liquidity.ECB_SOURCE]["total_failures"] == 0
+
+
+@pytest.mark.parametrize("error", [
+    "body of 300 bytes exceeds cap 100",
+    "body exceeds cap 100: stopped after 300 decoded bytes",  # the streamed read's wording on the cyclone branch
+])
+def test_an_oversized_body_is_named_with_its_cap(error):
+    assert liquidity._fetch_failure(BinaryResult(200, None, error)) == f"upstream fetch failed (HTTP 200, {error})"
+
+
+def _bsi_with_first_value(literal: str) -> bytes:
+    """The live BSI response with its first observation value written as ``literal``."""
+    data = copy.deepcopy(_BSI)
+    first = next(iter(data["dataSets"][0]["series"].values()))
+    first["observations"][next(iter(first["observations"]))][0] = 424242.25
+    text = json.dumps(data)
+    assert text.count("424242.25") == 1
+    return text.replace("424242.25", literal).encode()
+
+
+_NOT_FINITE = [
+    pytest.param(str(10**400), id="401-digit-integer"),
+    pytest.param("1e400", id="1e400"),
+    pytest.param("Infinity", id="infinity"),
+    pytest.param("-Infinity", id="minus-infinity"),
+    pytest.param("NaN", id="nan"),
+]
+
+
+@pytest.mark.parametrize("literal", _NOT_FINITE)
+@respx.mock
+async def test_an_ecb_value_that_is_not_a_finite_number_is_a_parse_error(fetcher, literal):
+    key = liquidity._ECB_MONEY_KEY
+    respx.get(_ECB_BSI_URL).respond(200, content=_bsi_with_first_value(literal))
+    out = await liquidity.fetch_ecb_series(fetcher, key=key)
+    assert out["error"].startswith(
+        f"ECB Data Portal response for BSI/{key} not in the expected SDMX-JSON shape (parse error: "
+    )
+    assert ("OverflowError" if literal.isdigit() else "is not a finite number") in out["error"]
+    assert out["data_gaps"] == [out["error"]]
+    assert fetcher.cache.get_stale(f"liquidity:ecb:BSI:{key}:25:None") is None  # never cached
+    assert fetcher.breaker.status()[liquidity.ECB_SOURCE]["total_failures"] == 0
+
+
+@pytest.mark.parametrize("literal", _NOT_FINITE[:2])
+@respx.mock
+async def test_a_value_that_is_not_a_finite_number_drops_only_its_rows(fetcher, literal):
+    """It once raised out of the board and money supply (gather without
+    return_exceptions), losing the FRED and ILM rows too."""
+    _mock_all(bsi=httpx.Response(200, content=_bsi_with_first_value(literal)))
+    board = await liquidity.fetch_liquidity_board(fetcher)
+    assert {r["indicator"] for r in board["indicators"]} == {
+        "fed_total_assets", "treasury_general_account", "reverse_repo", "net_liquidity", "us_m2",
+        "eurosystem_total_assets",
+    }
+    missing = {u["indicator"]: u["error"] for u in board["unavailable"]}
+    assert set(missing) == {"euro_area_m1", "euro_area_m2", "euro_area_m3"}
+    assert all("SDMX-JSON shape (parse error: " in e for e in missing.values())
+
+    money = await liquidity.fetch_money_supply(fetcher)
+    assert "error" not in money and money["us"]["M2"]["latest"]
+    assert "SDMX-JSON shape (parse error: " in money["euro_area"]["error"]

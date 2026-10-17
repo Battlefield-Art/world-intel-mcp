@@ -253,14 +253,24 @@ ECB_DATASETS = {
 }
 _ECB_MAX_AGE_DAYS = {"M": 75, "W": 16, "D": 6, "Q": 200, "A": 500}
 
-_ECB_KEY_RE = re.compile(r"^[A-Za-z0-9_+.]{1,200}$")
+# A key is letters, digits and these separators, at most _ECB_KEY_MAX_LEN
+# characters; the regex, the refusals and ECB_KEY_RULES derive from both.
+_ECB_KEY_MAX_LEN = 200
+_ECB_KEY_PUNCTUATION = (".", "+", "_")
+_ECB_KEY_RE = re.compile(
+    f"^[A-Za-z0-9{''.join(re.escape(c) for c in _ECB_KEY_PUNCTUATION)}]{{1,{_ECB_KEY_MAX_LEN}}}$"
+)
+_ECB_KEY_CHARACTERS = (
+    "letters, digits, " + ", ".join(f"'{c}'" for c in _ECB_KEY_PUNCTUATION[:-1])
+    + f" and '{_ECB_KEY_PUNCTUATION[-1]}' only"
+)
 # Dimensions a series key must give, per dataset, none left empty.
 _ECB_KEY_DIMENSIONS = {"BSI": 11, "ILM": 6}
 ECB_KEY_RULES = (
     f"SDMX series key: every dimension given (BSI {_ECB_KEY_DIMENSIONS['BSI']}, "
     f"ILM {_ECB_KEY_DIMENSIONS['ILM']}), none empty, so no wildcards; '+' selects "
     f"several values in one dimension, at most {_MAX_ECB_SERIES} series combinations "
-    "in all; letters, digits, '.', '+' and '_' only, up to 200 characters"
+    f"in all; {_ECB_KEY_CHARACTERS}, up to {_ECB_KEY_MAX_LEN} characters"
 )
 
 
@@ -756,7 +766,12 @@ def _period_end(value: dict) -> date | None:
 
 
 def parse_sdmx_json(data: dict, dataset: str) -> list[dict]:
-    """Every series in an ECB SDMX-JSON 1.0 response, points oldest first."""
+    """Every series in an ECB SDMX-JSON 1.0 response, points oldest first.
+
+    An observation value that is not a finite number (infinity, NaN, or an
+    integer too large for a float) raises ValueError or OverflowError: the
+    response is a parse error, and no such value is ever returned.
+    """
     structure = data["structure"]
     dims = structure["dimensions"]["series"]
     periods = structure["dimensions"]["observation"][0]["values"]
@@ -783,11 +798,14 @@ def parse_sdmx_json(data: dict, dataset: str) -> list[dict]:
                 if 0 <= ov[status_pos + 1] < len(values):
                     status = values[ov[status_pos + 1]].get("name")
             end = _period_end(period)
+            value = float(ov[0])
+            if not math.isfinite(value):
+                raise ValueError(f"observation value for {period['id']} is not a finite number")
             points.append(
                 {
                     "observed_at": period["id"],
                     "period_end": end.isoformat() if end else None,
-                    "value": float(ov[0]),
+                    "value": value,
                     "units": units,
                     "status": status,
                 }
@@ -884,7 +902,7 @@ async def _ecb_fetch(
                 return None, f"ECB Data Portal returned no data for {dataset}/{key}: {failure}, no cached copy"
     try:
         series = parse_sdmx_json(data, dataset)
-    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError, OverflowError) as exc:
         if not fetched:
             fetcher.cache.delete(cache_key)
         return None, (
@@ -957,9 +975,14 @@ async def fetch_ecb_series(
             "timestamp": _utc_now_iso(),
         }
     key = str(key or "").strip()
+    if len(key) > _ECB_KEY_MAX_LEN:
+        return {
+            "error": f"key must be at most {_ECB_KEY_MAX_LEN} characters, got {len(key)}",
+            "timestamp": _utc_now_iso(),
+        }
     if not _ECB_KEY_RE.fullmatch(key):
         return {
-            "error": "key must be an SDMX series key: letters, digits, '.', '+' and '_' only",
+            "error": f"key must be an SDMX series key: {_ECB_KEY_CHARACTERS}",
             "timestamp": _utc_now_iso(),
         }
     dimensions = key.split(".")
@@ -978,6 +1001,15 @@ async def fetch_ecb_series(
         start_d = _validate_start(start)
     except ValueError as exc:
         return {"error": str(exc), "timestamp": _utc_now_iso()}
+    # The portal answers a start after its own date with an HTTP 400 block
+    # page (measured 2026-10-17). Refused here, before any request, so a
+    # caller's input is never retried or counted as a source failure.
+    today = _today()
+    if start_d is not None and start_d > today:
+        return {
+            "error": f"start must be on or before today ({today} UTC), got {start!r}",
+            "timestamp": _utc_now_iso(),
+        }
 
     # One extra observation so the oldest returned point still has a change.
     series, err = await _ecb_fetch(fetcher, ds, key, n + 1 if n else 0, start_d)
@@ -1159,6 +1191,20 @@ _BOARD_FRED = (
     ("us_m2", "M2SL"),
 )
 
+# The order each board sort applies, returned as the payload's ranking_rule.
+_BOARD_RANKING_RULES = {
+    "biggest_move": (
+        "biggest_move ranks absolute changes in billions of each row currency; "
+        "no FX conversion, and observation horizons differ. Percentage changes "
+        "do not affect ranking."
+    ),
+    "newest": (
+        "newest orders rows by the period end of their latest observation, newest "
+        "first, and rows without a period end last; rows that tie are in reverse "
+        "alphabetical order of indicator. Changes do not affect the order."
+    ),
+}
+
 
 def _board_move(row: dict) -> float:
     divisor = 1000 if (row.get("units") or "").endswith(" millions") else 1
@@ -1168,7 +1214,7 @@ def _board_move(row: dict) -> float:
 async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") -> dict:
     """Latest reading and change per liquidity indicator across FRED and the ECB."""
     sort = str(sort or "biggest_move").strip().lower()
-    if sort not in ("biggest_move", "newest"):
+    if sort not in _BOARD_RANKING_RULES:
         return {"error": f"sort must be biggest_move or newest, got {sort!r}", "timestamp": _utc_now_iso()}
 
     fred_ids = [sid for _, sid in _BOARD_FRED]
@@ -1290,11 +1336,7 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
     )
     out: dict[str, Any] = {
         "sort": sort,
-        "ranking_rule": (
-            "biggest_move ranks absolute changes in billions of each row currency; "
-            "no FX conversion, and observation horizons differ. Percentage changes "
-            "do not affect ranking."
-        ),
+        "ranking_rule": _BOARD_RANKING_RULES[sort],
         "count": len(rows),
         "indicators": rows,
         "unavailable": unavailable,

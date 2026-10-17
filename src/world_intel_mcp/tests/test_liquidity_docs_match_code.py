@@ -1,7 +1,9 @@
-"""Liquidity docs say what the code does: the biggest_move rule, the
-`unknown` measure, the ECB key limits, the CLI board's ranking line and
-row status (whole at every terminal width from 40 to 200 columns), and
-the dated net liquidity measurement in the CHANGELOG.
+"""Liquidity docs say what the code does: the biggest_move rule and each
+board sort's ranking rule (payload and CLI), the `unknown` measure, the
+ECB key limits, the CLI board's ranking line and row status (whole at
+every terminal width from 40 to 200 columns), and the dated net liquidity
+measurement in the CHANGELOG. Every fetcher and cache a test opens is
+closed when it ends.
 
 Gaps / not covered: README wording (counts and tables wait for the final
 docs pass); the CHANGELOG figures themselves, which were measured live on
@@ -25,9 +27,48 @@ from world_intel_mcp.sources import liquidity
 from world_intel_mcp.tests.test_liquidity_surfaces import (
     _fake, _invoke, _isolation, _liquidity_tools, _payloads,
 )
-from world_intel_mcp.tests.test_sources_liquidity import _mock_all, fetcher
+from world_intel_mcp.tests import test_liquidity_surfaces as _surfaces
+from world_intel_mcp.tests.test_sources_liquidity import _mock_all
 
 _ROOT = Path(__file__).parents[3]
+
+
+@pytest.fixture
+async def fetcher(tmp_path):
+    """Like test_sources_liquidity's fetcher (no retries), but closes its client and cache."""
+    f = Fetcher(cache=Cache(db_path=tmp_path / "liq.db"), breaker=CircuitBreaker(), default_timeout=5.0,
+                max_retries=0)
+    yield f
+    await f.close()
+    f.cache.close()
+
+
+@pytest.fixture(autouse=True)
+def _close_payload_and_cli_caches(_isolation, monkeypatch: pytest.MonkeyPatch):
+    """No sqlite connection outlives its test: the fetchers _payloads opens
+    are closed inside the loop that used them, and the cache of the CLI's
+    own fetcher (cli._get_fetcher) at teardown."""
+    real_fetcher, real_build = _surfaces._fetcher, _surfaces._build_payloads
+    opened: list[Fetcher] = []
+
+    def recording(tmp_path):
+        opened.append(real_fetcher(tmp_path))
+        return opened[-1]
+
+    async def build_then_close(tmp_path):
+        try:
+            return await real_build(tmp_path)
+        finally:
+            while opened:
+                f = opened.pop()
+                await f.close()
+                f.cache.close()
+
+    monkeypatch.setattr(_surfaces, "_fetcher", recording)
+    monkeypatch.setattr(_surfaces, "_build_payloads", build_then_close)
+    yield
+    if cli._fetcher is not None:
+        cli._fetcher.cache.close()
 
 
 def _flat(text: str) -> str:
@@ -190,3 +231,66 @@ def test_changelog_states_the_measured_net_liquidity_start():
     assert int(early) + int(blank) + 1 == as_int(skipped) and late == last
     assert first < start < "2013-09-23" < last
     assert "ECB 404 and empty responses are final no-data answers" not in text
+
+
+_RANKING_RULES = {
+    "biggest_move": (
+        "biggest_move ranks absolute changes in billions of each row currency; no FX conversion, "
+        "and observation horizons differ. Percentage changes do not affect ranking."
+    ),
+    "newest": (
+        "newest orders rows by the period end of their latest observation, newest first, and rows "
+        "without a period end last; rows that tie are in reverse alphabetical order of indicator. "
+        "Changes do not affect the order."
+    ),
+}
+
+
+@respx.mock
+async def test_each_board_sort_states_the_order_it_applies(fetcher):
+    _mock_all()
+    by_move = await liquidity.fetch_liquidity_board(fetcher)
+    newest = await liquidity.fetch_liquidity_board(fetcher, sort="newest")
+
+    assert by_move["sort"] == "biggest_move" and by_move["ranking_rule"] == _RANKING_RULES["biggest_move"]
+    assert newest["sort"] == "newest" and newest["ranking_rule"] == _RANKING_RULES["newest"]
+    # Newest first; the three 2026-10-14 rows and the four 2026-08-31 rows tie.
+    assert [(r["indicator"], r["period_end"]) for r in newest["indicators"]] == [
+        ("reverse_repo", "2026-10-16"),
+        ("treasury_general_account", "2026-10-14"), ("net_liquidity", "2026-10-14"),
+        ("fed_total_assets", "2026-10-14"),
+        ("eurosystem_total_assets", "2026-10-11"),
+        ("us_m2", "2026-08-31"), ("euro_area_m3", "2026-08-31"), ("euro_area_m2", "2026-08-31"),
+        ("euro_area_m1", "2026-08-31"),
+    ]
+
+
+@respx.mock
+async def test_newest_puts_a_row_without_a_period_end_last(fetcher, monkeypatch):
+    """A weekly ECB period whose end the parser cannot read (patched here)."""
+    real = liquidity._period_end
+    monkeypatch.setattr(liquidity, "_period_end", lambda p: None if "-W" in str(p.get("id")) else real(p))
+    _mock_all()
+    newest = await liquidity.fetch_liquidity_board(fetcher, sort="newest")
+    rows = newest["indicators"]
+    assert rows[-1]["indicator"] == "eurosystem_total_assets" and rows[-1]["period_end"] is None
+    assert all(r["period_end"] for r in rows[:-1])
+
+
+def test_every_sort_the_surfaces_offer_has_a_ranking_rule():
+    tool_sorts = _tool("intel_liquidity_board").inputSchema["properties"]["sort"]["enum"]
+    cli_sorts = next(p for p in cli.liquidity_cmd.params if p.name == "sort").type.choices
+    assert set(tool_sorts) == set(cli_sorts) == set(liquidity._BOARD_RANKING_RULES) == set(_RANKING_RULES)
+    assert liquidity._BOARD_RANKING_RULES == _RANKING_RULES
+
+
+@pytest.mark.parametrize("sort", ["biggest_move", "newest"])
+def test_cli_board_prints_the_ranking_rule_of_its_sort(sort):
+    """End to end: CLI, source and payload, upstreams mocked."""
+    with respx.mock:
+        _mock_all()
+        out = _flat(_invoke("liquidity", "--sort", sort).output)
+    assert f"Liquidity board (sorted by {sort})" in out
+    assert f"Ranking: {_RANKING_RULES[sort]}" in out
+    (other,) = set(_RANKING_RULES) - {sort}
+    assert _RANKING_RULES[other] not in out

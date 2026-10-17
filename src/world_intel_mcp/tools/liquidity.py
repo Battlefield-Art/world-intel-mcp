@@ -136,7 +136,13 @@ TOOLS: list[Tool] = [
                     "description": "Newest points per series (default 24); 0 returns the full history",
                     "default": 24,
                 },
-                "start": _START,
+                "start": {
+                    **_START,
+                    "description": (
+                        "Optional ISO date YYYY-MM-DD, not after today (UTC): only points observed "
+                        "on or after it; a later date is refused without a request"
+                    ),
+                },
             },
             "required": ["key"],
         },

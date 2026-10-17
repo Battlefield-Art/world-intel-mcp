@@ -1782,7 +1782,7 @@ def fed_liquidity_cmd(ctx: click.Context, series_id: str, limit: int, start: str
 @click.argument("key")
 @click.option("--dataset", "-d", type=click.Choice(sorted(liquidity.ECB_DATASETS)), default="BSI")
 @click.option("--limit", "-n", default=12, help="Newest points per series (0 = full history)")
-@click.option("--start", default=None, help="Only points on or after YYYY-MM-DD")
+@click.option("--start", default=None, help="Only points on or after YYYY-MM-DD, not after today (UTC)")
 @click.pass_context
 def ecb_series_cmd(
     ctx: click.Context, key: str, dataset: str, limit: int, start: str | None
