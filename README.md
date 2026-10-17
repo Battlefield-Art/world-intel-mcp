@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **157 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **158 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -67,8 +67,9 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere), with opt-in forecast tracks: positions, UTC valid times and intensities, plus NHC's cone of uncertainty |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 | **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
+| **Connections Between Series** | 1 | Correlation between stored series at leads and lags, with a minimum sample, false-discovery control and what it cannot prove |
 
-**Total: 157 tools** across 30+ intelligence domains.
+**Total: 158 tools** across 30+ intelligence domains.
 
 ---
 
@@ -145,6 +146,8 @@ intel prediction-settled   # Brier scores on settled markets
 intel status               # cache + circuit breaker health
 intel guide                # the research guide (also served as intel://guide)
 intel history health       # per-source collection health from the collector's run log
+intel history connections central_bank_rates:federal_funds_rate central_bank_rates:boe_bank_rate_sonia
+                           # correlation at leads and lags between stored series (day grid by default)
 ```
 
 ---
@@ -625,6 +628,13 @@ History accrues only while the collector (`intel-collector`) runs; nothing befor
 | `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload |
 | `intel_series_history` | One series' observations with all three dates, or the list of available series |
 | `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates) |
+
+### Connections Between Series (1)
+Reads the history store only, so the sample is what the collector saved, not each series' full history. A connection is a correlation in that sample: it does not show causation, and a lead does not show causal direction.
+
+| Tool | Description |
+|------|-------------|
+| `intel_lagged_connections` | Correlation between 2 to 8 stored series (keys as `intel_series_history` lists them) on a UTC day, week or month grid, tested at every lag from `-max_lag` to `+max_lag` (default 5, at most 30, at most 1,000 tests a call). Default transform is period-over-period changes, because levels of trending series correlate spuriously; `levels` on request. Per pair: the lag with the smallest p, with Pearson r, overlap n, two-sided p from Student's t and the Benjamini-Hochberg q across every test in the call (significant at q <= 0.05 by default). Lag +k compares A at period t with B at t+k, so A leads B by k. Pair/lag overlaps under 30 points are listed as not tested with their n; revised points use the latest vintage; rows without `observed_at` (Yahoo quotes) are not used. Each strongest result also carries an AR(1) effective sample size as a serial-correlation diagnostic |
 
 ---
 

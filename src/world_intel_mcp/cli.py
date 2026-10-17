@@ -3581,5 +3581,105 @@ def history_revisions(
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 
 
+from .analysis import lagged_connections as _lagged  # noqa: E402
+
+
+def _p_text(value: float) -> str:
+    return "<1e-300" if value == 0 else f"{value:.2g}"
+
+
+@history_group.command(name="connections")
+@click.argument("series_keys", nargs=-1, required=True)
+@click.option("--grid", type=click.Choice(_lagged.GRIDS), default=_lagged.DEFAULT_GRID,
+              show_default=True, help="UTC calendar grid (weeks run Monday to Sunday)")
+@click.option("--transform", type=click.Choice(_lagged.TRANSFORMS),
+              default=_lagged.DEFAULT_TRANSFORM, show_default=True,
+              help="changes (period-over-period) or levels")
+@click.option("--max-lag", type=int, default=_lagged.DEFAULT_MAX_LAG, show_default=True,
+              help=f"Largest lead or lag in grid periods (0 to {_lagged.MAX_LAG_CAP})")
+@click.option("--min-overlap", type=int, default=_lagged.DEFAULT_MIN_OVERLAP, show_default=True,
+              help=f"Fewest overlapping periods a test needs (at least {_lagged.MIN_OVERLAP_FLOOR})")
+@click.option("--q", "q", type=float, default=_lagged.DEFAULT_Q, show_default=True,
+              help="False discovery rate threshold (Benjamini-Hochberg)")
+@click.option("--start", default=None, help="First date YYYY-MM-DD")
+@click.option("--end", default=None, help="Last date YYYY-MM-DD")
+@click.pass_context
+def history_connections(
+    ctx: click.Context, series_keys: tuple[str, ...], grid: str, transform: str,
+    max_lag: int, min_overlap: int, q: float, start: str | None, end: str | None,
+) -> None:
+    """Correlation between stored series at leads and lags.
+
+    Lag +k compares the first series of a pair at period t with the second
+    at t+k, so the first leads by k. A connection is not a cause.
+    """
+    data = _with_history_store(
+        lambda s: _lagged.lagged_connections(
+            s, list(series_keys), grid=grid, transform=transform, max_lag=max_lag,
+            min_overlap=min_overlap, q=q, start=start, end=end,
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    method = data["method"]
+    lo, hi = method["lags"]
+    table = Table(
+        title=f"Connections ({method['grid']} grid, {method['transform']}, lags {lo:+d} to "
+        f"{hi:+d}, {data['tests_run']} tests, BH q <= {method['q_threshold']:g})",
+        box=box.SIMPLE_HEAVY,
+    )
+    for name in ("A", "B", "Lag", "Timing", "r", "n", "n_eff", "p", "q", "Significant"):
+        justify = "right" if name in ("Lag", "r", "n", "n_eff", "p", "q") else "left"
+        table.add_column(name, justify=justify)
+    for pair in data["pairs"]:
+        if not pair["strongest"]:
+            table.add_row(_cell(pair["a"]), _cell(pair["b"]), "-",
+                          Text("not tested", style="dim"), "-", "-", "-", "-", "-", "-")
+        for entry in pair["strongest"]:
+            n_eff = entry.get("n_effective_ar1")
+            table.add_row(
+                _cell(pair["a"]), _cell(pair["b"]), f"{entry['lag']:+d}", entry["timing"],
+                f"{entry['r']:+.3f}", str(entry["n"]), "-" if n_eff is None else f"{n_eff:g}",
+                _p_text(entry["p"]), _p_text(entry["q"]),
+                Text("yes", style="green") if entry["significant"] else Text("no"),
+            )
+    console.print(table)
+    console.print(escape(data["summary"]))
+    console.print(
+        "n_eff: AR(1) effective sample size from the two series' lag-1 autocorrelations, "
+        "a diagnostic only: p and q use n."
+    )
+    console.print(f"Lag convention: {escape(method['lag_convention'])}")
+    console.print(
+        f"Transform: {escape(method['transform_rule'])} {escape(method['why_changes_default'])}"
+    )
+    for pair in data["pairs"]:
+        best = {e["lag"] for e in pair["strongest"]}
+        others = [e for e in pair["significant"] if e["lag"] not in best]
+        if others:
+            listed = ", ".join(
+                f"lag {e['lag']:+d} (r {e['r']:+.3f}, q {_p_text(e['q'])})" for e in others
+            )
+            console.print(f"Also significant: {escape(pair['a'])} / {escape(pair['b'])}: {listed}")
+        if pair["not_tested"]:
+            listed = ", ".join(
+                f"lag {nt['lag']:+d} (n {nt['n']}"
+                + (", no variation)" if nt["reason"] == "no_variation" else ")")
+                for nt in pair["not_tested"]
+            )
+            console.print(
+                f"[yellow]Not tested[/yellow] (minimum {method['min_overlap']} overlapping "
+                f"periods): {escape(pair['a'])} / {escape(pair['b'])}: {listed}"
+            )
+    for item in data["excluded_series"]:
+        console.print(
+            f"[yellow]Excluded:[/yellow] {escape(item['series_key'])}: {escape(item['reason'])}"
+        )
+    _print_data_gaps(data)
+    for line in data["cannot_prove"]:
+        console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
+
+
 if __name__ == "__main__":
     main()

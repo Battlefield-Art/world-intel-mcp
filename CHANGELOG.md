@@ -308,6 +308,56 @@ source here, and no proxy is substituted for any of these measures.
   history capture is an error.
 - Tools 139 -> 143.
 
+### Added: connections with timing offsets (Phase 29)
+- `intel_lagged_connections` (CLI: `intel history connections`): Pearson
+  correlation between 2 to 8 series in the history store (keys as
+  `intel_series_history` lists them), aligned on a UTC day, week (Monday to
+  Sunday) or month grid and tested at every lag from `-max_lag` to
+  `+max_lag` (default 5, at most 30, reduced so one call runs at most 1,000
+  tests). Lag +k compares A at period t with B at t+k, so A leads B by k.
+- Default transform: period-over-period changes, never taken across a gap;
+  `levels` on request. Responses say which ran and why changes are the
+  default (levels of trending series correlate spuriously).
+- Per pair: the lag with the smallest p, with r, n (overlapping periods
+  after the transform and shift), a two-sided p from Student's t (computed
+  from the regularized incomplete beta function, standard library only) and
+  the Benjamini-Hochberg q across every test in the call, with the
+  Benjamini-Yekutieli `q_by` alongside. Significant at q <= 0.05 by default
+  (allowed 0.001 to 0.25); the other significant lags are listed too.
+- A pair and lag with fewer than 30 overlapping periods (callers may go down
+  to 20), or a constant side, is listed as not tested with its n, never
+  dropped. 30 points give about 80% power for a true |r| of 0.5 at alpha
+  0.05 (module docstring).
+- One vintage, the latest collected value for each `observed_at`. Rows
+  without `observed_at` (Yahoo quotes) are not used, with the reason: rows
+  are stored only on change, so a missing day cannot be told from an
+  unchanged one. A period takes its last observation; nothing is averaged.
+- Serial correlation: each series' lag-1 autocorrelation after the
+  transform, and per strongest result an AR(1) effective sample size and
+  the p recomputed with it, as a diagnostic outside q. Nothing is
+  prewhitened.
+- `cannot_prove` in every response: correlation is not causation, a lead is
+  not a causal direction, serial correlation inflates significance, a
+  shared driver produces correlation, the store holds only what the
+  collector recorded, BH under dependence is approximate and covers one
+  call, and a small q is not a large effect.
+- An unknown grid or transform is an error naming the allowed values;
+  numeric inputs are clamped and each clamp is reported.
+- Measured 2026-10-17 over a live MCP stdio session and the CLI, on four
+  real FRED series (WALCL, WDTGAL, WTREGEN, RRPONTSYD) loaded into an
+  isolated store as one capture; illustrative, not findings. Week grid,
+  changes: 26 of 66 tests significant; the Wednesday TGA level against its
+  week average gives r 0.61 at lag 0 and 0.59 at lag +1, the averaging
+  window rather than a cause. Levels: Fed total assets against either TGA
+  series gives r 0.74 at lag 0 (n 1,244) with an AR(1) effective sample
+  size of 5.3 and 3.4. Day grid: the weekly series have no adjacent-day
+  changes, so nothing is tested and the response says why.
+- With the default 365-day observation retention
+  (`WORLD_INTEL_HISTORY_DAYS`), a store filled only by the collector spans
+  about a year, so the month grid cannot reach the 20-point floor without a
+  longer retention or backfilled history.
+- Tools 152 -> 153.
+
 ### Added: news signals (ROADMAP Phase 29)
 - `intel_hostility_timeline`: per UTC day, GDELT DOC 2.0 coverage of a
   country or a pair of countries (`timelinevolraw`): matching articles,
