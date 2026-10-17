@@ -56,6 +56,32 @@ data mining, scraping or harvesting tools, robots included); BLS public API (key
 v1 answers for CPI-U and payrolls, but api.bls.gov robots.txt disallows all paths
 and the terms page answers 403). Fund flows and ETF net issuance therefore have no
 source here, and no proxy is substituted for any of these measures.
+### Added: news vs market reaction
+- `intel_news_market_reaction` (CLI: `intel news-reaction`): the companies and
+  countries named in recent story clusters, mapped to a listing (the entity
+  table's ticker, confirmed against SEC's company_tickers.json for US
+  listings) or to the country's primary index (the table `intel_country_stocks`
+  uses), with the move on the story's market session from Yahoo daily bars.
+  Company rows give the stock's close-to-close return (adjusted closes), the
+  benchmark's return over the same two dates (SPY for US listings, the
+  exchange country's index otherwise) and the excess return; country rows
+  give the index return and a z-score against its previous up-to-20 sessions.
+- Session rule, stated in every response: the story time (earliest
+  `published` in the cluster) is converted to the exchange's timezone; before
+  the regular close on a trading day it is that session, at or after the close
+  the next one, and a weekend or holiday (read from the listing's own bars)
+  maps to the next trading day. A session that has not closed is `pending`.
+- Honest gaps: a failed quote, a missing benchmark bar, a stock series missing
+  a day its benchmark traded, a story timestamp later than the collection time
+  and a story older than the bar range are each a `data_gap` row with the
+  reason and no number, never a 0% move. Unmapped names (private companies,
+  countries without an index) are listed, not dropped. Company names that are
+  also common words (apple, amazon, meta, shell, bp, alphabet, chevron,
+  samsung) are excluded with a stated reason unless the headlines carry a
+  corroborating term or an article comes from a feed category where the
+  company sense dominates (a hyphen-joined use such as "meta-analysis" does
+  not count). Responses say they describe same-session co-movement, not
+  causation, and are not a trading signal. Tools 139 -> 140.
 
 ## 0.11.0 - 2026-10-12
 

@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **144 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **145 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -22,6 +22,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Earnings** | 2 | Yahoo Finance (mega-cap calendar, surprise history) |
 | **SEC Filings** | 3 | SEC EDGAR (full-text search, company filings, 8-K material events) |
 | **Company Enrichment** | 1 | Yahoo Finance + GDELT + SEC + GitHub (composite profile) |
+| **News vs Market Reaction** | 1 | RSS story clusters + Yahoo Finance daily bars + SEC ticker file (same-session move of named companies and country indices) |
 | **Macro Composite** | 1 | Weighted 6-signal market verdict (Fear&Greed, VIX, sectors, DXY, BTC, yields) |
 | **Economic Indicators** | 6 | AAA fuel prices, EIA energy, FRED macro, World Bank |
 | **Central Banks** | 1 | 15 central bank policy rates |
@@ -65,7 +66,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 144 tools** across 30+ intelligence domains.
+**Total: 145 tools** across 30+ intelligence domains.
 
 ---
 
@@ -132,6 +133,7 @@ intel migration-surges     # year-over-year displacement jumps (UNHCR)
 intel migration-flows -o Sudan
 intel liquidity            # Fed balance sheet, TGA, RRP, net liquidity, US M2, euro area M1-M3
 intel net-liquidity -n 0   # full weekly history, components and RRP date per week
+intel news-reaction -c finance  # same-session moves of companies in the news
 intel status               # cache + circuit breaker health
 ```
 
@@ -200,6 +202,11 @@ collector.py  (daemon)    ─┘
 | Tool | Description |
 |------|-------------|
 | `intel_company_profile` | Composite profile: stock quote + financials + news + SEC + GitHub |
+
+### News vs Market Reaction (1)
+| Tool | Description |
+|------|-------------|
+| `intel_news_market_reaction` | Companies and countries named in recent story clusters, mapped to tickers (SEC-confirmed for US listings) and country indices; the move on the story's market session (stock, benchmark, excess return; index return with a trailing z-score). After-close stories map to the next session, weekends and holidays to the next trading day, in the exchange's timezone. Unmapped and ambiguous names are listed with reasons; a failed quote is a data gap, never 0%. Co-movement, not causation; not a trading signal |
 
 ### Macro Composite (1)
 | Tool | Description |
