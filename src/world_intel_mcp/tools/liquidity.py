@@ -38,7 +38,10 @@ TOOLS: list[Tool] = [
                 "sort": {
                     "type": "string",
                     "enum": ["biggest_move", "newest"],
-                    "description": "biggest_move (absolute percent change) or newest (latest period end)",
+                    "description": (
+                        "biggest_move (largest absolute change, in billions of each row's currency, "
+                        "no FX conversion; percent change does not rank) or newest (latest period end)"
+                    ),
                     "default": "biggest_move",
                 },
             },
@@ -111,7 +114,8 @@ TOOLS: list[Tool] = [
             "ECB Data Portal series by SDMX key, keyless: BSI (euro area monetary "
             "aggregates and MFI balance sheets) or ILM (Eurosystem weekly financial "
             "statement). Units, scale and provisional flags come from the response; each "
-            "series is typed as amount_outstanding, flow, growth_rate or index. "
+            "series is typed as amount_outstanding, flow, growth_rate, index or unknown "
+            "(a data type not recognized, named in data_gaps). "
             "Example key: BSI M.U2.Y.V.M30.X.1.U2.2300.Z01.E (euro area M3 stock)."
         ),
         inputSchema={
@@ -125,7 +129,7 @@ TOOLS: list[Tool] = [
                 },
                 "key": {
                     "type": "string",
-                    "description": "SDMX series key; '+' selects several values in one dimension",
+                    "description": liquidity.ECB_KEY_RULES,
                 },
                 "limit": {
                     **_LIMIT,

@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import click
+from rich.cells import cell_len
 from rich.console import Console
 from rich.markup import escape
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 from rich.panel import Panel
@@ -1952,10 +1954,35 @@ def _liq_points_table(title: str, points: list[dict], extra: tuple[str, ...] = (
     return table
 
 
+# Board columns: (header, justify, whole). A whole column holds dates,
+# numbers or units and is never wrapped or cut; the text columns fold.
+_LIQ_BOARD_COLUMNS = (
+    ("Indicator", "left", False), ("Observed", "left", True), ("Latest", "right", True),
+    ("Units", "left", True), ("Change", "right", True), ("Change %", "right", True),
+    ("Measure", "left", False), ("Status", "left", False),
+)
+_LIQ_TEXT_MIN_WIDTH = 12
+
+
+def _liq_board_fits(rows: list[list[str]], width: int) -> bool:
+    """Whether the board table fits ``width`` with its whole columns intact
+    and each text column at least _LIQ_TEXT_MIN_WIDTH wide (or its full
+    width). Narrower, Rich would cut cells or drop text columns (at 80
+    columns it dropped Indicator), so the board is printed as a list."""
+    need = len(_LIQ_BOARD_COLUMNS) + 1  # table edges and column separators
+    for i, (header, _, whole) in enumerate(_LIQ_BOARD_COLUMNS):
+        natural = max([cell_len(header)] + [cell_len(row[i]) for row in rows])
+        need += (natural if whole else min(natural, _LIQ_TEXT_MIN_WIDTH)) + 2  # cell padding
+    return need <= width
+
+
 @main.command(name="liquidity")
 @click.option(
     "--sort", type=click.Choice(["biggest_move", "newest"]), default="biggest_move",
-    help="Order rows by absolute percent change or by newest period",
+    help=(
+        "biggest_move: largest absolute change, in billions of each row's currency "
+        "(no FX conversion; percent change does not rank); newest: latest period end"
+    ),
 )
 @click.pass_context
 def liquidity_cmd(ctx: click.Context, sort: str) -> None:
@@ -1963,27 +1990,45 @@ def liquidity_cmd(ctx: click.Context, sort: str) -> None:
     data = _run(liquidity.fetch_liquidity_board(_get_fetcher(), sort=sort))
     if _bail_on_error(ctx, data):
         return
-    table = Table(title=f"Liquidity board (sorted by {sort})", box=box.SIMPLE_HEAVY)
-    table.add_column("Indicator", style="bold")
-    table.add_column("Observed")
-    table.add_column("Latest", justify="right")
-    table.add_column("Units")
-    table.add_column("Change", justify="right")
-    table.add_column("Change %", justify="right")
-    table.add_column("Measure")
+    rows, stale = [], []
     for r in data.get("indicators", []):
-        stale = (r.get("freshness") or {}).get("stale")
         measure = r.get("measure", "")
-        table.add_row(
-            _cell(r.get("indicator", "")),
-            Text(f"{r.get('observed_at')} (stale)", style="yellow") if stale else _cell(r.get("observed_at", "")),
+        stale.append(bool((r.get("freshness") or {}).get("stale")))
+        rows.append([
+            str(r.get("indicator", "")),
+            f"{r.get('observed_at')} (stale)" if stale[-1] else str(r.get("observed_at", "")),
             _liq_num(r.get("latest_value")),
-            _cell(r.get("units") or ""),
+            str(r.get("units") or ""),
             _liq_num(r.get("change"), signed=True),
             _liq_num(r.get("change_pct"), signed=True),
-            _cell("stock" if measure == "amount_outstanding" else measure),
-        )
-    console.print(table)
+            "stock" if measure == "amount_outstanding" else str(measure),
+            str(r.get("status") or ""),
+        ])
+    title = f"Liquidity board (sorted by {sort})"
+    if _liq_board_fits(rows, console.width):
+        table = Table(title=title, box=box.SIMPLE_HEAVY)
+        for header, justify, whole in _LIQ_BOARD_COLUMNS:
+            table.add_column(
+                header, justify=justify, no_wrap=whole, overflow="fold",
+                style="bold" if header == "Indicator" else None,
+            )
+        for row, is_stale in zip(rows, stale):
+            cells = [_cell(value) for value in row]
+            if is_stale:
+                cells[1].stylize("yellow")
+            table.add_row(*cells)
+        console.print(table)
+    else:
+        console.print(Text(title, style="bold"))
+        for row, is_stale in zip(rows, stale):
+            indicator, observed, latest, units, change, change_pct, measure, status = row
+            console.print(Text(indicator, style="bold"))
+            console.print(Padding(Text.assemble(
+                f"{latest} {units}, observed ", (observed, "yellow" if is_stale else ""),
+                f", change {change} ({change_pct}%), {measure}", f", {status}" if status else "",
+            ), (0, 0, 0, 2)))
+    if data.get("ranking_rule"):
+        console.print(f"[dim]Ranking: {escape(str(data['ranking_rule']))}[/dim]")
     for u in data.get("unavailable", []):
         console.print(
             f"[red]Unavailable:[/red] {escape(str(u.get('indicator')))}: {escape(str(u.get('error')))}"

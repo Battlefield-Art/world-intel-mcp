@@ -14,8 +14,10 @@ Eurosystem balance sheet. Keyless sources only.
 Every point carries ``observed_at`` (the period the value describes),
 ``value`` and ``units``; every series says whether it is an amount
 outstanding, a flow (transactions within the period), a growth rate or an
-index. A blank FRED cell is a missing observation, never a zero, and a
-failed component is an error, never a zero term in the net liquidity sum.
+index, or is typed ``unknown`` (named in ``data_gaps``) when the ECB data
+type is not one of those. A blank FRED cell is a missing observation, never
+a zero, and a failed component is an error, never a zero term in the net
+liquidity sum.
 RRP uses the Wednesday value; a blank Wednesday on or after 2013-09-23
 may use Tuesday only. Earlier blank Wednesdays and missing Tuesdays are
 skipped and counted, never filled.
@@ -43,7 +45,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
-from ..fetcher import Fetcher
+from ..fetcher import BinaryResult, Fetcher
 
 logger = logging.getLogger("world-intel-mcp.sources.liquidity")
 
@@ -252,6 +254,14 @@ ECB_DATASETS = {
 _ECB_MAX_AGE_DAYS = {"M": 75, "W": 16, "D": 6, "Q": 200, "A": 500}
 
 _ECB_KEY_RE = re.compile(r"^[A-Za-z0-9_+.]{1,200}$")
+# Dimensions a series key must give, per dataset, none left empty.
+_ECB_KEY_DIMENSIONS = {"BSI": 11, "ILM": 6}
+ECB_KEY_RULES = (
+    f"SDMX series key: every dimension given (BSI {_ECB_KEY_DIMENSIONS['BSI']}, "
+    f"ILM {_ECB_KEY_DIMENSIONS['ILM']}), none empty, so no wildcards; '+' selects "
+    f"several values in one dimension, at most {_MAX_ECB_SERIES} series combinations "
+    "in all; letters, digits, '.', '+' and '_' only, up to 200 characters"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +336,7 @@ def _freshness(period_end: date | None, max_age_days: int) -> dict:
 def _stale_gap(name: str, observed_at: str, fresh: dict) -> str | None:
     if fresh.get("served_from_stale_cache"):
         return (
-            f"{name}: upstream fetch failed or circuit open; served from stale cache "
+            f"{name}: {fresh['fetch_failure']}; served from stale cache "
             f"({fresh['cache_age_seconds']} seconds old)"
         )
     if fresh.get("stale"):
@@ -336,6 +346,33 @@ def _stale_gap(name: str, observed_at: str, fresh: dict) -> str | None:
             "(publisher delay, a served stale cache copy, or an outage)"
         )
     return None
+
+
+def _fetch_failure(result: BinaryResult) -> str:
+    """Why ``get_bytes`` returned no body: the HTTP status, a request that
+    got no response, or an open circuit (no request sent)."""
+    error = result.error or ""
+    if result.status is None and error.startswith("circuit open"):
+        return "upstream fetch failed (circuit open: request not sent after repeated failures)"
+    kind = error.split(":", 1)[0]
+    if result.status is not None and kind in ("", "HTTPStatusError"):
+        return f"upstream fetch failed (HTTP {result.status})"
+    if "exceeds cap" in error:
+        return f"upstream fetch failed (HTTP {result.status}, {error})"
+    return f"upstream fetch failed (no response: {kind or 'unknown error'})"
+
+
+def _stale_copy(fetcher: Fetcher, key: str, failure: str) -> tuple[Any, dict]:
+    """The last good copy under ``key`` and the markers that travel with it."""
+    hit = fetcher.cache.get_stale_meta(key)
+    if hit is None:
+        return None, {}
+    value, created_at = hit
+    return value, {
+        "served_from_stale_cache": True,
+        "cache_age_seconds": round(max(0.0, time.time() - created_at), 1),
+        "fetch_failure": failure,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -366,14 +403,17 @@ def parse_fred_csv(text: str, series_id: str) -> list[tuple[date, float | None]]
     return rows
 
 
-def _cache_meta(fetcher: Fetcher, key: str) -> dict:
-    meta = fetcher.cache.get_stale_meta(key)
-    if meta is None:
-        return {}
-    return {
-        "served_from_stale_cache": True,
-        "cache_age_seconds": round(max(0.0, time.time() - meta[1]), 1),
-    }
+def _keep_or_count(fetcher: Fetcher, key: str, value: Any, ttl: int, source: str, meta: dict) -> None:
+    """After a body parsed: cache a fresh one, or count a stale copy served.
+
+    A stale copy is never written back (that would restamp old data as
+    fresh); each one served counts on the circuit breaker's
+    ``total_stale_serves``, which intel_status and the dashboard show.
+    """
+    if meta:
+        fetcher.breaker.record_stale_serve(source)
+    else:
+        fetcher.cache.set(key, value, ttl)
 
 
 def _mark_cached(series: dict, meta: dict) -> dict:
@@ -388,7 +428,7 @@ async def _fred_rows(
 ) -> tuple[list[tuple[date, float | None]] | None, str | None, dict]:
     key = f"liquidity:fred:{series_id}"
     text = fetcher.cache.get(key)
-    meta = {}
+    meta: dict = {}
     fetched = text is None
     if fetched:
         result = await fetcher.get_bytes(
@@ -398,20 +438,20 @@ async def _fred_rows(
         if result.ok:
             text = result.content.decode("utf-8", errors="replace")
         else:
-            text = fetcher.cache.get_stale(key)
-            meta = _cache_meta(fetcher, key)
-    if text is None:
-        return None, f"FRED graph CSV for {series_id} unavailable (fetch failed, no cached copy)", {}
+            failure = _fetch_failure(result)
+            text, meta = _stale_copy(fetcher, key, failure)
+            if text is None:
+                return None, f"FRED graph CSV for {series_id} unavailable: {failure}, no cached copy", {}
     try:
         rows = parse_fred_csv(text, series_id)
     except (ValueError, csv.Error) as exc:
         if not fetched:
             fetcher.cache.delete(key)
-        return None, f"FRED graph CSV for {series_id} not in the expected format: {exc}", {}
+        return None, f"FRED graph CSV for {series_id} not in the expected format (parse error: {exc})", {}
     if not any(v is not None for _, v in rows):
         return None, f"FRED graph CSV for {series_id} has no observations", {}
-    if fetched and not meta:
-        fetcher.cache.set(key, text, _FRED_TTL)
+    if fetched:
+        _keep_or_count(fetcher, key, text, _FRED_TTL, FRED_SOURCE, meta)
     return rows, None, meta
 
 
@@ -770,6 +810,27 @@ def parse_sdmx_json(data: dict, dataset: str) -> list[dict]:
     return out
 
 
+_JSON_KINDS = {list: "array", str: "string", int: "number", float: "number", bool: "boolean", type(None): "null"}
+
+
+def _ecb_404_is_no_data(body: bytes) -> bool:
+    """Whether an ECB 404 is the portal's own answer to a key that matches
+    no series: an empty body or a JSON object (its problem+json, e.g.
+    "No Series was returned for the query"). A 404 with any other body
+    (an HTML or plain-text error page, JSON that is not an object) came
+    from something in front of the portal and takes the outage path.
+
+    Residual risk: a JSON-object 404 from a moved gateway would still
+    read as no-data.
+    """
+    if not body.strip():
+        return True
+    try:
+        return isinstance(json.loads(body), dict)
+    except (ValueError, RecursionError):  # UnicodeError is a ValueError
+        return False
+
+
 async def _ecb_fetch(
     fetcher: Fetcher, dataset: str, key: str, last_n: int, start: date | None
 ) -> tuple[list[dict] | None, str | None]:
@@ -780,37 +841,53 @@ async def _ecb_fetch(
         params["startPeriod"] = start.isoformat()
     cache_key = f"liquidity:ecb:{dataset}:{key}:{last_n}:{start}"
     data = fetcher.cache.get(cache_key)
-    cache_meta = {}
+    cache_meta: dict = {}
     fetched = data is None
     if fetched:
         result = await fetcher.get_bytes(
             f"{_ECB_DATA_URL.format(dataset=dataset, key=key)}?{urlencode(params)}",
-            source=ECB_SOURCE, headers=_HEADERS, timeout=30.0,
+            source=ECB_SOURCE, headers=_HEADERS, timeout=30.0, accept_404=_ecb_404_is_no_data,
         )
-        if result.status == 404:
+        if result.status == 404 and result.error is None:
             return None, f"ECB Data Portal: no series matches the key {dataset}/{key}"
-        if result.ok and not result.content.strip():
-            return None, f"ECB Data Portal: no observations on or after {start or 'the requested start'} for {dataset}/{key}"
-        if result.ok:
+        # An unexpected payload takes the outage path (last good copy,
+        # marked) without a circuit-breaker failure: the transport worked.
+        failure = None
+        if not result.ok:
+            failure = _fetch_failure(result)
+        elif not result.content.strip():
+            # Empty is the portal's answer when nothing is observed on or
+            # after startPeriod; with no start sent it answers nothing.
+            if start is not None:
+                return None, f"ECB Data Portal: no observations on or after {start} for {dataset}/{key}"
+            failure = "unexpected payload (empty body, no start requested)"
+        else:
             try:
                 data = json.loads(result.content)
             except (ValueError, UnicodeError) as exc:
-                return None, f"ECB Data Portal response not in the expected SDMX-JSON shape: {exc!r:.80}"
-        else:
-            data = fetcher.cache.get_stale(cache_key)
-            cache_meta = _cache_meta(fetcher, cache_key)
-    if not isinstance(data, dict):
-        return None, f"ECB Data Portal returned no data for {dataset}/{key} (upstream fetch failed or circuit open)"
+                return None, (
+                    "ECB Data Portal response not in the expected SDMX-JSON shape "
+                    f"(parse error: {exc!r:.80})"
+                )
+            if not isinstance(data, dict):
+                failure = f"unexpected payload (JSON {_JSON_KINDS.get(type(data), type(data).__name__)}, not an object)"
+        if failure is not None:
+            data, cache_meta = _stale_copy(fetcher, cache_key, failure)
+            if data is None:
+                return None, f"ECB Data Portal returned no data for {dataset}/{key}: {failure}, no cached copy"
     try:
         series = parse_sdmx_json(data, dataset)
     except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
         if not fetched:
             fetcher.cache.delete(cache_key)
-        return None, f"ECB Data Portal response for {dataset}/{key} not in the expected SDMX-JSON shape: {exc!r:.80}"
+        return None, (
+            f"ECB Data Portal response for {dataset}/{key} not in the expected SDMX-JSON shape "
+            f"(parse error: {exc!r:.80})"
+        )
     if not any(s["points"] for s in series):
         return None, f"ECB Data Portal returned no observations for {dataset}/{key}"
-    if fetched and not cache_meta:
-        fetcher.cache.set(cache_key, data, _ECB_TTL)
+    if fetched:
+        _keep_or_count(fetcher, cache_key, data, _ECB_TTL, ECB_SOURCE, cache_meta)
     for item in series:
         item.update(cache_meta)
     return series, None
@@ -841,7 +918,8 @@ def _finish_ecb_series(series: dict, limit: int) -> dict:
         "freshness": {
             **_freshness(end, max_age),
             **({"stale": True, "served_from_stale_cache": True,
-                "cache_age_seconds": series["cache_age_seconds"]}
+                "cache_age_seconds": series["cache_age_seconds"],
+                "fetch_failure": series["fetch_failure"]}
                if series.get("served_from_stale_cache") else {}),
         },
         "order": "newest_first",
@@ -878,11 +956,14 @@ async def fetch_ecb_series(
             "timestamp": _utc_now_iso(),
         }
     dimensions = key.split(".")
-    if (len(dimensions) != {"BSI": 11, "ILM": 6}[ds]
+    if (len(dimensions) != _ECB_KEY_DIMENSIONS[ds]
             or any(not code for dim in dimensions for code in dim.split("+"))
             or math.prod(len(dim.split("+")) for dim in dimensions) > _MAX_ECB_SERIES):
         return {
-            "error": "key must specify every SDMX dimension without wildcards and at most 50 series combinations",
+            "error": (
+                f"key must specify every SDMX dimension ({_ECB_KEY_DIMENSIONS[ds]} for {ds}) "
+                f"without wildcards and at most {_MAX_ECB_SERIES} series combinations"
+            ),
             "timestamp": _utc_now_iso(),
         }
     try:
@@ -1051,7 +1132,7 @@ def _row(
         "units": units,
         "latest_value": latest["value"] if latest else None,
         "status": latest.get("status") if latest else None,
-        **({k: freshness[k] for k in ("served_from_stale_cache", "cache_age_seconds")}
+        **({k: freshness[k] for k in ("served_from_stale_cache", "cache_age_seconds", "fetch_failure")}
            if freshness.get("served_from_stale_cache") else {}),
         "observed_at": latest["observed_at"] if latest else None,
         "period_end": period_end.isoformat() if period_end else None,
