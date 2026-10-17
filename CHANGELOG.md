@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: vessel snapshot waterway matching
+- `intel_vessel_snapshot` counted every NGA warning at all nine waterways,
+  so three naval-keyword warnings anywhere on Earth marked Panama and
+  Hormuz critical alike. On the live feed of 2026-10-17 the old code marked
+  all nine `critical` from 8 such warnings, none within 300 km of any of
+  them. A warning now counts only at waterways within 300 km of a position
+  it states (degrees-minutes or degrees-minutes-seconds). A warning that
+  states no position counts by NAVAREA only when its area code names a
+  single NAVAREA (4 is NAVAREA IV, 12 is NAVAREA XII, which of the nine
+  contain only the Panama Canal). HYDROLANT, HYDROPAC and HYDROARC each
+  span several NAVAREAs, so a positionless naval warning in those series,
+  or one whose only stated position is malformed, is listed in
+  `unplaced_naval_warnings` and named in `data_gaps`. The response states
+  the rule in `matching_rule`.
+- Each waterway emits `total_nearby` (warnings of any topic credited to
+  it, which the old code computed and dropped), split by how they matched
+  in `nearby_by_match` and `naval_by_match`; `warning_details` entries
+  carry `match`, `distance_km` and `issue_date`.
+- With NGA down every waterway read `clear`. It now reads `unknown`, and
+  the response carries `error`, `degraded` and `reason`.
+
+### Fixed: navigational warnings
+- An NGA outage returned `warnings: []` with no marker, the same shape as a
+  sea with no active warnings. It now carries `error`, `degraded`,
+  `reason` (`nga_msi_fetch_failed`) and `data_gaps`. A payload with no
+  warnings list is `nga_msi_unexpected_payload`; a stale cache serve is
+  degraded and says how old the copy is.
+- The NGA MSI API holds no warning issued after 10 May 2024 (measured
+  2026-10-17: `msgYear=2025` with `status=all` and `msgYear=2026` return
+  none, `msgYear=2024` with `status=all` ends on 10 May, and
+  `/current-warnings` and `/inforce` list the same 2024 state), yet
+  responses read as current. `intel_nav_warnings` now reports
+  `newest_issue_date` and `newest_issue_age_days`; past `stale_after_days`
+  (14, twice the slowest series' longest gap between issues in 2024) the
+  response is degraded with the age in `data_gaps`. The vessel snapshot and
+  fleet report pass this on.
+- `area_codes` maps the codes the API sends in `navArea` (4, 12, A, P, C;
+  never the Roman numerals) to the NAVAREAs, with each code's source in
+  `sources/maritime.py`.
+
+### Fixed: fleet report
+- `intel_fleet_report` turned a failed component into `{}`, so with all
+  three down it read `LOW_ACTIVITY` with no marker. A component that raises
+  or reports an error is now named in `unavailable_components` and
+  `data_gaps` and the report is degraded; with all three down it also
+  carries `error` and `reason` (`fleet_components_unavailable`). Component
+  `data_gaps` are passed on.
+
+### Tests
+- Failing-first regression tests for all three, built on live NGA records
+  captured 2026-10-17.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

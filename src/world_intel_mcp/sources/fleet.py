@@ -15,11 +15,32 @@ logger = logging.getLogger("world-intel-mcp.sources.fleet")
 
 
 async def _safe(coro, label: str) -> dict:
+    """Await one report component; a raise or a non-dict result comes back
+    as an error dict (error / degraded / reason), never as an empty one.
+
+    This used to return {}, which made a component that raised read exactly
+    like one that found nothing: with all three down, the report scored
+    LOW_ACTIVITY with no sign that it had no data.
+    """
     try:
-        return await coro
+        result = await coro
     except Exception as exc:
         logger.warning("Fleet report: %s failed: %s", label, exc)
-        return {}
+        return {
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+            "degraded": True,
+            "reason": "component_raised",
+        }
+    if not isinstance(result, dict):
+        logger.warning(
+            "Fleet report: %s returned %s, not a dict", label, type(result).__name__
+        )
+        return {
+            "error": f"returned {type(result).__name__}, not a dict",
+            "degraded": True,
+            "reason": "component_bad_shape",
+        }
+    return result
 
 
 def _fleet_readiness(theaters: dict, waterways: list, surges: list) -> tuple[str, int]:
@@ -66,6 +87,12 @@ async def fetch_fleet_report(fetcher) -> dict:
     - Vessel snapshot (9 strategic waterways, naval status)
     - Military surge detections (anomalous foreign aircraft concentration)
     - Naval bases (filtered from static dataset)
+
+    A component that raised or reported an error is named in
+    unavailable_components and data_gaps, and the report is degraded; the
+    readiness score is then computed without it. With all three down the
+    report carries error / reason, so an outage never reads as
+    LOW_ACTIVITY. data_gaps also carries each component's own gaps.
     """
     from . import intelligence, military, geospatial
 
@@ -82,6 +109,25 @@ async def fetch_fleet_report(fetcher) -> dict:
     # Get naval bases (sync, no fetcher needed)
     naval_bases = await geospatial.fetch_military_bases(base_type="naval_base")
     naval_base_count = naval_bases.get("count", 0)
+
+    components = {
+        "military_surge": surge_data,
+        "theater_posture": posture_data,
+        "vessel_snapshot": vessel_data,
+    }
+    unavailable = [name for name, data in components.items() if data.get("error")]
+    data_gaps: list[str] = []
+    for name, data in components.items():
+        if data.get("error"):
+            data_gaps.append(
+                f"{name}: unavailable ({data['error']}); readiness_score is "
+                "computed without it"
+            )
+            continue
+        gaps = data.get("data_gaps") or []
+        data_gaps.extend(f"{name}: {gap}" for gap in gaps)
+        if data.get("degraded") and not gaps:
+            data_gaps.append(f"{name}: degraded")
 
     # Extract key data
     theaters = posture_data.get("theaters", {})
@@ -133,7 +179,7 @@ async def fetch_fleet_report(fetcher) -> dict:
             }
         )
 
-    return {
+    response = {
         "readiness_level": readiness_level,
         "readiness_score": readiness_score,
         "theater_summary": theater_summary,
@@ -146,6 +192,20 @@ async def fetch_fleet_report(fetcher) -> dict:
         "total_tracked_aircraft": sum(
             t.get("count", 0) for t in theaters.values() if isinstance(t, dict)
         ),
+        "data_gaps": data_gaps,
         "source": "fleet-activity-report",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if unavailable:
+        # The zeroed fields above stay for consumers that read them;
+        # these say which inputs they lack.
+        response["unavailable_components"] = unavailable
+        response["degraded"] = True
+        if len(unavailable) == len(components):
+            response["error"] = "All fleet report components unavailable: " + ", ".join(
+                unavailable
+            )
+            response["reason"] = "fleet_components_unavailable"
+    elif any(data.get("degraded") for data in components.values()):
+        response["degraded"] = True
+    return response
