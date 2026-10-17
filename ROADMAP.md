@@ -2,7 +2,7 @@
 
 **Benchmark**: [koala73/worldmonitor](https://github.com/koala73/worldmonitor)
 **Updated**: 2026-10-12 (0.11.0: aircraft-cohort early warning, cross-border migration)
-**Current tools**: 139 (138 intel + 1 status)
+**Current tools**: 141 (140 intel + 1 status)
 
 ---
 
@@ -132,7 +132,7 @@
 | `intel_strategic_ports` | Static dataset (40 ports) | :white_check_mark: |
 | `intel_pipelines` | Static dataset (24 pipelines) | :white_check_mark: |
 
-### Humanitarian & Social (8 tools)
+### Humanitarian & Social (10 tools)
 | Tool | WM Equivalent | Status |
 |------|---------------|--------|
 | `intel_humanitarian_summary` | `get-humanitarian-summary` | :white_check_mark: |
@@ -141,6 +141,8 @@
 | `intel_migration_surges` | none (beyond parity) | :white_check_mark: year-over-year mass-movement ranking |
 | `intel_migration_history` | none (beyond parity) | :white_check_mark: per-country series since 1951 |
 | `intel_net_migration` | none (beyond parity) | :white_check_mark: World Bank net migration + migrant stock |
+| `intel_us_border_encounters` | none (beyond parity) | :white_check_mark: CBP monthly encounters (a flow) |
+| `intel_uk_small_boat_arrivals` | none (beyond parity) | :white_check_mark: Home Office small-boat arrivals (a flow) |
 | `intel_social_signals` | Reddit public intelligence | :white_check_mark: |
 | `intel_disease_outbreaks` | WHO/ProMED/CIDRAP RSS | :white_check_mark: |
 
@@ -534,8 +536,9 @@ heatmaps; the excess-origins tool infers takeoffs/landings and clusters
 them. Only aircraft first seen 24 h before the window count, so a fresh
 install answers `warming_up` for a day.
 
-### Phase 28: Cross-Border Migration (+4 = 139 tools)
-`intel_migration_flows`, `intel_migration_surges`, `intel_migration_history`, `intel_net_migration`
+### Phase 28: Cross-Border Migration (+6 = 141 tools)
+`intel_migration_flows`, `intel_migration_surges`, `intel_migration_history`, `intel_net_migration`,
+`intel_us_border_encounters`, `intel_uk_small_boat_arrivals`
 
 UNHCR origin -> destination corridors (about 6,000 for 2025) with
 prior-year change and country/region filters; a surge ranking by
@@ -548,8 +551,21 @@ year-end stocks (stated in each response), not crossings.
 
 Shipped in 0.11.0 with the dashboard corridor map, CLI commands and
 collector sources. Open: near-real-time displacement (IOM DTM, HDX HAPI:
-both need keys) and regional border-crossing series (Frontex, CBP, UK
-small boats).
+both need keys).
+
+Border crossings (Unreleased, `sources/border_crossings.py`): FLOWS, events
+per day, week or month, kept apart from the stocks above and never added to
+or compared with them. Publisher status as measured on 2026-10-17 with an
+identifying User-Agent:
+
+| Publisher | Measured | Status |
+|-----------|----------|--------|
+| U.S. CBP | Dataset page `cbp.gov/document/stats/nationwide-encounters` 200; newest file a 6.7 MB CSV under `/sites/default/files/2026-09/` (200); robots.txt 200, disallows `/sites/default/files/assets/documents/` (the FY20-FY23 files and data dictionary, never requested); public domain, cite CBP | :white_check_mark: `intel_us_border_encounters`, monthly from October 2022 |
+| UK Home Office | GOV.UK Content API 200 (keyless, 10 requests/s); time series published only as ODS on `assets.publishing.service.gov.uk` (200, robots.txt 404), read with zipfile + ElementTree, no new dependency; Open Government Licence v3.0 | :white_check_mark: `intel_uk_small_boat_arrivals`, daily from 2018, weekly preventions from May 2024 |
+| Frontex | Migratory map page 200; its only data file is an XLSX under `/assets/`, which robots.txt (200) disallows for every user agent; not requested, no workaround | :red_circle: blocked by robots.txt (and XLSX only) |
+
+Not exposed yet: CBP sector and field-office (area of responsibility) and
+by-state detail, and CBP years before FY2023 (robots-disallowed path).
 
 ---
 
@@ -635,8 +651,8 @@ suite, and a live MCP stdio session.
 
 | Category | Current | Notes |
 |----------|---------|-------|
-| Total MCP tools | 139 | 138 intelligence tools + `intel_status` |
-| Tool parity | 139 / 139 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
+| Total MCP tools | 141 | 140 intelligence tools + `intel_status` |
+| Tool parity | 141 / 141 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
 | Tests in repo | 991 | 973 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 973 passed, 18 deselected); full suite requires `.[dev]` |
