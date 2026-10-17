@@ -40,18 +40,31 @@ responses say so. `limit=0` returns the full history.
 - `intel_fed_liquidity_series`: WALCL, WDTGAL, WTREGEN, RRPONTSYD or M2SL with full
   history; blank source dates (2,833 for RRPONTSYD on 2026-10-17, 2,679 of them
   before 2013-09-23, when daily values begin) are counted, not read as zero.
+  Net liquidity therefore starts at 2003-03-19: of 1,244 WALCL weeks, 705 align
+  and 539 are skipped and counted (first 2002-12-18, last 2018-12-05): 8 before
+  RRPONTSYD begins on 2003-02-07, 530 with a blank Wednesday before 2013-09-23,
+  and 2018-12-05, when RRPONTSYD is blank on both the Tuesday and the Wednesday.
+  10 points use the Tuesday value, all on holiday Wednesdays (measured
+  2026-10-17).
 - `intel_ecb_series`: any ECB BSI or ILM series by SDMX key, with units, scale,
   titles and provisional flags taken from the response. A growth rate's change is
   reported in points, not as a percent of a percent.
-- Stale cache responses carry `served_from_stale_cache` and `cache_age_seconds`,
-  and name the upstream failure in `data_gaps`. Only parsed bodies enter the cache.
-  ECB 404 and empty responses are final no-data answers, without outage retries.
+- Stale cache responses carry `served_from_stale_cache`, `cache_age_seconds` and
+  `fetch_failure`, and name the failure in `data_gaps`: the HTTP status, no
+  response, an open circuit or an unexpected payload. Each stale copy served
+  counts in the circuit breaker's `total_stale_serves` (`intel_status`), and none
+  is re-cached as fresh. Only parsed bodies enter the cache. ECB 404 responses
+  are final no-data answers, without outage retries. An empty ECB response is
+  one only when a start was requested; without one it is an unexpected payload
+  and takes the outage path, as does JSON that is not an object.
   Missing ECB roles and board rows are named; index bases, provisional status
   and percentage-point change units are retained. ECB keys must specify every
   dimension and request at most 50 series combinations.
 - CLI: `intel liquidity`, `intel net-liquidity`, `intel money-supply`,
   `intel fed-liquidity`, `intel ecb-series`. Collector: `liquidity_board` and
-  `net_liquidity` (group `liquidity`).
+  `net_liquidity` (group `liquidity`). `intel liquidity` prints the ranking
+  rule and each row's status; a terminal too narrow for the table gets one
+  entry per indicator instead, so no value, date or unit is cut.
 - Live reading 2026-10-17: net liquidity for Wednesday 2026-10-14 was
   USD 5,869.615 billion (WALCL 6,755,639 million, WDTGAL 885,823 million,
   RRPONTSYD 0.201 billion, all observed 2026-10-14).
