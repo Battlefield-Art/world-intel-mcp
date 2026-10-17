@@ -77,7 +77,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_aoi_escalation",
-        description="Run the hotspot escalation scoring (baseline, military, conflict, social-unrest components; 0-100) on a user-defined AOI instead of only the 22 built-in intel hotspots. News-mention and geo-convergence components are not wired up and report null, same as intel_hotspot_escalation. Required: name (must already be defined via intel_aoi_define).",
+        description="Run the hotspot escalation scoring (baseline, news, military, conflict, social-unrest and convergence components; 0-100) on a user-defined AOI instead of only the 22 built-in intel hotspots. News: the rise in the area's share of GDELT coverage, the last 7 days against the 7 before, for the reverse-geocoded place (news_signal shows the counts). Convergence: multi-domain convergence of the earthquakes, military flights, ACLED events and wildfires inside the AOI's exact shape (circle, polygon or corridor; convergence_signal shows the cells). If the news or convergence inputs fail, that component is null and explained in data_gaps, never a 0; computed_from lists the components the score was computed from, and zero_filled_components any of those that are a 0 only because the military or ACLED fetch failed. Required: name (must already be defined via intel_aoi_define).",
         inputSchema={
             "type": "object",
             "properties": {

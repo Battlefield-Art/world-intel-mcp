@@ -42,6 +42,33 @@ _NEAR_LAT, _NEAR_LON = 40.50, -80.00
 _FAR_LAT, _FAR_LON = 42.33, -83.05
 
 
+async def _unstubbed_domain(*args, **kwargs) -> dict:
+    return {"error": "domain not stubbed by this test"}
+
+
+@pytest.fixture(autouse=True)
+def _no_live_domains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this module reaches a live API: every network-bound
+    source function the AOI tools compose defaults to an outage. A test
+    that wants data for a domain stubs it (``_patch_all_domains`` or its
+    own ``monkeypatch.setattr``), which overrides this default.
+
+    Added with the escalation news and convergence components (Phase 23):
+    ``fetch_aoi_escalation`` now also reverse-geocodes and queries GDELT,
+    USGS and FIRMS, which the escalation tests written before it (they
+    stub only ACLED and military) would otherwise send live."""
+    for module, attr in (
+        (geocode, "fetch_place_context"),
+        (seismology, "fetch_earthquakes"),
+        (military, "fetch_military_flights"),
+        (conflict, "fetch_acled_events"),
+        (wildfire, "fetch_wildfires"),
+        (aviation, "fetch_domestic_flights"),
+        (news, "fetch_gdelt_search"),
+    ):
+        monkeypatch.setattr(module, attr, _unstubbed_domain)
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> AOIStore:
     s = AOIStore(tmp_path / "test_aoi_cache.db")
