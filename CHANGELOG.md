@@ -25,8 +25,8 @@
 
 ### Data honesty: forecast tracks
 - `data_gaps` names every track or cone not delivered, per storm, with a
-  status: `fetch_failed`, `unparsed`, `not_linked`, `not_published` or
-  `not_fetched_cap` (at most 10 storms per call; the rest are named,
+  status: `fetch_failed`, `unparsed`, `refused_link`, `not_linked`,
+  `not_published` or `not_fetched_cap` (at most 10 storms per call; the rest are named,
   never dropped). A failure marks the response `degraded`; a product the
   agency does not link is a gap, not degradation. A quiet basin still
   answers zero storms, not degraded, and makes no product fetches; a feed
@@ -41,7 +41,13 @@
   not trip the warning feeds' breakers.
 - Remote KML is parsed with the standard library: strict UTF-8, any
   DOCTYPE refused, size caps (KMZ 2 MB, KML 8 MB), and a cone with more
-  than one ring refused, never trimmed.
+  than one ring refused, never trimmed. A ring of more than 10,000
+  vertices is refused before simplifying, and simplifying runs off the
+  event loop.
+- Product links come from the agencies' feeds and are fetched only when
+  they are https on the agency's own host (www.nhc.noaa.gov,
+  www.metoc.navy.mil). Any other link is reported as `refused_link` and
+  never requested.
 - Measured 2026-10-17: every product used answered HTTP 200 without a
   key; nhc.noaa.gov robots.txt disallows nothing and the NWS disclaimer
   puts the products in the public domain. The JTWC home page and

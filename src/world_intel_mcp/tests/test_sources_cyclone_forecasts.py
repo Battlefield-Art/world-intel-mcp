@@ -453,6 +453,60 @@ async def test_nhc_storm_without_a_forecast_advisory_link_is_a_gap_not_a_failure
     assert routes["tcm"].called is False
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_product_links_off_the_nhc_host_are_refused_not_fetched(
+    fetcher: Fetcher,
+) -> None:
+    """Product links come from the feed: one that is not https on
+    www.nhc.noaa.gov is never requested. A request would reach respx
+    unmocked and read as fetch_failed, not refused_link."""
+    current = _current_storms()
+    storm = current["activeStorms"][0]
+    storm["forecastAdvisory"]["url"] = "https://127.0.0.1:8080/text/MIATCMEP1.shtml"
+    storm["trackCone"]["kmzFile"] = _CONE_URL.replace("https://", "http://")
+    routes = _mock_nhc(current=current)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "refused_link"
+    assert fc["points"] == []
+    assert fc["cone_status"] == "refused_link"
+    assert fc["cone"] is None
+    assert result["degraded"] is True
+    assert result["data_gaps"] == [
+        "Trudy (ep212026): forecast track refused_link: forecast/advisory link "
+        "'https://127.0.0.1:8080/text/MIATCMEP1.shtml' is not https on "
+        "www.nhc.noaa.gov; not fetched",
+        "Trudy (ep212026): no cone, cone KMZ link "
+        "'http://www.nhc.noaa.gov/storm_graphics/api/EP212026_017adv_CONE.kmz' "
+        "is not https on www.nhc.noaa.gov; not fetched",
+    ]
+    assert routes["tcm"].called is False
+    assert routes["cone"].called is False
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [
+        ("https://www.nhc.noaa.gov/text/MIATCMEP1.shtml", True),
+        ("https://WWW.NHC.NOAA.GOV/text/MIATCMEP1.shtml", True),
+        ("https://www.nhc.noaa.gov:443/text/MIATCMEP1.shtml", True),
+        ("http://www.nhc.noaa.gov/text/MIATCMEP1.shtml", False),
+        ("https://www.nhc.noaa.gov:8443/text/MIATCMEP1.shtml", False),
+        ("https://www.nhc.noaa.gov:99999/text/MIATCMEP1.shtml", False),
+        ("https://www.nhc.noaa.gov@169.254.169.254/latest", False),
+        ("https://www.nhc.noaa.gov.example.net/text/MIATCMEP1.shtml", False),
+        ("https://nhc.noaa.gov/text/MIATCMEP1.shtml", False),
+        ("file:///etc/passwd", False),
+        ("/text/MIATCMEP1.shtml", False),
+    ],
+)
+def test_product_link_allowlist(url: str, allowed: bool) -> None:
+    assert (cf._refused_link(url, cf._NHC_PRODUCT_HOSTS) is None) is allowed
+
+
 # ---------------------------------------------------------------------------
 # NHC parsers: direct
 # ---------------------------------------------------------------------------
@@ -485,6 +539,27 @@ def test_cone_kml_with_doctype_is_refused() -> None:
     kml = '<?xml version="1.0"?><!DOCTYPE kml [<!ENTITY x "y">]><kml/>'
     with pytest.raises(ValueError, match="DOCTYPE"):
         cf.parse_nhc_cone_kmz(_kmz(kml))
+
+
+def _ring_kml(vertices: int) -> str:
+    """A closed ring of ``vertices`` distinct points in a minimal cone KML."""
+    points = [f"{-100 + i * 1e-4:.4f},{15 + (i % 2) * 1e-4:.4f},0" for i in range(vertices)]
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Polygon>'
+        "<outerBoundaryIs><LinearRing><coordinates>"
+        + " ".join(points + points[:1])
+        + "</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></kml>"
+    )
+
+
+def test_cone_ring_over_the_vertex_cap_is_refused_before_simplifying() -> None:
+    """Douglas-Peucker is quadratic in the worst case; a ring past the cap
+    is refused, one at the cap is simplified."""
+    at_cap = cf.parse_nhc_cone_kmz(_kmz(_ring_kml(cf._CONE_MAX_VERTICES)))
+    assert at_cap["source_vertex_count"] == cf._CONE_MAX_VERTICES
+    with pytest.raises(ValueError, match="over the cap"):
+        cf.parse_nhc_cone_kmz(_kmz(_ring_kml(cf._CONE_MAX_VERTICES + 1)))
 
 
 def test_forecast_advisory_without_synoptic_line_keeps_times_drops_tau() -> None:
@@ -728,6 +803,24 @@ async def test_jtwc_unlinked_text_is_a_gap_and_the_fan_out_cap_a_failure(
     assert many[-1]["forecast"]["cone_status"] == "not_published"
     assert degraded is True
     assert sum("per-call cap" in g for g in gaps) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_warning_link_off_the_jtwc_host_is_refused_not_fetched(
+    fetcher: Fetcher,
+) -> None:
+    storm = _unlinked_jtwc_storm(0)
+    storm["warning_text_url"] = "https://www.metoc.navy.mil.example.net/jtwc/products/wp0026web.txt"
+    gaps, degraded = await cf.attach_jtwc_forecasts(fetcher, [storm])
+    assert storm["forecast"]["track_status"] == "refused_link"
+    assert storm["forecast"]["points"] == []
+    assert degraded is True
+    assert gaps[0] == (
+        "Storm0 (00W): forecast track refused_link: warning text link "
+        "'https://www.metoc.navy.mil.example.net/jtwc/products/wp0026web.txt' "
+        "is not https on www.metoc.navy.mil; not fetched"
+    )
 
 
 @respx.mock

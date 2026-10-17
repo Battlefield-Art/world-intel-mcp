@@ -66,6 +66,7 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..fetcher import Fetcher
 
@@ -85,6 +86,15 @@ CONE_SIMPLIFY_TOLERANCE_DEG = 0.01
 _FORECAST_CACHE_TTL = 3600
 _CONE_MAX_BYTES = 2 * 1024 * 1024
 _KML_MAX_BYTES = 8 * 1024 * 1024
+# Douglas-Peucker is quadratic in the worst case, so a ring past this is
+# refused before simplifying (Trudy #17's ring has 1,167 vertices).
+_CONE_MAX_VERTICES = 10_000
+
+# Product links come from the agencies' feeds; one is fetched only when
+# it is https on the agency's own host, so a malformed or tampered feed
+# cannot point the server at another host.
+_NHC_PRODUCT_HOSTS = frozenset({"www.nhc.noaa.gov"})
+_JTWC_PRODUCT_HOSTS = frozenset({"www.metoc.navy.mil"})
 
 _MONTHS = {
     name: number
@@ -99,7 +109,14 @@ _MONTHS = {
 # (or got an older issuance). not_linked / not_published are upstream
 # coverage facts: named in data_gaps, not degradation.
 _FAILED_STATUSES = frozenset(
-    {"fetch_failed", "unparsed", "not_fetched_cap", "stale_advisory", "stale_warning"}
+    {
+        "fetch_failed",
+        "unparsed",
+        "not_fetched_cap",
+        "stale_advisory",
+        "stale_warning",
+        "refused_link",
+    }
 )
 
 _CONE_NOTE = (
@@ -196,6 +213,18 @@ def _same_number(found: Any, expected: Any) -> bool:
         return int(found) == int(expected)
     except (TypeError, ValueError):
         return str(found).lstrip("0").upper() == str(expected).lstrip("0").upper()
+
+
+def _refused_link(url: str, hosts: frozenset[str]) -> str | None:
+    """Why a feed-supplied product link is not fetched, or None if it may be."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return f"link {url!r} is not a valid URL; not fetched"
+    if parts.scheme != "https" or (parts.hostname or "").lower() not in hosts or port not in (None, 443):
+        return f"link {url!r} is not https on {', '.join(sorted(hosts))}; not fetched"
+    return None
 
 
 def resolve_day_time(
@@ -336,8 +365,13 @@ def _ring_from_root(root: ET.Element) -> list[tuple[float, float]]:
     coords = next((el for el in rings[0].iter() if _local(el.tag) == "coordinates"), None)
     if coords is None or not (coords.text or "").strip():
         raise ValueError("cone ring has no coordinates")
+    tokens = coords.text.split()
+    if len(tokens) > _CONE_MAX_VERTICES + 1:  # + 1: the ring repeats its first vertex
+        raise ValueError(
+            f"cone ring has {len(tokens)} vertices, over the cap of {_CONE_MAX_VERTICES}"
+        )
     ring: list[tuple[float, float]] = []
-    for token in coords.text.split():
+    for token in tokens:
         parts = token.split(",")
         if len(parts) < 2:
             raise ValueError(f"malformed KML coordinate {token!r}")
@@ -549,6 +583,11 @@ async def _nhc_track(fetcher: Fetcher, storm_id: str, advisory: dict, now: datet
         out["track_status"] = "not_linked"
         out["track_error"] = "CurrentStorms.json links no forecast/advisory for this storm"
         return out
+    refused = _refused_link(url, _NHC_PRODUCT_HOSTS)
+    if refused:
+        out["track_status"] = "refused_link"
+        out["track_error"] = "forecast/advisory " + refused
+        return out
 
     expected = advisory.get("advNum")
     key = f"cyclones:nhc:tcm:{storm_id}:{expected}:{advisory.get('fileUpdateTime')}"
@@ -583,6 +622,11 @@ async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: dict) -> dict:
     if not url:
         out["cone_status"] = "not_linked"
         return out
+    refused = _refused_link(url, _NHC_PRODUCT_HOSTS)
+    if refused:
+        out["cone_status"] = "refused_link"
+        out["cone_error"] = "cone KMZ " + refused
+        return out
 
     key = f"cyclones:nhc:cone:{storm_id}:{cone_meta.get('advNum')}:{cone_meta.get('fileUpdateTime')}"
     cached = fetcher.cache.get(key)
@@ -598,7 +642,8 @@ async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: dict) -> dict:
         )
         return out
     try:
-        cone = parse_nhc_cone_kmz(result.content)
+        # In a worker thread: simplifying is CPU work and must not stall the event loop.
+        cone = await asyncio.to_thread(parse_nhc_cone_kmz, result.content)
     except (zipfile.BadZipFile, zlib.error, ET.ParseError, ValueError, RuntimeError, EOFError) as exc:
         out["cone_status"] = "unparsed"
         out["cone_error"] = f"NHC cone KMZ unreadable: {type(exc).__name__}: {exc}"
@@ -634,6 +679,11 @@ async def _jtwc_storm_forecast(fetcher: Fetcher, storm: dict, now: datetime) -> 
     if not url:
         out["track_status"] = "not_linked"
         out["track_error"] = "the JTWC RSS item links no warning text for this storm"
+        return out
+    refused = _refused_link(url, _JTWC_PRODUCT_HOSTS)
+    if refused:
+        out["track_status"] = "refused_link"
+        out["track_error"] = "warning text " + refused
         return out
 
     expected = storm.get("warning_number")
@@ -698,7 +748,7 @@ def _summarize(storms: list[dict]) -> tuple[list[str], bool]:
             gaps.append(f"{label}: forecast track {status}: {forecast.get('track_error')}")
             degraded = degraded or status in _FAILED_STATUSES
         cone_status = forecast.get("cone_status")
-        if cone_status in ("fetch_failed", "unparsed"):
+        if cone_status in ("fetch_failed", "unparsed", "refused_link"):
             gaps.append(f"{label}: no cone, {forecast.get('cone_error')}")
             degraded = True
         elif cone_status == "not_linked":
