@@ -837,6 +837,7 @@ function fmtNum(n, d) { d = d != null ? d : 2; return n == null ? '\u2014' : Num
 function fmtPct(n) { return n == null ? '\u2014' : (n >= 0 ? '+' : '') + fmtNum(n); }
 function fmtBig(n) { if (n == null) return '\u2014'; var a = Math.abs(n); if (a >= 1e12) return '$'+(n/1e12).toFixed(1)+'T'; if (a >= 1e9) return '$'+(n/1e9).toFixed(1)+'B'; if (a >= 1e6) return '$'+(n/1e6).toFixed(1)+'M'; return '$'+fmtNum(n,0); }
 function fmtBigPlain(n) { if (n == null) return '\u2014'; var a = Math.abs(n); if (a >= 1e9) return (n/1e9).toFixed(1)+'B'; if (a >= 1e6) return (n/1e6).toFixed(1)+'M'; if (a >= 1e3) return (n/1e3).toFixed(1)+'K'; return String(n); }
+function countOrUnknown(n) { return typeof n === 'number' ? String(n) : '?'; }
 function cls(n) { return n == null ? '' : n >= 0 ? 'up' : 'down'; }
 function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 function trunc(s, n) { n = n || 50; s = s || ''; return s.length > n ? s.slice(0, n) + '\u2026' : s; }
@@ -2841,13 +2842,24 @@ function updateDrawer(data) {
     }
 
     // ── TRENDS ──
-    if (data.weekly_trends && !data.weekly_trends.error) {
+    // A count the analysis could not compute arrives as null, and a failed
+    // fetch carries none: show those as unknown, never as 0, and list what
+    // failed (the data gaps, or the fetch error when there are none).
+    if (data.weekly_trends) {
         var wt = data.weekly_trends;
         h += '<div class="sh">TRENDS</div>';
         h += '<div class="mini-row">';
-        h += '<div class="mini-box"><div class="v">' + (wt.trend_count || 0) + '</div><div class="l">Metrics</div></div>';
-        h += '<div class="mini-box"><div class="v' + ((wt.current_anomaly_count || 0) > 0 ? ' warn' : '') + '">' + (wt.current_anomaly_count || 0) + '</div><div class="l">Anomalies</div></div>';
+        h += '<div class="mini-box"><div class="v">' + countOrUnknown(wt.trend_count) + '</div><div class="l">Metrics</div></div>';
+        h += '<div class="mini-box"><div class="v' + (wt.current_anomaly_count > 0 ? ' warn' : '') + '">' + countOrUnknown(wt.current_anomaly_count) + '</div><div class="l">Anomalies</div></div>';
         h += '</div>';
+        var wtGaps = (Array.isArray(wt.data_gaps) && wt.data_gaps.length) ? wt.data_gaps : (wt.error ? [wt.error] : []);
+        if (wtGaps.length) {
+            h += '<div class="sub">Data Gaps</div><table class="dtable"><tbody>';
+            wtGaps.forEach(function(g) {
+                h += '<tr><td class="warn">' + esc(String(g)) + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
         var anomalies = wt.current_anomalies || [];
         if (anomalies.length) {
             h += '<div class="sub">Active Anomalies</div><table class="dtable"><thead><tr><th>Metric</th><th>Region</th><th>Dev</th></tr></thead><tbody>';

@@ -37,14 +37,16 @@
   anomaly detection's own gaps, and flags a baseline created by the same
   call or with no metric at the 5 observations volatility needs. Reading
   the baselines no longer creates an empty database file.
+- The dashboard's Trends panel shows a count that could not be computed as
+  `?` instead of 0, stays visible when weekly trends report an error or
+  time out, and lists the data gaps, or the error when there are none.
 - Apply per-source request spacing to every HTTP retry, including JSON,
   text, XML and binary fetches.
 - Known open: each retry now waits out its source's spacing and the
   breaker is still checked only before the first attempt, so a full outage
   of a rate-limited source takes longer than before to fall back to its
-  stale copy. The dashboard's Trends panel shows a `null` anomaly count as
-  0 (it hides the panel only on `error`). The registry tests' temp-cache
-  premise still depends on test order.
+  stale copy. The registry tests' temp-cache premise still depends on test
+  order.
 
 ## 0.11.0 - 2026-10-12
 
