@@ -571,7 +571,17 @@ instead of silently omitting it.
 `intel_aoi_escalation` runs the same baseline/military/conflict/social-
 unrest scoring engine that powers `intel_hotspot_escalation` for the 22
 built-in hotspots, but scoped to your AOI's own radius instead of a fixed
-2-degree window.
+2-degree window. It also scores the two components the built-ins leave
+null. News is the rise in the area's share of all GDELT coverage over the
+last 7 days against the 7 before, for the reverse-geocoded place (the
+same query the brief uses), so a swing or outage in what GDELT ingests is
+not read as a news surge. Convergence runs the multi-domain convergence
+grid over the earthquakes, military flights, ACLED events and wildfires
+inside the AOI's exact shape. If either one's inputs fail, it comes back
+null with the reason in `data_gaps`, never as a 0, and `computed_from`
+names the components the score was computed from
+(`zero_filled_components` flags any that are a 0 only because the
+military or ACLED fetch failed).
 
 AOIs persist in a dedicated table inside the same SQLite cache database
 the server already uses (`~/.cache/world-intel-mcp/cache.db` by default,

@@ -37,10 +37,11 @@ import math
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .convergence import detect_convergence
 from .escalation import score_hotspot
 from .situation import _add_source, _cite, _has_valid_citation
 
@@ -1252,6 +1253,24 @@ async def _aoi_news_query(fetcher, aoi_row: dict) -> tuple[str, dict]:
     }
 
 
+def _scope_to_aoi(
+    result: Any, list_key: str, aoi_row: dict, lat_key: str, lon_key: str
+) -> dict:
+    """One domain's fetch result scoped to the AOI: ``{"error": msg}``,
+    or ``{"items": [...]}`` filtered to the exact shape by
+    ``filter_by_aoi`` (plus ``partial_errors`` when the fetch reported
+    partial coverage). Shared by the brief/changes gather and the
+    escalation score, so every AOI tool agrees on what is inside the
+    fence."""
+    if isinstance(result, dict) and result.get("error"):
+        return {"error": str(result["error"])}
+    items = result.get(list_key, []) if isinstance(result, dict) else []
+    entry: dict[str, Any] = {"items": filter_by_aoi(items, aoi_row, lat_key, lon_key)}
+    if isinstance(result, dict) and result.get("partial_errors"):
+        entry["partial_errors"] = result["partial_errors"]
+    return entry
+
+
 async def _gather_scoped_domains(fetcher, aoi_row: dict) -> dict[str, dict]:
     """Fetch all six dynamic domains in parallel and scope each to the
     AOI. The single shared scoping path for ``fetch_aoi_brief`` and
@@ -1295,27 +1314,19 @@ async def _gather_scoped_domains(fetcher, aoi_row: dict) -> dict[str, dict]:
         ),
     )
 
-    scoped: dict[str, dict] = {}
-
-    def _scope(
-        result: Any, list_key: str, domain: str, lat_key: str, lon_key: str
-    ) -> None:
-        if isinstance(result, dict) and result.get("error"):
-            scoped[domain] = {"error": str(result["error"])}
-            return
-        items = result.get(list_key, []) if isinstance(result, dict) else []
-        entry: dict[str, Any] = {
-            "items": filter_by_aoi(items, aoi_row, lat_key, lon_key)
-        }
-        if isinstance(result, dict) and result.get("partial_errors"):
-            entry["partial_errors"] = result["partial_errors"]
-        scoped[domain] = entry
-
-    _scope(eq_result, "earthquakes", "earthquakes", "latitude", "longitude")
-    _scope(mil_result, "aircraft", "military_flights", "latitude", "longitude")
-    _scope(conflict_result, "events", "conflict_events", "latitude", "longitude")
-    _scope(wildfire_result, "clusters", "wildfires", "lat", "lon")
-    _scope(aviation_result, "sampled", "aviation", "lat", "lon")
+    scoped: dict[str, dict] = {
+        "earthquakes": _scope_to_aoi(
+            eq_result, "earthquakes", aoi_row, "latitude", "longitude"
+        ),
+        "military_flights": _scope_to_aoi(
+            mil_result, "aircraft", aoi_row, "latitude", "longitude"
+        ),
+        "conflict_events": _scope_to_aoi(
+            conflict_result, "events", aoi_row, "latitude", "longitude"
+        ),
+        "wildfires": _scope_to_aoi(wildfire_result, "clusters", aoi_row, "lat", "lon"),
+        "aviation": _scope_to_aoi(aviation_result, "sampled", aoi_row, "lat", "lon"),
+    }
 
     if isinstance(news_result, dict) and news_result.get("error"):
         scoped["news"] = {"error": str(news_result["error"]), "scoping": news_scoping}
@@ -1598,17 +1609,345 @@ async def fetch_aoi_brief(fetcher, store: AOIStore, name: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# intel_aoi_escalation (optional, reuses analysis/escalation.py unmodified)
+# intel_aoi_escalation (reuses analysis/escalation.py and
+# analysis/convergence.py unmodified)
 # ---------------------------------------------------------------------------
+
+# News component: how the area's share of world coverage moved, the
+# latest week against the week before. Seven days matches the ACLED
+# window this score already uses and puts every weekday in each window.
+NEWS_WINDOW_DAYS = 7
+
+# Floor on the expected article count in the percent change, so a
+# handful of stories about a quiet place cannot read as a surge (one
+# extra article against an expected 0.5 would otherwise be +200%).
+_NEWS_EXPECTED_FLOOR = 20.0
+
+# Each window must have monitored at least this fraction of the other
+# window's GDELT volume. GDELT's index has multi-day ingestion outages:
+# measured 2026-10-17 for ("Pittsburgh" OR "Allegheny County"), its
+# default daily timeline had no data at all for 16 of 85 days, and
+# Oct 6, 8 and 10 held 3.3%, 0.6% and 1.5% of a normal day's volume.
+# Raw counts across such a gap read the recovery as a news surge; even
+# shares get noisy when one window rests on a sliver of intake.
+_NEWS_MIN_INTAKE_RATIO = 0.5
+
+NEWS_METHOD = (
+    "GDELT DOC timelinevolraw for the geocoded place query (see "
+    "news_scoping). Current window: the 7 days ending with GDELT's current "
+    "time step, which may be partly filled; prior window: the 7 days before "
+    "it. Share = matching articles / all articles GDELT monitored in the "
+    "window. expected_articles = prior share x current monitored volume; "
+    "change_pct = 100 x (current articles - expected) / max(expected, 20); "
+    "news component = min(20, 0.2 x max(0, change_pct)), so a doubled share "
+    "scores the full 20 (once 20 or more articles were expected) and a flat "
+    "or falling one scores 0. Not scored when "
+    "either window monitored under half the other's volume (GDELT ingestion "
+    "gaps)."
+)
+
+# Convergence component: the geolocated domains whose in-fence events
+# feed analysis/convergence.py, with their coordinate keys. Aviation is
+# left out (a 1-in-10 sample of ordinary civil traffic is not a risk
+# signal) and news has no per-article coordinates.
+_CONVERGENCE_DOMAINS: dict[str, tuple[str, str]] = {
+    "earthquakes": ("latitude", "longitude"),
+    "military_flights": ("latitude", "longitude"),
+    "conflict_events": ("latitude", "longitude"),
+    "wildfires": ("lat", "lon"),
+}
+_CONVERGENCE_GRID_DEGREES = 1.0
+_CONVERGENCE_MIN_DOMAINS = 2
+_CONVERGENCE_MIN_EVENTS = 3
+
+CONVERGENCE_METHOD = (
+    "analysis/convergence.py detect_convergence over the events inside the "
+    "AOI's exact shape (filter_by_aoi) from earthquakes, military flights, "
+    "ACLED conflict events and wildfires: 1-degree grid, a cell converges "
+    "with events from at least 2 of those domains and at least 3 events, "
+    "cell score = domains x (1 + sqrt(events)). Input = the strongest cell; "
+    "convergence component = min(8, 2 x score), so any convergent cell "
+    "(smallest possible score 5.46) earns the full 8. A cell's lat/lon is "
+    "its grid-cell centre, which can lie outside a small AOI."
+)
+
+
+def _parse_gdelt_step(raw: Any) -> datetime | None:
+    try:
+        return datetime.strptime(str(raw), "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _is_count(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+    )
+
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def news_coverage_trend(timeline: Any, now: datetime | None = None) -> dict:
+    """Escalation signal from a GDELT ``timelinevolraw`` timeline: the
+    area's share of all GDELT-monitored coverage in the latest
+    ``NEWS_WINDOW_DAYS`` days against the same span just before (the
+    formula is ``NEWS_METHOD``).
+
+    Shares, not raw counts, because GDELT's intake swings by weekday and
+    has whole-day outages; a share is unaffected by how much GDELT
+    happened to ingest, and a partly filled latest step simply weighs
+    less. Steps GDELT has no data for count in neither window, and the
+    comparison is refused when the two windows' intake is too uneven
+    (``_NEWS_MIN_INTAKE_RATIO``).
+
+    Returns the comparison (window bounds, articles, monitored volume,
+    shares, ``expected_articles``, ``change_pct`` and ``score_input``,
+    the non-negative value the escalation score takes) or a dict with
+    ``error`` naming why the timeline cannot support one. Pure: no I/O;
+    ``now`` is injectable.
+    """
+    now = now or datetime.now(timezone.utc)
+    data = None
+    if isinstance(timeline, list):
+        for series in timeline:
+            if isinstance(series, dict) and isinstance(series.get("data"), list):
+                if series["data"]:
+                    data = series["data"]
+                    break
+    if not data:
+        return {
+            "error": (
+                "GDELT returned no coverage timeline for the query (nothing "
+                "matched in its search window, or an empty upstream answer; "
+                "the two cannot be told apart)"
+            )
+        }
+
+    steps: dict[datetime, tuple[float, float]] = {}
+    for point in data:
+        when = _parse_gdelt_step(point.get("date")) if isinstance(point, dict) else None
+        value = point.get("value") if isinstance(point, dict) else None
+        norm = point.get("norm") if isinstance(point, dict) else None
+        if when is None or not _is_count(value) or not _is_count(norm):
+            return {"error": f"GDELT timeline point is malformed: {point!r}"[:240]}
+        steps[when] = (float(value), float(norm))
+
+    times = sorted(steps)
+    if len(times) < 2:
+        return {
+            "error": (
+                "GDELT timeline holds a single time step; comparing two "
+                "windows needs the step size"
+            )
+        }
+    step = min(b - a for a, b in zip(times, times[1:]))
+    step_s = step.total_seconds()
+    if step_s > 86400 or 86400 % step_s:
+        return {
+            "error": (
+                f"GDELT timeline step of {step_s:.0f} s does not divide a day; "
+                "day windows cannot be formed"
+            )
+        }
+
+    # Anchor both windows to the step containing `now` on the series' own
+    # grid, so a feed that stopped updating leaves its silent days inside
+    # the current window instead of sliding the comparison into the past
+    # (and steps after `now`, when replaying history, fall outside both).
+    last = times[-1]
+    current_step = last + step * math.floor((now - last) / step)
+    window = timedelta(days=NEWS_WINDOW_DAYS)
+    end = current_step + step
+    cur_start = end - window
+    pri_start = cur_start - window
+    per_window = int(window / step)
+
+    def _window(start: datetime, stop: datetime) -> dict:
+        present = [steps[t] for t in times if start <= t < stop]
+        return {
+            "start": _iso(start),
+            "end": _iso(stop),
+            "articles": int(sum(v for v, _ in present)),
+            "monitored_articles": int(sum(n for _, n in present)),
+            "steps_with_data": len(present),
+            "steps": per_window,
+        }
+
+    cur = _window(cur_start, end)
+    pri = _window(pri_start, cur_start)
+    out: dict[str, Any] = {
+        "window_days": NEWS_WINDOW_DAYS,
+        "step_seconds": int(step_s),
+        "latest_step": _iso(last),
+        "current_window": cur,
+        "prior_window": pri,
+        "method": NEWS_METHOD,
+    }
+
+    cur_norm, pri_norm = cur["monitored_articles"], pri["monitored_articles"]
+    low, high = min(cur_norm, pri_norm), max(cur_norm, pri_norm)
+    if low <= 0 or low < _NEWS_MIN_INTAKE_RATIO * high:
+        out["error"] = (
+            f"GDELT intake too uneven to compare: it monitored {pri_norm:,} "
+            f"articles in the prior {NEWS_WINDOW_DAYS} days ({pri['steps_with_data']} "
+            f"of {per_window} steps with data) and {cur_norm:,} in the latest "
+            f"{NEWS_WINDOW_DAYS} ({cur['steps_with_data']} of {per_window}), so a "
+            "comparison would measure GDELT's ingestion gaps, not the news"
+        )
+        return out
+
+    prior_share = pri["articles"] / pri_norm
+    expected = prior_share * cur_norm
+    change_pct = (
+        100.0 * (cur["articles"] - expected) / max(expected, _NEWS_EXPECTED_FLOOR)
+    )
+    pri["share_per_10k"] = round(prior_share * 1e4, 2)
+    cur["share_per_10k"] = round(cur["articles"] / cur_norm * 1e4, 2)
+    out["expected_articles"] = round(expected, 1)
+    out["change_pct"] = round(change_pct, 1)
+    out["score_input"] = round(max(0.0, change_pct), 1)
+
+    missing = 2 * per_window - cur["steps_with_data"] - pri["steps_with_data"]
+    if missing > 0:
+        out["note"] = (
+            f"GDELT has no data for {missing} of the {2 * per_window} time steps "
+            "compared; each window's share covers the steps it has."
+        )
+    return out
+
+
+def aoi_convergence(scoped: dict[str, dict]) -> dict:
+    """Multi-domain convergence inside an AOI: ``detect_convergence``
+    (``analysis/convergence.py``, unmodified) over the in-fence events of
+    the four geolocated domains in ``_CONVERGENCE_DOMAINS``. ``scoped``
+    maps each domain to its ``_scope_to_aoi`` result, so the events are
+    already filtered to the AOI's exact shape (circle, polygon or
+    corridor).
+
+    ``score`` is the strongest convergent cell's score, the escalation
+    input. It is a measured 0.0 only when every input domain answered in
+    full. With a domain failed or partial, a positive score is reported
+    with ``lower_bound`` true (with uniform weights a cell scores
+    domains x (1 + sqrt(events)), so the missing events could only raise
+    it), and no convergent cell yields ``score`` None plus ``error``,
+    because quiet cannot be told from missing.
+    """
+    events: list[dict] = []
+    events_by_domain: dict[str, int] = {}
+    used: list[str] = []
+    failed: list[str] = []
+    partial: list[str] = []
+    for domain, (lat_key, lon_key) in _CONVERGENCE_DOMAINS.items():
+        result = scoped.get(domain) or {}
+        if result.get("error") or "items" not in result:
+            failed.append(domain)
+            continue
+        used.append(domain)
+        if result.get("partial_errors"):
+            partial.append(domain)
+        events_by_domain[domain] = len(result["items"])
+        events.extend(
+            {"lat": item.get(lat_key), "lon": item.get(lon_key), "type": domain}
+            for item in result["items"]
+        )
+
+    cells = detect_convergence(
+        events,
+        resolution=_CONVERGENCE_GRID_DEGREES,
+        min_types=_CONVERGENCE_MIN_DOMAINS,
+        min_total=_CONVERGENCE_MIN_EVENTS,
+    )
+    incomplete = failed + partial
+    out: dict[str, Any] = {
+        "score": None,
+        "lower_bound": False,
+        "convergent_cells": len(cells),
+        "cells": cells[:5],
+        "events_by_domain": events_by_domain,
+        "inputs_used": used,
+        "inputs_failed": failed,
+        "inputs_partial": partial,
+        "method": CONVERGENCE_METHOD,
+    }
+    if not used:
+        out["error"] = "no convergence input domain answered"
+    elif incomplete and not cells:
+        out["error"] = (
+            f"no convergent cell among {', '.join(used)}, but "
+            f"{', '.join(incomplete)} answered only partly or not at all, so "
+            "quiet cannot be told from missing"
+        )
+    else:
+        out["score"] = cells[0]["convergence_score"] if cells else 0.0
+        out["lower_bound"] = bool(incomplete)
+    return out
+
+
+async def _aoi_news_timeline(fetcher, aoi_row: dict) -> tuple[dict, dict]:
+    """The escalation's news input: GDELT's per-step article counts
+    (``timelinevolraw``) for the place the AOI sits in, searched with the
+    same geocoded query the brief uses (``_aoi_news_query``). Returns
+    ``(result, scoping)``; ``scoping["query"]`` is the query actually
+    sent, or None when none was.
+
+    When the area cannot be placed, the only query left is the AOI's own
+    name (the brief's fallback), which counts mentions of a label rather
+    than coverage of the area; it is not sent, ``scoping["basis"]`` is
+    ``"unavailable"`` and ``result`` is an error instead."""
+    from ..sources import news
+
+    try:
+        query, scoping = await _aoi_news_query(fetcher, aoi_row)
+    except Exception as exc:
+        logger.warning("AOI escalation: news query failed: %s", exc)
+        return {"error": f"the news query could not be built: {exc}"}, {
+            "basis": "unavailable",
+            "query": None,
+            "reason": str(exc),
+        }
+    if scoping.get("basis") != "geocoded":
+        reason = scoping.get("reason") or "no named place"
+        return {
+            "error": (
+                f"not scored: the area could not be placed ({reason}), and "
+                "counting mentions of the AOI's own name would not measure "
+                "coverage of the area"
+            )
+        }, {"basis": "unavailable", "query": None, "reason": reason}
+    result = await _safe_fetch(
+        news.fetch_gdelt_search(fetcher, query=query, mode="timelinevolraw"),
+        "news_timeline",
+    )
+    return result, scoping
 
 
 async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     """Run the existing hotspot escalation scoring (``score_hotspot`` in
     ``analysis/escalation.py``, unmodified) on a user-defined AOI instead
-    of only the 22 built-in intel hotspots. Gathers military and conflict
-    signals scoped to the AOI's own radius (via haversine), rather than
-    the fixed 2-degree window ``fetch_hotspot_escalation`` uses for the
-    built-ins."""
+    of only the 22 built-in intel hotspots.
+
+    Military and conflict signals are scoped to the AOI's exact shape,
+    rather than the fixed 2-degree window ``fetch_hotspot_escalation``
+    uses for the built-ins. The news component is the rise in the
+    area's share of GDELT coverage, this week against last, for the
+    geocoded place (``news_coverage_trend``). The convergence component
+    is ``analysis/convergence.py`` run over the in-fence earthquakes,
+    military flights, conflict events and wildfires (``aoi_convergence``).
+
+    When the news or convergence inputs fail, that component is
+    ``None`` in ``components``, listed in ``unavailable_components`` and
+    explained in ``data_gaps``, never a 0; ``computed_from`` names the
+    components the score was renormalized over. A military or ACLED
+    failure is named in ``data_gaps`` but still enters the score as 0,
+    because ``score_hotspot`` takes no null for those components;
+    ``zero_filled_components`` lists which of ``computed_from`` that
+    happened to, so a reader can tell those zeros from measured quiet.
+    ``news_signal`` and ``convergence_signal`` carry the working for
+    both new components."""
     if not isinstance(name, str) or not name.strip():
         return {"error": "name must be a non-empty string."}
 
@@ -1619,28 +1958,45 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
         }
 
     from ..sources import conflict as conflict_mod
+    from ..sources import seismology
 
     lat, lon, radius_km = aoi["lat"], aoi["lon"], aoi["radius_km"]
     aoi_name = aoi["name"]
     bboxes = bboxes_from_radius_km(lat, lon, radius_km)
+    wildfire_regions = _overlapping_wildfire_regions(lat, lon, radius_km)
 
-    acled_result, mil_result = await asyncio.gather(
+    (
+        acled_result,
+        mil_result,
+        eq_result,
+        wildfire_result,
+        (news_result, news_scoping),
+    ) = await asyncio.gather(
         _safe_fetch(conflict_mod.fetch_acled_events(fetcher, days=7), "acled_events"),
         _fetch_military_merged(fetcher, bboxes),
+        _safe_fetch(seismology.fetch_earthquakes(fetcher, hours=72), "earthquakes"),
+        _safe_fetch(_fetch_wildfires_for_aoi(fetcher, wildfire_regions), "wildfires"),
+        _aoi_news_timeline(fetcher, aoi),
     )
+    scoped = {
+        "earthquakes": _scope_to_aoi(
+            eq_result, "earthquakes", aoi, "latitude", "longitude"
+        ),
+        "military_flights": _scope_to_aoi(
+            mil_result, "aircraft", aoi, "latitude", "longitude"
+        ),
+        "conflict_events": _scope_to_aoi(
+            acled_result, "events", aoi, "latitude", "longitude"
+        ),
+        "wildfires": _scope_to_aoi(wildfire_result, "clusters", aoi, "lat", "lon"),
+    }
 
     data_gaps: list[str] = []
     conflict_count = fatalities = protests = 0
-    if isinstance(acled_result, dict) and acled_result.get("error"):
-        data_gaps.append(f"Conflict events: {acled_result['error']}")
+    if scoped["conflict_events"].get("error"):
+        data_gaps.append(f"Conflict events: {scoped['conflict_events']['error']}")
     else:
-        events = filter_by_aoi(
-            acled_result.get("events", []) if isinstance(acled_result, dict) else [],
-            aoi,
-            "latitude",
-            "longitude",
-        )
-        for ev in events:
+        for ev in scoped["conflict_events"]["items"]:
             if "protest" in (ev.get("event_type") or "").lower():
                 protests += 1
             else:
@@ -1648,20 +2004,41 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
             fatalities += ev.get("fatalities") or 0
 
     military_count = 0
-    if isinstance(mil_result, dict) and mil_result.get("error"):
-        data_gaps.append(f"Military flights: {mil_result['error']}")
+    if scoped["military_flights"].get("error"):
+        data_gaps.append(f"Military flights: {scoped['military_flights']['error']}")
     else:
-        for partial in (
-            mil_result.get("partial_errors", []) if isinstance(mil_result, dict) else []
-        ):
+        for partial in scoped["military_flights"].get("partial_errors", []):
             data_gaps.append(f"Military flights: partial coverage: {partial}")
-        aircraft = filter_by_aoi(
-            mil_result.get("aircraft", []) if isinstance(mil_result, dict) else [],
-            aoi,
-            "latitude",
-            "longitude",
+        military_count = len(scoped["military_flights"]["items"])
+
+    for domain, label in (("earthquakes", "Earthquakes"), ("wildfires", "Wildfires")):
+        if scoped[domain].get("error"):
+            data_gaps.append(f"{label}: {scoped[domain]['error']}")
+
+    convergence = aoi_convergence(scoped)
+    if convergence.get("error"):
+        data_gaps.append(f"Convergence: not scored; {convergence['error']}.")
+    elif convergence["lower_bound"]:
+        incomplete = convergence["inputs_failed"] + convergence["inputs_partial"]
+        data_gaps.append(
+            f"Convergence: computed without full {', '.join(incomplete)} data; "
+            f"{convergence['score']} is a lower bound (the missing events could "
+            "only raise it)."
         )
-        military_count = len(aircraft)
+
+    if news_result.get("error"):
+        trend: dict[str, Any] = {"error": str(news_result["error"])}
+    else:
+        trend = news_coverage_trend(news_result.get("timeline"))
+    news_signal = {
+        "query": news_scoping.get("query"),
+        "basis": news_scoping.get("basis"),
+        **trend,
+    }
+    if news_signal.get("error"):
+        data_gaps.append(f"News: {news_signal['error']}.")
+    elif news_signal.get("note"):
+        data_gaps.append(f"News: {news_signal['note']}")
 
     hotspot_config = {
         "lat": lat,
@@ -1671,10 +2048,10 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     }
     scored = score_hotspot(
         hotspot_config,
-        news_mentions=None,
+        news_mentions=None if news_signal.get("error") else news_signal["score_input"],
         military_count=military_count,
         conflict_events=conflict_count,
-        convergence_score=None,
+        convergence_score=convergence["score"],
         fatalities=fatalities,
         protests=protests,
     )
@@ -1687,11 +2064,25 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
             "radius_km": radius_km,
             "kind": aoi.get("kind", "circle"),
         },
-        "unavailable_components": ["news", "convergence"],
+        "unavailable_components": scored["unavailable_components"],
         "data_gaps": data_gaps,
         "source": "aoi-escalation",
         "timestamp": _utc_now_iso(),
         **scored,
+        "computed_from": [
+            comp for comp, points in scored["components"].items() if points is not None
+        ],
+        "zero_filled_components": (
+            (["military"] if scoped["military_flights"].get("error") else [])
+            + (
+                ["conflict", "social_unrest"]
+                if scoped["conflict_events"].get("error")
+                else []
+            )
+        ),
+        "news_scoping": news_scoping,
+        "news_signal": news_signal,
+        "convergence_signal": convergence,
     }
 
 

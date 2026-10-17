@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Added: AOI escalation news and convergence components
+- `intel_aoi_escalation` now scores the news and convergence components it
+  used to report as null (ROADMAP Phase 23).
+- News: the rise in the area's share of all GDELT coverage over the last 7
+  days against the 7 days before, for the reverse-geocoded settlement and
+  county (the query the AOI brief already uses, sent as `timelinevolraw`).
+  Expected articles = prior share x current GDELT volume; change_pct =
+  100 x (current - expected) / max(expected, 20); component =
+  min(20, 0.2 x max(0, change_pct)). Shares rather than raw counts because
+  GDELT's own intake has multi-day outages (measured 2026-10-17 for
+  Pittsburgh: no data for 16 of 85 days), which raw counts would read as a
+  surge on recovery; a comparison where one week monitored under half the
+  other's volume is refused as a data gap. An area that cannot be
+  geocoded is not scored, rather than searched by the AOI's name.
+- Convergence: `analysis/convergence.py`, unmodified, over the
+  earthquakes, military flights, ACLED events and wildfires inside the
+  AOI's exact shape (circle, polygon or corridor, through the same
+  `filter_by_aoi` scoping as the brief). With an input missing, a
+  convergent cell is reported as a lower bound; no cell at all is null,
+  because quiet cannot be told from missing.
+- New response keys; existing keys keep their meaning. `computed_from`
+  names the components the score was computed from, and
+  `zero_filled_components` the ones among them that are a 0 only because
+  the military or ACLED fetch failed (`score_hotspot` takes no null for
+  those, unchanged); `news_signal` (query, both windows' counts and
+  shares, change), `news_scoping` and `convergence_signal` (cells, events
+  per domain, inputs used, failed or partial) carry the working. A failed
+  news or convergence input makes that component null in `components`,
+  listed in `unavailable_components` and explained in `data_gaps`, never
+  a 0.
+
+### Changed
+- The escalation also fetches earthquakes and wildfires (convergence
+  inputs) and one GDELT timeline, in parallel with ACLED and military
+  flights; their failures are named in `data_gaps`. The brief, the change
+  sweep and the escalation now share one AOI scoping helper.
+- `test_aoi.py` stubs every network-bound source by default: its older
+  escalation tests stub only ACLED and military flights and would
+  otherwise reach Nominatim, GDELT, USGS and FIRMS live.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard
