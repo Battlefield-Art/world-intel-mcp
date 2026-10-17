@@ -3693,7 +3693,7 @@ def _p_text(value: float) -> str:
 @click.option("--min-overlap", type=int, default=_lagged.DEFAULT_MIN_OVERLAP, show_default=True,
               help=f"Fewest overlapping periods a test needs (at least {_lagged.MIN_OVERLAP_FLOOR})")
 @click.option("--q", "q", type=float, default=_lagged.DEFAULT_Q, show_default=True,
-              help="False discovery rate threshold (Benjamini-Hochberg)")
+              help="False discovery rate threshold (Benjamini-Hochberg, applied to q_ar1)")
 @click.option("--start", default=None, help="First date YYYY-MM-DD")
 @click.option("--end", default=None, help="Last date YYYY-MM-DD")
 @click.pass_context
@@ -3719,30 +3719,46 @@ def history_connections(
     lo, hi = method["lags"]
     table = Table(
         title=f"Connections ({method['grid']} grid, {method['transform']}, lags {lo:+d} to "
-        f"{hi:+d}, {data['tests_run']} tests, BH q <= {method['q_threshold']:g})",
+        f"{hi:+d}, {data['tests_run']} tests, BH q_ar1 <= {method['q_threshold']:g})",
         box=box.SIMPLE_HEAVY,
     )
-    for name in ("A", "B", "Lag", "Timing", "r", "n", "n_eff", "p", "q", "Significant"):
-        justify = "right" if name in ("Lag", "r", "n", "n_eff", "p", "q") else "left"
-        table.add_column(name, justify=justify)
+    numeric = ("Lag", "r", "n", "n_eff", "p", "q", "p_ar1", "q_ar1")
+    for name in ("A", "B", "Lag", "Timing", "r", "n", "n_eff", "p", "q", "p_ar1", "q_ar1",
+                 "Significant"):
+        table.add_column(name, justify="right" if name in numeric else "left")
     for pair in data["pairs"]:
         if not pair["strongest"]:
             table.add_row(_cell(pair["a"]), _cell(pair["b"]), "-",
-                          Text("not tested", style="dim"), "-", "-", "-", "-", "-", "-")
+                          Text("not tested", style="dim"), *["-"] * 8)
         for entry in pair["strongest"]:
-            n_eff = entry.get("n_effective_ar1")
+            n_eff = entry["n_effective_ar1"]
             table.add_row(
                 _cell(pair["a"]), _cell(pair["b"]), f"{entry['lag']:+d}", entry["timing"],
                 f"{entry['r']:+.3f}", str(entry["n"]), "-" if n_eff is None else f"{n_eff:g}",
-                _p_text(entry["p"]), _p_text(entry["q"]),
+                _p_text(entry["p"]), _p_text(entry["q"]), _p_text(entry["p_ar1"]),
+                _p_text(entry["q_ar1"]),
                 Text("yes", style="green") if entry["significant"] else Text("no"),
             )
     console.print(table)
     console.print(escape(data["summary"]))
     console.print(
-        "n_eff: AR(1) effective sample size from the two series' lag-1 autocorrelations, "
-        "a diagnostic only: p and q use n."
+        "n_eff: AR(1) effective sample size from the two series' lag-1 autocorrelations. "
+        "p and q use n (periods treated as independent); p_ar1 and q_ar1 use n_eff, and "
+        f"Significant means q_ar1 <= {method['q_threshold']:g}."
     )
+    for pair in data["pairs"]:
+        for entry in pair["strongest"]:
+            if entry.get("note"):
+                console.print(
+                    f"[yellow]Note:[/yellow] {escape(pair['a'])} / {escape(pair['b'])} lag "
+                    f"{entry['lag']:+d}: {escape(entry['note'])}"
+                )
+    for clamp in data["inputs_clamped"]:
+        why = clamp.get("reason") or "allowed {} to {}".format(*clamp["allowed"])
+        console.print(
+            f"[yellow]Clamped:[/yellow] {clamp['input']} {escape(str(clamp['requested']))} -> "
+            f"{escape(str(clamp['used']))} ({escape(why)})"
+        )
     console.print(f"Lag convention: {escape(method['lag_convention'])}")
     console.print(
         f"Transform: {escape(method['transform_rule'])} {escape(method['why_changes_default'])}"
@@ -3752,7 +3768,7 @@ def history_connections(
         others = [e for e in pair["significant"] if e["lag"] not in best]
         if others:
             listed = ", ".join(
-                f"lag {e['lag']:+d} (r {e['r']:+.3f}, q {_p_text(e['q'])})" for e in others
+                f"lag {e['lag']:+d} (r {e['r']:+.3f}, q_ar1 {_p_text(e['q_ar1'])})" for e in others
             )
             console.print(f"Also significant: {escape(pair['a'])} / {escape(pair['b'])}: {listed}")
         if pair["not_tested"]:

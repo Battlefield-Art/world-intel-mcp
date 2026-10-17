@@ -24,8 +24,13 @@ TOOLS: list[Tool] = [
             "tested at every lag from -max_lag to +max_lag. Default transform is period-over-"
             "period changes, because levels of trending series correlate spuriously; 'levels' "
             "on request. Per pair: the lag with the strongest evidence (smallest p) with "
-            "Pearson r, overlap n, two-sided p from Student's t, and the Benjamini-Hochberg q "
-            f"across every test in the call (significant at q <= {lc.DEFAULT_Q:g} by default). "
+            "Pearson r, overlap n, two-sided p from Student's t treating periods as "
+            "independent, p_ar1 recomputed with an AR(1) effective sample size from both "
+            "series' lag-1 autocorrelations, and the Benjamini-Hochberg q and q_ar1 across "
+            f"every test in the call. Significant means q_ar1 <= {lc.DEFAULT_Q:g} by default "
+            "(significant_if_independent applies it to q); serial_correlation_dominates and "
+            "data_gaps name autocorrelated series, and an effective sample below 3 is "
+            "reported as no evidence. "
             "Lag +k compares A at period t with B at t+k, so A leads B by k. Pair/lag "
             f"overlaps under {lc.DEFAULT_MIN_OVERLAP} points are listed as not tested. Revised "
             "points use the latest vintage; rows without observed_at (Yahoo quotes) are not "
@@ -77,14 +82,18 @@ TOOLS: list[Tool] = [
                 "q": {
                     "type": "number",
                     "description": (
-                        f"False discovery rate threshold (default {lc.DEFAULT_Q:g}, clamped to "
-                        f"{lc.Q_FLOOR:g}..{lc.Q_CAP:g})"
+                        f"False discovery rate threshold applied to q_ar1 (default "
+                        f"{lc.DEFAULT_Q:g}, clamped to {lc.Q_FLOOR:g}..{lc.Q_CAP:g})"
                     ),
                     "default": lc.DEFAULT_Q,
                 },
                 "start": {
                     "type": "string",
-                    "description": "First date YYYY-MM-DD; its grid period and later are used",
+                    "description": (
+                        "First date YYYY-MM-DD; its grid period and later are used (moved "
+                        f"later, and reported, when the window would exceed {lc.MAX_PERIODS:,} "
+                        "periods)"
+                    ),
                 },
                 "end": {
                     "type": "string",

@@ -133,6 +133,24 @@ def _planted(store, at: float = T0) -> None:
     _write(store, {"x": _days(x), "y": _days(y, offset=3)}, at)
 
 
+def _ar1(seed: int, n: int, phi: float) -> list[float]:
+    """n unit-variance AR(1) values: e_t = phi e_(t-1) + sqrt(1 - phi^2) z_t."""
+    z = _normals(seed, n)
+    out = [z[0]]
+    for t in range(1, n):
+        out.append(phi * out[-1] + math.sqrt(1.0 - phi * phi) * z[t])
+    return out
+
+
+def _levels(changes: list[float]) -> list[float]:
+    """Levels starting at 0 whose day-to-day changes are ``changes``."""
+    level, out = 0.0, [0.0]
+    for step in changes:
+        level += step
+        out.append(level)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Statistics against independent reference values
 # ---------------------------------------------------------------------------
@@ -501,6 +519,204 @@ def test_cannot_prove_says_a_small_q_is_not_a_large_effect(store) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Serial correlation decides significance (q_ar1)
+# ---------------------------------------------------------------------------
+
+
+def test_independent_random_walks_in_levels_are_not_flagged(store) -> None:
+    """Two independent Gaussian random walks of 300 daily points per seed,
+    levels, defaults. q treats the periods as independent and flags almost
+    every seed; significant follows q_ar1 and flags about none. Measured
+    through the store in a scratch run over seeds 0-99: 91 by q, 0 by q_ar1.
+    Seeds 0-19 here: 19 by q, 0 by q_ar1."""
+    series = {}
+    for s in range(20):
+        steps = _normals(s, 600)
+        series[f"w{s}a"] = _days(_levels(steps[:300])[1:])
+        series[f"w{s}b"] = _days(_levels(steps[300:])[1:])
+    _write(store, series)
+    flagged = flagged_if_independent = 0
+    for s in range(20):
+        result = _run(store, [f"w{s}a", f"w{s}b"], transform="levels")
+        flagged += result["significant_tests"] > 0
+        flagged_if_independent += result["significant_tests_if_independent"] > 0
+    assert flagged_if_independent >= 15
+    assert flagged <= 1
+
+
+def test_autocorrelated_changes_keep_significance_near_the_nominal_rate(store) -> None:
+    """Independent pairs whose daily changes are AR(1) with phi 0.8, 200
+    changes each, one test per call (max_lag 0), so q_ar1 is p_ar1 and q is
+    p. A scratch run of 4,000 pairs gave p <= 0.05 in 35.3% and p_ar1 <= 0.05
+    in 5.1%; these 120 pairs give 44 by q and 4 by q_ar1."""
+    series = {}
+    for run in range(120):
+        series[f"ar{run}a"] = _days(_levels(_ar1(2000 + 2 * run, 200, 0.8)))
+        series[f"ar{run}b"] = _days(_levels(_ar1(2001 + 2 * run, 200, 0.8)))
+    _write(store, series)
+    significant = if_independent = 0
+    for run in range(120):
+        result = _run(store, [f"ar{run}a", f"ar{run}b"], max_lag=0)
+        significant += result["significant_tests"]
+        if_independent += result["significant_tests_if_independent"]
+    assert if_independent >= 30
+    assert significant <= 12
+    gaps = _run(store, ["ar0a", "ar0b"], max_lag=0)["data_gaps"]
+    assert any(g.startswith("lagtest:ar0a: lag-1 autocorrelation +0.8") for g in gaps)
+    assert any("significance uses the AR(1)-adjusted p_ar1 and q_ar1" in g for g in gaps)
+
+
+def test_below_an_effective_size_of_three_is_no_evidence(store) -> None:
+    """Seeds 1000/1001 in levels: |r| 0.87 and q ~ 1e-59 if periods were
+    independent, but both lag-1 autocorrelations are above 0.99, leaving an
+    effective sample under 1. That is reported as no evidence, not as null."""
+    _write(store, {"rwa": _days(_walk(1000, 200)), "rwb": _days(_walk(1001, 200))})
+    result = _run(store, ["rwa", "rwb"], transform="levels")
+    best = result["pairs"][0]["strongest"][0]
+    assert abs(best["r"]) > 0.8 and best["q"] < 1e-50
+    assert best["n_effective_ar1"] < 3 and best["p_ar1"] == 1.0 and best["q_ar1"] == 1.0
+    assert best["note"].startswith("no evidence:")
+    assert best["significant"] is False and best["significant_if_independent"] is True
+    assert best["serial_correlation_dominates"] is True
+    assert result["significant_tests"] == 0 and result["significant_tests_if_independent"] > 0
+    assert result["summary"].startswith("0 of 1 pairs have a lag with q_ar1 <= 0.05")
+    assert "Assuming independent periods instead, 1 of 1 pairs have a lag with q <= 0.05." in result["summary"]
+    (dominates,) = [g for g in result["data_gaps"] if "serial correlation dominates" in g]
+    assert dominates.startswith("lagtest:rwa / lagtest:rwb: serial correlation dominates")
+    assert "no evidence either way" in dominates
+    assert "significant uses q_ar1" in result["method"]["serial_correlation"]
+    assert "post-selection" in result["method"]["serial_correlation"]
+
+
+def test_unmeasurable_autocorrelation_is_not_counted_as_significant(store) -> None:
+    """Weekly observations on the day grid, in levels: no two observations
+    sit on adjacent days, so neither lag-1 autocorrelation can be measured and
+    p cannot be adjusted. The near-exact lag-0 match keeps its p but is not
+    counted as significant, and the response says why."""
+    x = _walk(501, 40)
+    noise = _normals(502, 40)
+    weeks = [(D0 + timedelta(days=7 * i)).isoformat() for i in range(40)]
+    _write(store, {"wx": list(zip(weeks, x)),
+                   "wy": list(zip(weeks, [v + 0.1 * e for v, e in zip(x, noise)]))})
+    result = _run(store, ["wx", "wy"], transform="levels")
+    best = result["pairs"][0]["strongest"][0]
+    assert (best["lag"], best["n"]) == (0, 40) and best["r"] > 0.99
+    assert best["significant_if_independent"] is True and best["significant"] is False
+    assert best["n_effective_ar1"] is None and best["p_ar1"] == 1.0
+    assert best["serial_correlation_dominates"] is None
+    assert best["note"].startswith("not assessed:")
+    unmeasurable = [g for g in result["data_gaps"]
+                    if "lag-1 autocorrelation not measurable (0 adjacent periods" in g]
+    assert len(unmeasurable) == 2
+    assert all(g.endswith("a median 7 days apart, so a coarser grid may fit") for g in unmeasurable)
+
+
+def test_q_and_q_ar1_adjust_across_every_test_in_the_call(store) -> None:
+    """Three series, 3 pairs x 11 lags = 33 tests. The planted lag's p (and
+    p_ar1) is the smallest in the call by far, so Benjamini-Hochberg gives it
+    m p with m = 33, every test in the call; per pair it would be 11 p.
+    Measured: q / p = 33.08 and q_ar1 / p_ar1 = 32.98 after rounding to three
+    significant digits."""
+    _planted(store)
+    _write(store, {"z": _days(_walk(13, 200))}, at=T0 + 1)
+    result = _run(store, ["x", "y", "z"])
+    assert result["tests_run"] == 33
+    (xy,) = [p for p in result["pairs"] if (p["a"], p["b"]) == ("lagtest:x", "lagtest:y")]
+    best = xy["strongest"][0]
+    assert best["lag"] == 3 and 0 < best["p"] <= best["p_ar1"] < 1e-50
+    # Ratios: pytest.approx's default absolute tolerance (1e-12) would call
+    # any two values this small equal.
+    assert best["q"] / best["p"] == pytest.approx(33, rel=0.02)
+    assert best["q_ar1"] / best["p_ar1"] == pytest.approx(33, rel=0.02)
+    harmonic = sum(1 / i for i in range(1, 34))
+    assert best["q_by"] / best["q_ar1"] == pytest.approx(harmonic, rel=0.02)
+
+
+def test_strongest_breaks_ties_on_p_by_the_larger_t(store) -> None:
+    """b_t = a_(t-2) + 0.9 a_(t-3) + small noise over 3,000 days: in changes,
+    r is 0.748 at +2 and 0.675 at +3 on 2,996 points, and both p underflow to
+    exactly 0.0. Equal p, so the larger |t| (lag +2) is the strongest."""
+    a = _walk(301, 3000)
+    noise = _normals(302, 3000)
+    b = [a[t - 2] + 0.9 * a[t - 3] + 0.05 * noise[t] for t in range(3, 3000)]
+    _write(store, {"ta": _days(a), "tb": _days(b, offset=3)})
+    pair = _run(store, ["ta", "tb"])["pairs"][0]
+    assert [(e["lag"], e["p"]) for e in pair["significant"]] == [(2, 0.0), (3, 0.0)]
+    (best,) = pair["strongest"]
+    assert (best["lag"], best["n"]) == (2, 2996)
+    assert best["r"] == pytest.approx(0.748, abs=0.005)
+
+
+def test_a_q_exactly_at_the_threshold_is_significant(store, monkeypatch) -> None:
+    """The rule is q_ar1 <= threshold (q <= threshold for
+    significant_if_independent). With every adjusted value forced to the
+    threshold itself, every test counts."""
+    _planted(store)
+    monkeypatch.setattr(lc, "benjamini_hochberg", lambda pvalues: [0.05] * len(pvalues))
+    result = _run(store, ["x", "y"])
+    assert result["tests_run"] == 11
+    assert result["significant_tests"] == 11
+    assert result["significant_tests_if_independent"] == 11
+    entries = result["pairs"][0]["significant"]
+    assert len(entries) == 11 and all(e["q_ar1"] == e["q"] == 0.05 for e in entries)
+
+
+def test_effective_sample_size_is_capped_at_n(store) -> None:
+    """Changes autocorrelated with opposite signs (measured phi +0.53 and
+    -0.42) make (1 - phi_a phi_b) / (1 + phi_a phi_b) about 1.57; the
+    effective size is capped at n, so p_ar1 equals p instead of undercutting
+    it."""
+    pos = _ar1(401, 300, 0.5)
+    neg = [c + 0.25 * v for v, c in zip(pos, _ar1(402, 300, -0.5))]
+    _write(store, {"pos": _days(_levels(pos)), "neg": _days(_levels(neg))})
+    result = _run(store, ["pos", "neg"])
+    phi_a, phi_b = (s["lag1_autocorrelation"] for s in result["series"])
+    assert phi_a > 0.3 and phi_b < -0.3
+    best = result["pairs"][0]["strongest"][0]
+    assert best["lag"] == 0 and best["p"] < 1e-4
+    assert best["n_effective_ar1"] == best["n"] == 300
+    assert best["p_ar1"] == best["p"]
+    assert best["serial_correlation_dominates"] is False
+
+
+def test_week_grid_reports_unequal_change_intervals(store) -> None:
+    """Each week takes its last observation. A series seen on Fridays except
+    every third week (Monday only) has changes spanning 3 to 11 days; a daily
+    series has 7-day changes throughout."""
+    rows = [((D0 + timedelta(days=7 * w + (0 if w % 3 == 0 else 4))).isoformat(), v)
+            for w, v in enumerate(_walk(601, 40))]
+    _write(store, {"irregular": rows, "daily": _days(_walk(602, 280))})
+    result = _run(store, ["irregular", "daily"], grid="week", min_overlap=20, max_lag=1)
+    by_key = {s["series_key"]: s for s in result["series"]}
+    assert by_key["lagtest:irregular"]["change_interval_days"] == {"min": 3, "max": 11}
+    assert by_key["lagtest:daily"]["change_interval_days"] == {"min": 7, "max": 7}
+    gaps = result["data_gaps"]
+    assert any(g.startswith("lagtest:irregular: on the week grid its changes span 3 to 11 days")
+               for g in gaps)
+    assert not any(g.startswith("lagtest:daily: on the week grid") for g in gaps)
+    assert "unequal intervals" in result["method"]["sampling"]
+    levels = _run(store, ["irregular", "daily"], grid="week", transform="levels", max_lag=1)
+    assert all(s["change_interval_days"] is None for s in levels["series"])
+
+
+def test_window_cut_reports_a_given_start_as_clamped(store, monkeypatch) -> None:
+    """The most-recent cut also applies when start is given; the start
+    actually used is then reported (200 days, cut to the last 120: day 80)."""
+    monkeypatch.setattr(lc, "MAX_PERIODS", 120)
+    _planted(store)
+    result = _run(store, ["x", "y"], start=D0.isoformat())
+    (clamp,) = [c for c in result["inputs_clamped"] if c["input"] == "start"]
+    assert clamp == {
+        "input": "start", "requested": D0.isoformat(),
+        "used": (D0 + timedelta(days=80)).isoformat(),
+        "reason": "the window is limited to the most recent 120 days",
+    }
+    assert result["method"]["window"]["start"] == clamp["used"]
+    inside = _run(store, ["x", "y"], start=(D0 + timedelta(days=100)).isoformat())
+    assert not [c for c in inside["inputs_clamped"] if c["input"] == "start"]
+
+
+# ---------------------------------------------------------------------------
 # Inputs: clamps and errors
 # ---------------------------------------------------------------------------
 
@@ -712,3 +928,29 @@ def test_cli_connections_json_and_errors(cli_db) -> None:
     assert out.startswith("Error:") and "lagtest:nope" in out
     bad = CliRunner().invoke(cli.main, ["history", "connections", "a", "b", "--grid", "hour"])
     assert bad.exit_code == 2 and "day" in bad.output and "month" in bad.output
+
+
+def test_cli_connections_reports_each_clamp(cli_db, monkeypatch) -> None:
+    out = _invoke("history", "connections", "lagtest:x", "lagtest:y",
+                  "--min-overlap", "5", "--max-lag", "40", "--q", "0.5").output
+    assert "Clamped: min_overlap 5 -> 20 (allowed 20 to 3000)" in out
+    assert "Clamped: max_lag 40 -> 30 (allowed 0 to 30)" in out
+    assert "Clamped: q 0.5 -> 0.25 (allowed 0.001 to 0.25)" in out
+    monkeypatch.setattr(lc, "MAX_PERIODS", 120)
+    cut = _invoke("history", "connections", "lagtest:x", "lagtest:y", "--start", D0.isoformat()).output
+    used = (D0 + timedelta(days=80)).isoformat()
+    assert (f"Clamped: start {D0.isoformat()} -> {used} (the window is limited to the most "
+            "recent 120 days)") in cut
+    assert "Clamped:" not in _invoke("history", "connections", "lagtest:x", "lagtest:y").output
+
+
+def test_cli_connections_table_shows_p_ar1_and_q_ar1(cli_db) -> None:
+    args = ("history", "connections", "lagtest:x", "lagtest:y", "--transform", "levels")
+    best = json.loads(_invoke("--json-output", *args).output)["pairs"][0]["strongest"][0]
+    out = _invoke(*args).output
+    (header,) = [line for line in out.splitlines() if "n_eff" in line and "Timing" in line]
+    assert header.split()[-5:] == ["p", "q", "p_ar1", "q_ar1", "Significant"]
+    (row,) = [line for line in out.splitlines() if "A leads B by 3 days" in line]
+    assert row.split()[-3:] == [cli._p_text(best["p_ar1"]), cli._p_text(best["q_ar1"]),
+                                "yes" if best["significant"] else "no"]
+    assert "p_ar1 and q_ar1 use n_eff, and Significant means q_ar1 <= 0.05" in out

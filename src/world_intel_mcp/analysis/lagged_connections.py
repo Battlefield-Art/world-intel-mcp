@@ -21,7 +21,11 @@ Alignment:
 - Sampling: a period takes the value of its last observation by
   ``observed_at``, so a daily series on the week grid is its last day of the
   week. Values inside a period are not averaged: averaging a random walk
-  makes its period-to-period changes serially correlated.
+  makes its period-to-period changes serially correlated. On the week and
+  month grids a change therefore runs from one period's last observation to
+  the next period's, and those intervals need not be equal (a Monday close
+  then the next week's Friday close is 11 days); each series reports the
+  shortest and longest interval in days (dated observations only).
 - Rows without ``observed_at`` (Yahoo quotes) are not used. Their only date
   is ``collected_at``, when this server saw a changed value, and rows are
   stored only when the value changes, so a day with no row cannot be told
@@ -29,7 +33,9 @@ Alignment:
   excluded with that reason.
 - ``start`` / ``end`` select whole grid periods (the ones containing them and
   every period between). Without them the window is the series' combined
-  span, cut to the most recent ``MAX_PERIODS`` periods.
+  span. Either way it is cut to the most recent ``MAX_PERIODS`` periods; when
+  the cut moves a given ``start``, the start actually used is reported in
+  ``inputs_clamped``.
 
 Transform:
 - ``changes`` (default): a period's value minus the immediately preceding
@@ -50,10 +56,12 @@ Tests:
   P(|T| >= |t|) = I_{1 - r^2}((n - 2) / 2, 1 / 2), the regularized incomplete
   beta function, evaluated by its continued fraction (DLMF 8.17.22) with the
   modified Lentz method. No permutation test is run.
-- q is the Benjamini-Hochberg adjusted p over every test run in the call;
-  ``q_by`` is the Benjamini-Yekutieli version, valid under any dependence
-  between tests. A test is significant when q <= the threshold (default
-  ``DEFAULT_Q`` = 0.05).
+- q is the Benjamini-Hochberg adjusted p over every test run in the call,
+  and q_ar1 the same adjustment of ``p_ar1`` (below); ``q_by`` is the
+  Benjamini-Yekutieli version of q_ar1, valid under any dependence between
+  tests. A test is significant when q_ar1 <= the threshold (default
+  ``DEFAULT_Q`` = 0.05); ``significant_if_independent`` applies the
+  threshold to q.
 
 Minimum sample, ``DEFAULT_MIN_OVERLAP`` = 30 overlapping points (callers may
 raise it, or lower it to ``MIN_OVERLAP_FLOOR`` = 20): at n = 30 a two-sided
@@ -65,20 +73,38 @@ more often missed than found, and one that passes rests on few points. The
 floor is 20 because below it a single outlying pair can dominate r and the t
 reference distribution leans on near-normal values.
 
-Serial correlation: p and q treat periods as independent. Each series'
-lag-1 autocorrelation after the transform is reported, and each strongest
-result carries ``n_effective_ar1`` and ``p_ar1``: n scaled by
-(1 - phi_a phi_b) / (1 + phi_a phi_b), the large-sample variance inflation
-of r for two AR(1) series (Bartlett), capped at n. That is a diagnostic only:
-q uses p, and nothing is prewhitened.
+Serial correlation: p and q treat periods as independent, which overstates
+the evidence when a series is autocorrelated after the transform. Each
+series' lag-1 autocorrelation (phi) is measured, and every test carries
+``n_effective_ar1``, n scaled by (1 - phi_a phi_b) / (1 + phi_a phi_b) (the
+large-sample variance inflation of r for two AR(1) series, Bartlett) and
+capped at n, and ``p_ar1``, p recomputed with that sample size. Significance
+uses q_ar1. Below an effective size of 3 the sample carries no evidence
+either way, and without a measurable phi (fewer than ``_AUTOCORR_MIN_PAIRS``
+adjacent periods) the adjustment cannot be made; both set p_ar1 to 1 and the
+entry says why. ``serial_correlation_dominates`` marks n_effective_ar1 below
+``DOMINATES_BELOW`` x n (variance of r inflated more than fivefold), and
+data_gaps names those pairs and every series with |phi| above
+``AUTOCORR_NOTE_ABOVE``. The strongest lag is chosen by p among a pair's
+lags, so its p and p_ar1 are post-selection values; q and q_ar1 carry the
+adjustment for every test in the call. Measured 2026-10-17 in a scratch
+simulation through the store (not part of the test suite): for two
+independent Gaussian random walks of 300 daily points, levels, defaults,
+seeds 0-99, 91 of 100 seeds have a lag with q <= 0.05 and none with q_ar1 <=
+0.05 (conservative there: their phi is near 1). For two independent series
+of 200 AR(1) changes, 4,000 runs, at lag 0 p <= 0.05 in 12.2% (phi 0.5) and
+35.3% (phi 0.8) of runs and q_ar1 <= 0.05 in 4.5% and 5.1%; with the default
+11 lags a call has any significant lag in 4.3% and 2.9% of runs.
 
 Gaps / not covered:
 - Pearson only: no rank correlation, so a few extreme changes can drive r.
 - No prewhitening and no correction for autocorrelation beyond lag 1 or for
-  volatility clustering; ``p_ar1`` is an AR(1) approximation outside q.
+  volatility clustering: ``p_ar1`` is an AR(1) approximation, so series
+  with longer memory (seasonal patterns, long swings) can still have their
+  evidence overstated.
 - Benjamini-Hochberg assumes independent or positively dependent tests;
-  neighbouring lags of one pair share most of their data, so q is
-  approximate (``q_by`` is the any-dependence bound).
+  neighbouring lags of one pair share most of their data, so q and q_ar1 are
+  approximate (``q_by`` is the any-dependence bound for q_ar1).
 - The adjustment covers one call. Other calls with other series, grids or
   windows are further tests it cannot see.
 - Business-day series lose their Monday changes on the day grid (Friday to
@@ -115,6 +141,11 @@ MAX_TESTS = 1000
 MAX_PERIODS = 3000
 # Fewer adjacent pairs than this and a lag-1 autocorrelation is not reported.
 _AUTOCORR_MIN_PAIRS = 10
+# n_effective_ar1 below this share of n: the variance of r is inflated more
+# than fivefold, so serial correlation, not the sample size, sets the evidence.
+DOMINATES_BELOW = 0.2
+# A series whose |lag-1 autocorrelation| exceeds this gets a data_gaps line.
+AUTOCORR_NOTE_ABOVE = 0.3
 
 _UNIT = {"day": "day", "week": "week", "month": "month"}
 
@@ -126,7 +157,9 @@ GRID_RULES = {
 SAMPLING_RULE = (
     "Each period takes the value of its last observation by observed_at (a daily "
     "series on the week grid is its last day of the week). Values inside a period "
-    "are not averaged."
+    "are not averaged. On the week and month grids a change runs from one period's "
+    "last observation to the next period's, so changes can span unequal intervals; "
+    "each series reports change_interval_days (shortest and longest)."
 )
 VINTAGE_RULE = (
     "Latest vintage: where later captures revised the value for an observed_at, the "
@@ -168,10 +201,35 @@ MIN_OVERLAP_REASON = (
 )
 AR1_RULE = (
     "p and q treat periods as independent. Done: each series' lag-1 "
-    "autocorrelation after the transform is reported, and each strongest result "
-    "carries n_effective_ar1 (n scaled by (1 - phi_a phi_b) / (1 + phi_a phi_b), "
-    "capped at n) and p_ar1 (p recomputed with it). Not done: prewhitening, "
-    "autocorrelation beyond lag 1, volatility clustering; p_ar1 does not enter q."
+    "autocorrelation (phi) after the transform is measured, and every test carries "
+    "n_effective_ar1 (n scaled by (1 - phi_a phi_b) / (1 + phi_a phi_b), capped at "
+    "n) and p_ar1 (p recomputed with it). q_ar1 is the Benjamini-Hochberg "
+    "adjustment of p_ar1 across the call, and significant uses q_ar1; p_ar1 does "
+    "not enter q. Below an effective sample size of 3 the sample carries no "
+    "evidence either way, and without a measurable phi (fewer than "
+    f"{_AUTOCORR_MIN_PAIRS} adjacent periods) no adjustment can be made; both set "
+    "p_ar1 to 1 and say why in the entry's note. n_effective_ar1 is shown rounded "
+    "down to one decimal. serial_correlation_dominates "
+    f"marks n_effective_ar1 below {DOMINATES_BELOW:g} n. The strongest lag is the "
+    "smallest p among the pair's lags, so its p and p_ar1 are post-selection "
+    "values; q and q_ar1 carry the adjustment for every test in the call. Not "
+    "done: prewhitening, autocorrelation beyond lag 1, volatility clustering."
+)
+SIGNIFICANCE_RULE = (
+    "A test is significant when q_ar1 <= the threshold. significant_if_independent "
+    "applies the same threshold to q, which treats periods as independent and "
+    "overstates the evidence for autocorrelated series."
+)
+NO_EVIDENCE_NOTE = (
+    "no evidence: the AR(1) effective sample size is below 3, so with this much "
+    "serial correlation the sample cannot tell a real correlation from chance; "
+    "p_ar1 is set to 1"
+)
+NO_PHI_NOTE = (
+    "not assessed: a series has fewer than "
+    f"{_AUTOCORR_MIN_PAIRS} adjacent periods after the transform, so its lag-1 "
+    "autocorrelation cannot be measured and p cannot be adjusted for it; p_ar1 is "
+    "set to 1, so the test cannot be significant"
 )
 NOT_TESTED_REASONS = {
     "below_min_overlap": "fewer overlapping periods than min_overlap",
@@ -185,9 +243,11 @@ CANNOT_PROVE = [
     "a third factor can reach A first.",
     "Serial correlation inflates significance even after differencing: p and q "
     "treat periods as independent. What was done: lag-1 autocorrelations are "
-    "reported and p_ar1 recomputes the strongest results with an AR(1) effective "
-    "sample size. What was not: prewhitening, autocorrelation beyond lag 1, "
-    "volatility clustering. p_ar1 does not enter q.",
+    "measured, every test carries p_ar1 with an AR(1) effective sample size, and "
+    "significant uses q_ar1, the false-discovery adjustment of p_ar1. What was "
+    "not: prewhitening, autocorrelation beyond lag 1, volatility clustering, so "
+    "series with longer memory than AR(1) can still have their evidence "
+    "overstated.",
     "A shared common driver produces correlation: two series that both respond to "
     "a third (the business cycle, a policy date, a holiday calendar) correlate "
     "with no link between them.",
@@ -196,9 +256,9 @@ CANNOT_PROVE = [
     "periods the collector missed are absent, not zero.",
     "Benjamini-Hochberg controls the false discovery rate for independent or "
     "positively dependent tests; neighbouring lags of one pair share most of "
-    "their data, so q is approximate (q_by holds under any dependence). The "
-    "adjustment covers this call only, not other calls with other series, grids "
-    "or windows.",
+    "their data, so q and q_ar1 are approximate (q_by, the Benjamini-Yekutieli "
+    "version of q_ar1, holds under any dependence). The adjustment covers this "
+    "call only, not other calls with other series, grids or windows.",
 ]
 
 
@@ -274,6 +334,27 @@ def correlation_p_value(r: float, n: float) -> float:
         return 0.0
     # t^2 = r^2 df / (1 - r^2), so df / (df + t^2) = 1 - r^2 exactly.
     return min(1.0, _ibeta(df / 2.0, 0.5, (1.0 - r) * (1.0 + r), r * r))
+
+
+def ar1_adjusted(
+    r: float, n: int, phi_a: float | None, phi_b: float | None
+) -> tuple[float | None, float, str | None]:
+    """(n_effective_ar1, p_ar1, note) for one test: n scaled by
+    (1 - phi_a phi_b) / (1 + phi_a phi_b) and capped at n, and p recomputed
+    with it. p_ar1 is 1, with a note, when either phi is unknown or the
+    effective size is below 3."""
+    if phi_a is None or phi_b is None:
+        return None, 1.0, NO_PHI_NOTE
+    prod = phi_a * phi_b
+    if prod >= 1.0:
+        n_eff = 0.0
+    elif prod <= -1.0:
+        n_eff = float(n)
+    else:
+        n_eff = min(float(n), n * (1.0 - prod) / (1.0 + prod))
+    if n_eff < 3:
+        return n_eff, 1.0, NO_EVIDENCE_NOTE
+    return n_eff, correlation_p_value(r, n_eff), None
 
 
 # Quotes a p from correlation_p_value, so it joins the list once that exists.
@@ -490,6 +571,7 @@ def _sample_on_grid(key: str, rows: list[tuple], grid: str) -> dict[str, Any]:
     coarser = unreadable = 0
     coarser_kinds: set[str] = set()
     levels: dict[int, float] = {}
+    days: dict[int, int | None] = {}
     for observed_at in sorted(latest):
         period, why = period_of(observed_at, grid)
         if period is None:
@@ -500,6 +582,9 @@ def _sample_on_grid(key: str, rows: list[tuple], grid: str) -> dict[str, Any]:
                 unreadable += 1
             continue
         levels[period] = latest[observed_at]  # sorted, so the last one wins
+        # The sampled observation's day; a YYYY-MM row on the month grid has none.
+        day = _DAY.fullmatch(str(observed_at))
+        days[period] = date(int(day[1]), int(day[2]), int(day[3])).toordinal() if day else None
     last_row = rows[-1] if rows else (None, None, None, None, None)
     return {
         "series_key": key,
@@ -513,8 +598,19 @@ def _sample_on_grid(key: str, rows: list[tuple], grid: str) -> dict[str, Any]:
         "revised_observed_at": sum(1 for values in distinct.values() if len(values) > 1),
         "dated_observations": len(latest),
         "_levels": levels,
+        "_days": days,
         "_coarser_kinds": coarser_kinds,
     }
+
+
+def change_interval_days(levels: dict[int, float], days: dict[int, int | None]) -> list[int]:
+    """Days spanned by each period-over-period change, from the earlier
+    period's sampled observation to the later one's (both ends dated)."""
+    out = []
+    for p in sorted(levels):
+        if p - 1 in levels and days.get(p) is not None and days.get(p - 1) is not None:
+            out.append(days[p] - days[p - 1])
+    return out
 
 
 def _exclusion_reason(info: dict, grid: str) -> str | None:
@@ -546,6 +642,11 @@ def _median_gap(periods: Iterable[int]) -> float | None:
 
 def _sig(value: float) -> float:
     return float(f"{value:.3g}")
+
+
+def _floor1(value: float) -> float:
+    # Rounded down, so an effective size just under 3 never reads as 3.0.
+    return math.floor(value * 10 + 1e-9) / 10
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +716,7 @@ def lagged_connections(
         else:
             usable.append(info)
 
+    unit = _UNIT[grid]
     # One shared window of whole grid periods.
     window: dict[str, Any] = {"start": None, "end": None, "limited_to_recent": False}
     lo = period_of(start_d.isoformat(), grid)[0] if start_d else None
@@ -627,6 +729,12 @@ def lagged_connections(
         if hi - lo + 1 > MAX_PERIODS:
             lo = hi - MAX_PERIODS + 1
             window["limited_to_recent"] = True
+            if start_d:
+                clamps.append({
+                    "input": "start", "requested": start_d.isoformat(),
+                    "used": period_label(lo, grid),
+                    "reason": f"the window is limited to the most recent {MAX_PERIODS} {unit}s",
+                })
         window.update(start=period_label(lo, grid), end=period_label(hi, grid),
                       periods=max(0, hi - lo + 1))
 
@@ -640,6 +748,10 @@ def lagged_connections(
                              "reason": "no observation inside the window"})
             continue
         info["_values"] = apply_transform(inside, transform)
+        info["_intervals"] = (
+            change_interval_days(inside, info["_days"]) if transform == "changes" else []
+        )
+        info["_phi"], info["_phi_pairs"] = lag1_autocorrelation(info["_values"])
         still_usable.append(info)
     usable = still_usable
 
@@ -669,23 +781,26 @@ def lagged_connections(
                 pair["not_tested"].append({"lag": k, "n": n, "reason": "no_variation"})
                 continue
             t_abs = math.inf if abs(r) >= 1.0 else abs(r) * math.sqrt((n - 2) / (1 - r * r))
-            test = {"lag": k, "r": r, "n": n, "p": correlation_p_value(r, n), "_t": t_abs}
+            n_eff, p_ar1, note = ar1_adjusted(r, n, a["_phi"], b["_phi"])
+            test = {"lag": k, "r": r, "n": n, "p": correlation_p_value(r, n), "_t": t_abs,
+                    "n_eff": n_eff, "p_ar1": p_ar1, "note": note}
             tests.append(test)
             pair["_tests"].append(test)
         pairs.append(pair)
 
     pvalues = [t["p"] for t in tests]
-    for test, q_bh, q_by in zip(tests, benjamini_hochberg(pvalues), benjamini_yekutieli(pvalues)):
-        test["q"], test["q_by"] = q_bh, q_by
-        test["significant"] = q_bh <= q_threshold
+    p_ar1_values = [t["p_ar1"] for t in tests]
+    for test, q_bh, q_ar1, q_by in zip(
+        tests, benjamini_hochberg(pvalues), benjamini_hochberg(p_ar1_values),
+        benjamini_yekutieli(p_ar1_values),
+    ):
+        test["q"], test["q_ar1"], test["q_by"] = q_bh, q_ar1, q_by
+        test["significant"] = q_ar1 <= q_threshold
+        test["significant_if_independent"] = q_bh <= q_threshold
 
-    for info in usable:
-        info["_phi"], info["_phi_pairs"] = lag1_autocorrelation(info["_values"])
-
-    unit = _UNIT[grid]
     gaps: list[str] = []
 
-    def _entry(test: dict, a: dict, b: dict, full: bool) -> dict:
+    def _entry(test: dict) -> dict:
         k = test["lag"]
         plural = "" if abs(k) == 1 else "s"
         timing = (
@@ -693,6 +808,7 @@ def lagged_connections(
             else f"B leads A by {-k} {unit}{plural}" if k < 0
             else f"same {unit}"
         )
+        n_eff = test["n_eff"]
         out = {
             "lag": k,
             "timing": timing,
@@ -701,23 +817,18 @@ def lagged_connections(
             "n": test["n"],
             "p": _sig(test["p"]),
             "q": _sig(test["q"]),
+            "n_effective_ar1": None if n_eff is None else _floor1(n_eff),
+            "p_ar1": _sig(test["p_ar1"]),
+            "q_ar1": _sig(test["q_ar1"]),
             "q_by": _sig(test["q_by"]),
             "significant": test["significant"],
+            "significant_if_independent": test["significant_if_independent"],
+            "serial_correlation_dominates": (
+                None if n_eff is None else n_eff < DOMINATES_BELOW * test["n"]
+            ),
         }
-        if full:
-            phi_a, phi_b = a["_phi"], b["_phi"]
-            if phi_a is None or phi_b is None:
-                out["n_effective_ar1"] = out["p_ar1"] = None
-            else:
-                prod = phi_a * phi_b
-                if prod >= 1.0:
-                    n_eff = 0.0
-                elif prod <= -1.0:
-                    n_eff = float(test["n"])
-                else:
-                    n_eff = min(float(test["n"]), test["n"] * (1.0 - prod) / (1.0 + prod))
-                out["n_effective_ar1"] = round(n_eff, 1)
-                out["p_ar1"] = _sig(correlation_p_value(test["r"], n_eff)) if n_eff >= 3 else None
+        if test["note"]:
+            out["note"] = test["note"]
         return out
 
     pair_out = []
@@ -731,8 +842,8 @@ def lagged_connections(
             "b": pair["b"],
             "lags_tested": len(pair["_tests"]),
             "lags_not_tested": len(pair["not_tested"]),
-            "strongest": [_entry(t, a, b, full=True) for t in strongest],
-            "significant": [_entry(t, a, b, full=False) for t in ranked if t["significant"]],
+            "strongest": [_entry(t) for t in strongest],
+            "significant": [_entry(t) for t in ranked if t["significant"]],
             "not_tested": pair["not_tested"],
         })
         if not ranked:
@@ -741,10 +852,25 @@ def lagged_connections(
                 f"{pair['a']} / {pair['b']}: no lag could be tested (largest overlap "
                 f"{biggest} periods; minimum {min_n})"
             )
+        elif strongest[0]["n_eff"] is not None and (
+            strongest[0]["n_eff"] < DOMINATES_BELOW * strongest[0]["n"]
+        ):
+            best = strongest[0]
+            gap = (
+                f"{pair['a']} / {pair['b']}: serial correlation dominates: lag-1 "
+                f"autocorrelations {a['_phi']:+.2f} and {b['_phi']:+.2f} leave an AR(1) "
+                f"effective sample size of {_floor1(best['n_eff']):g} of {best['n']} periods "
+                "at the strongest lag, so p and q overstate the evidence; significance uses q_ar1"
+            )
+            if best["n_eff"] < 3:
+                gap += ". Below 3 the sample carries no evidence either way (p_ar1 set to 1)"
+            gaps.append(gap)
 
+    tested_keys = {key for p in pairs if p["_tests"] for key in (p["a"], p["b"])}
     series_out = []
     for info in usable:
         values = info["_values"]
+        intervals = info["_intervals"]
         series_out.append({
             "series_key": info["series_key"],
             "source": info["source"],
@@ -764,8 +890,40 @@ def lagged_connections(
             "points_after_transform": len(values),
             "lag1_autocorrelation": None if info["_phi"] is None else round(info["_phi"], 4),
             "lag1_pairs": info["_phi_pairs"],
+            "change_interval_days": (
+                {"min": min(intervals), "max": max(intervals)} if intervals else None
+            ),
         })
         key = info["series_key"]
+        phi = info["_phi"]
+        tested = key in tested_keys
+        if tested and phi is not None and abs(phi) > AUTOCORR_NOTE_ABOVE:
+            gaps.append(
+                f"{key}: lag-1 autocorrelation {phi:+.2f} after the transform; p and q "
+                "assume independent periods, so significance uses the AR(1)-adjusted "
+                "p_ar1 and q_ar1"
+            )
+        elif tested and phi is None:
+            gap = (
+                f"{key}: lag-1 autocorrelation not measurable ({info['_phi_pairs']} adjacent "
+                f"periods after the transform, at least {_AUTOCORR_MIN_PAIRS} needed), so its "
+                "tests cannot be adjusted for serial correlation and are not counted as "
+                "significant (p_ar1 set to 1)"
+            )
+            spacing = _median_gap(info["_levels"])
+            if spacing is not None and spacing > 1:
+                gap += (f"; its observations are a median {spacing:g} {unit}s apart, so a "
+                        "coarser grid may fit")
+            gaps.append(gap)
+        # A week is 7 days; calendar months alone vary from 28 to 31.
+        if grid != "day" and intervals and max(intervals) - min(intervals) > (
+            0 if grid == "week" else 3
+        ):
+            gaps.append(
+                f"{key}: on the {grid} grid its changes span {min(intervals)} to "
+                f"{max(intervals)} days (each period takes its last observation), so "
+                "changes cover unequal intervals"
+            )
         if info["rows_without_observed_at"]:
             gaps.append(f"{key}: {info['rows_without_observed_at']} rows without observed_at not used")
         if info["rows_coarser_than_grid"]:
@@ -792,12 +950,18 @@ def lagged_connections(
         gaps.append("fewer than two series could be used, so nothing was tested")
 
     significant = sum(1 for t in tests if t["significant"])
+    significant_independent = sum(1 for t in tests if t["significant_if_independent"])
     with_signal = sum(1 for p in pair_out if p["significant"])
+    with_signal_independent = sum(
+        1 for p in pairs if any(t["significant_if_independent"] for t in p["_tests"])
+    )
     not_run = sum(p["lags_not_tested"] for p in pair_out)
     return {
         "summary": (
-            f"{with_signal} of {len(pair_out)} pairs have a lag with q <= {q_threshold:g} "
-            f"({significant} of {len(tests)} tests; {not_run} pair/lag combinations not tested)"
+            f"{with_signal} of {len(pair_out)} pairs have a lag with q_ar1 <= {q_threshold:g} "
+            f"({significant} of {len(tests)} tests; {not_run} pair/lag combinations not "
+            f"tested). Assuming independent periods instead, {with_signal_independent} of "
+            f"{len(pair_out)} pairs have a lag with q <= {q_threshold:g}."
         ),
         "series": series_out,
         "excluded_series": excluded,
@@ -805,6 +969,7 @@ def lagged_connections(
         "tests_run": len(tests),
         "tests_not_run": not_run,
         "significant_tests": significant,
+        "significant_tests_if_independent": significant_independent,
         "method": {
             "grid": grid,
             "grid_rule": GRID_RULES[grid],
@@ -821,8 +986,11 @@ def lagged_connections(
             "transformed values exist; n is reported per test.",
             "correlation": "Pearson r",
             "p_value": P_RULE,
-            "multiple_testing": f"Benjamini-Hochberg q across all {len(tests)} tests run in "
-            "this call; q_by is the Benjamini-Yekutieli version, valid under any dependence.",
+            "multiple_testing": f"Benjamini-Hochberg across all {len(tests)} tests run in "
+            "this call: q over p (periods treated as independent) and q_ar1 over p_ar1; "
+            "q_by is the Benjamini-Yekutieli version of q_ar1, valid under any dependence "
+            "between tests.",
+            "significance": SIGNIFICANCE_RULE,
             "q_threshold": q_threshold,
             "q_threshold_default": DEFAULT_Q,
             "strongest": "Per pair, the tested lag(s) with the smallest p (ties broken by "
