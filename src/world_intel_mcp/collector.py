@@ -7,7 +7,11 @@ ensuring data accumulates 24/7 for semantic search and historical analysis.
 Every source outcome of a cycle (ok, degraded or error, with duration and
 payload hash) is also written to the history store (``history.py``) in the
 cache DB, in one transaction per cycle. That run log is what
-``intel_collection_health`` and the other history tools read.
+``intel_collection_health`` and the other history tools read. Each source
+runs inside ``fetcher.recording_stale_serves()``, so a run answered from
+expired cache is recorded as a stale-cache replay even when the source
+module dropped the fetcher's ``_stale`` marker. A failed write is retried
+once, then kept as a lost-cycle record beside the DB.
 
 Usage:
     intel-collector                    # Single collection cycle
@@ -37,8 +41,8 @@ logger = logging.getLogger("world-intel-collector")
 
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
-from .fetcher import Fetcher
-from .history import HistoryStore, SourceOutcome
+from .fetcher import Fetcher, recording_stale_serves
+from .history import HistoryStore, SourceOutcome, record_write_failure
 from .vector_store import VectorStore
 
 # All fetchable sources grouped by domain.
@@ -218,8 +222,9 @@ def _import_fetch_fn(module_path: str, fn_name: str):
 
 def _record_history(fetcher: Fetcher, outcomes: list) -> dict:
     """Write one cycle's outcomes to the history store in the fetcher's
-    cache DB. A history failure is reported in the cycle summary and the
-    log; it never fails the cycle itself."""
+    cache DB. A history failure never fails the cycle itself: it is
+    reported in the cycle summary and the log, and kept as a lost-cycle
+    record beside the DB that ``intel_collection_health`` reports."""
     db_path = getattr(getattr(fetcher, "cache", None), "db_path", None)
     if db_path is None:
         logger.warning("History not recorded: fetcher has no cache db_path")
@@ -227,21 +232,34 @@ def _record_history(fetcher: Fetcher, outcomes: list) -> dict:
             "recorded": 0,
             "error": "fetcher has no cache db_path; history not recorded",
         }
-    try:
-        store = HistoryStore(db_path)
+    for attempt in (1, 2):
         try:
-            return store.record_cycle(outcomes)
-        finally:
-            store.close()
-    except (sqlite3.Error, OSError) as exc:
-        logger.warning("History write failed: %s", exc)
-        return {"recorded": 0, "error": f"history write failed: {exc}"}
-    except Exception as exc:  # a history bug must not cost the cycle
-        logger.exception("History write failed unexpectedly")
-        return {
-            "recorded": 0,
-            "error": f"history write failed: {type(exc).__name__}: {exc}",
-        }
+            store = HistoryStore(db_path)
+            try:
+                return store.record_cycle(outcomes)
+            finally:
+                store.close()
+        except sqlite3.OperationalError as exc:
+            # Usually another writer held the lock past the busy timeout.
+            # The cycle's transaction rolled back, so a retry cannot write
+            # it twice.
+            if attempt == 1:
+                logger.warning("History write failed (%s); retrying once", exc)
+                continue
+            logger.warning("History write failed: %s", exc)
+            failure = {"recorded": 0, "error": f"history write failed: {exc}"}
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("History write failed: %s", exc)
+            failure = {"recorded": 0, "error": f"history write failed: {exc}"}
+        except Exception as exc:  # a history bug must not cost the cycle
+            logger.exception("History write failed unexpectedly")
+            failure = {
+                "recorded": 0,
+                "error": f"history write failed: {type(exc).__name__}: {exc}",
+            }
+        break
+    record_write_failure(db_path, outcomes, failure["error"])
+    return failure
 
 
 async def collect_once(
@@ -261,20 +279,26 @@ async def collect_once(
 
     # Per-source wall time and finish time, for the history run log.
     timings: dict[str, tuple[float, float]] = {}
+    # Per-source stale-cache serves. Sources run concurrently and name
+    # their fetches differently ("usgs" for earthquakes), so each run gets
+    # its own task-scoped log rather than a per-fetch-source counter.
+    stale_serves: dict[str, list] = {}
 
     async def _fetch_one(name: str, module_path: str, fn_name: str, kwargs: dict):
         budget = SOURCE_TIMEOUTS.get(name, timeout)
         t0 = time.monotonic()
-        try:
-            fn = _import_fetch_fn(module_path, fn_name)
-            result = await asyncio.wait_for(fn(fetcher, **kwargs), timeout=budget)
-            return name, result, None
-        except asyncio.TimeoutError:
-            return name, None, f"timeout ({budget}s)"
-        except Exception as exc:
-            return name, None, str(exc)[:120]
-        finally:
-            timings[name] = (time.monotonic() - t0, time.time())
+        with recording_stale_serves() as served:
+            stale_serves[name] = served
+            try:
+                fn = _import_fetch_fn(module_path, fn_name)
+                result = await asyncio.wait_for(fn(fetcher, **kwargs), timeout=budget)
+                return name, result, None
+            except asyncio.TimeoutError:
+                return name, None, f"timeout ({budget}s)"
+            except Exception as exc:
+                return name, None, str(exc)[:120]
+            finally:
+                timings[name] = (time.monotonic() - t0, time.time())
 
     tasks = [_fetch_one(name, mod, fn, kw) for name, mod, fn, kw in sources_to_run]
 
@@ -287,20 +311,25 @@ async def collect_once(
 
     for (source_name, _, _, _), item in zip(sources_to_run, results):
         duration, finished = timings.get(source_name, (None, time.time()))
+        served = tuple(stale_serves.get(source_name, ()))
         if isinstance(item, BaseException):
             reason = str(item)[:500] or repr(item)
             outcomes.append(
-                SourceOutcome(source_name, finished, duration, error=reason)
+                SourceOutcome(source_name, finished, duration, error=reason,
+                              stale_serves=served)
             )
         else:
             outcomes.append(
                 SourceOutcome(
-                    source_name, finished, duration, payload=item[1], error=item[2]
+                    source_name, finished, duration, payload=item[1], error=item[2],
+                    stale_serves=served,
                 )
             )
 
     for item in results:
-        if isinstance(item, Exception):
+        # BaseException, not Exception: gather() also returns a source's
+        # CancelledError or other BaseException, which cannot be unpacked.
+        if isinstance(item, BaseException):
             failures += 1
             errors.append(str(item)[:100])
             continue

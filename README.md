@@ -513,14 +513,14 @@ different, openly licensed data source; no ews code is used.
 | `intel_situation_brief` | Cited situational awareness brief, generated on demand over MCP: a bounded server-side overview (earthquakes, military flights, ACLED conflict events, wildfires, cyber threats, disease outbreaks, news, space weather, strategic posture, alert digest), synthesized via local Ollama or a mechanically-cited fallback when Ollama is unreachable |
 
 ### Collection History (4)
-History accrues only while the collector (`intel-collector`) runs; nothing before its first recorded cycle exists. Every observation keeps three dates: `observed_at` (the period the value describes, from the payload, or null when the payload has none), `published_at` (publisher release, when known) and `collected_at` (when this server saved it).
+History accrues only while the collector (`intel-collector`) runs; nothing before its first recorded cycle exists. Every observation keeps three dates: `observed_at` (the period the value describes, from the payload, or null when the payload has none), `published_at` (publisher release, when known) and `collected_at` (when this server saved it). A run answered from an expired cached copy is recorded as a stale-cache replay: it never counts as a success, and its observations are not stored, because a replay is not a new observation.
 
 | Tool | Description |
 |------|-------------|
-| `intel_collection_health` | Per-source health from the collector's run log: last attempt, last success, consecutive failures, overdue against the expected cadence, never-run sources, history storage size; states what it cannot prove (a fresh capture does not mean upstream observations are current) |
-| `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload |
+| `intel_collection_health` | Per-source health from the collector's run log: last attempt, last live success (a source served from stale cache reads `stale` and goes overdue), last fully ok capture, consecutive failures, overdue against the expected cadence, never-run sources, lost history writes, history storage size; states its data gaps and what it cannot prove (a fresh capture does not mean upstream observations are current) |
+| `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, such as `served stale cache`, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload (an outline of its keys past the replay cap) |
 | `intel_series_history` | One series' observations with all three dates, or the list of available series |
-| `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates) |
+| `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates), with how many observations and dated series were checked |
 
 ---
 

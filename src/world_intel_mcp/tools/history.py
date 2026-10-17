@@ -23,10 +23,12 @@ TOOLS: list[Tool] = [
         name="intel_collection_health",
         description=(
             "Per-source collection health from the collector's run log: last attempt, "
-            "last success, consecutive failures, overdue against the expected cadence "
-            "(default 300 s, overdue past 3 cadences), never-run sources, and history "
-            "storage size. States what it cannot prove: a fresh capture does not mean "
-            "upstream observations are current (see latest_observed_at). " + _ACCRUAL
+            "last live success (a stale-cache replay never counts; such a source reads "
+            "stale), last fully ok capture, consecutive failures, overdue against the "
+            "expected cadence (default 300 s, overdue past 3 cadences), never-run "
+            "sources, cycles whose history write failed, and history storage size. "
+            "States its data gaps and what it cannot prove: a fresh capture does not "
+            "mean upstream observations are current (see latest_observed_at). " + _ACCRUAL
         ),
         inputSchema={
             "type": "object",
@@ -42,9 +44,11 @@ TOOLS: list[Tool] = [
         name="intel_capture_history",
         description=(
             "A source's earlier collector captures, newest first: status (ok / degraded / "
-            "error with reason), duration, record count, payload hash and whether it "
-            "changed from the previous capture. Pass capture_id to replay one stored "
-            "payload. " + _ACCRUAL
+            "error with reason; a run answered from expired cache is degraded with "
+            "reason 'served stale cache'), duration, record count, payload hash and "
+            "whether it changed from the previous capture. Pass capture_id to replay one "
+            "stored payload (over the replay cap, an outline of its top-level keys). "
+            + _ACCRUAL
         ),
         inputSchema={
             "type": "object",
@@ -97,8 +101,8 @@ TOOLS: list[Tool] = [
         description=(
             "Values for the same observed_at that a later capture changed (for example "
             "USGS magnitude revisions, NOAA Kp updates), with both values and both "
-            "collection times. Only changes between this server's own captures are "
-            "visible. " + _ACCRUAL
+            "collection times, and how many observations and dated series were checked. "
+            "Only changes between this server's own captures are visible. " + _ACCRUAL
         ),
         inputSchema={
             "type": "object",

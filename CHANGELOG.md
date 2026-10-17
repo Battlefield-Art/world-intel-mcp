@@ -9,8 +9,24 @@
   with its reason and no record count, never an ok capture with zero
   records. An empty payload is degraded, because a quiet period and a
   silent upstream failure look the same.
+- A run that any upstream fetch answered from an expired cached copy is a
+  stale-cache replay: degraded, with the reason `served stale cache` and
+  the copy's age. The collector reads this from a per-task log the fetcher
+  keeps (`fetcher.recording_stale_serves()`, opened once per source task),
+  because most source modules rebuild their payload and drop the fetcher's
+  `_stale` marker. A replay's observations are counted but not stored: a
+  stale replay is not a new observation. A live capture that is degraded
+  for another reason (empty, partial, marked degraded) still stores the
+  points it has.
 - Payload bodies are kept once per distinct payload as compressed JSON
-  (top-level fetch-time stamps are ignored when hashing). Retention, each
+  (top-level fetch-time stamps and the stale markers are ignored when
+  hashing, so a fresh and a stale copy of the same data read unchanged).
+  A body over `WORLD_INTEL_HISTORY_MAX_BODY_BYTES` (default 4 MiB of
+  JSON, 0 = no cap) is not stored: its capture keeps the hash and says
+  why. Replay returns at most `WORLD_INTEL_HISTORY_REPLAY_MAX_BYTES`
+  (default 256 KiB, 0 = no cap) and an outline of the top-level keys
+  beyond that; replaying a capture whose body an earlier capture stored
+  names that capture's time. Retention, each
   0 = keep forever: `WORLD_INTEL_HISTORY_PAYLOAD_DAYS` (default 7) for
   bodies, `WORLD_INTEL_HISTORY_CAPTURE_DAYS` (default 30) for the run log,
   `WORLD_INTEL_HISTORY_DAYS` (default 365) for observations. Measured over
@@ -26,20 +42,52 @@
   NOAA Kp, USGS per-event magnitude, FRED-sourced central bank rates
   (curated rows are skipped), Yahoo index and commodity quotes (null
   `observed_at`: the payload carries no quote time).
-  `history.register_extractor()` is the public API for new sources.
+  `history.register_extractor()` is the public API for new sources; its
+  `expected=N` declares how many points a complete payload yields. The
+  Yahoo quote sources declare one per default symbol, so a run where some
+  symbols did not answer is degraded as `partial: X of N expected series`.
+  Observation dates must name a real calendar period (`2026-02-30` and
+  `0000` are rejected).
 - MCP tools `intel_collection_health`, `intel_capture_history`,
   `intel_series_history` and `intel_revisions`, and the CLI group
   `intel history health|captures|series|revisions`. History accrues only
   while the collector runs.
+- Collection health counts a success only from a live capture. A source
+  served from stale cache reads `stale`, keeps its last live success time
+  and goes overdue on schedule; consecutive failures count errors and
+  stale replays since the last live capture. Health also reports the last
+  fully ok capture (`last_ok_at`, `last_ok_age_s`; a Last ok column in
+  `intel history health`), `data_gaps` (an empty run log names the file
+  it read), lost history writes and what it cannot prove.
+  `intel_revisions` reports how many observations and dated series it
+  checked, and its data gaps.
 - The collector records every source outcome of a cycle in one
   transaction. Its summary gains a `history` key (and the CLI summary a
-  History line); a history write failure is reported there and in the
-  log, and never fails the cycle.
+  History line). A failed history write is retried once; when the retry
+  fails too, the lost cycle is appended to
+  `<cache db>-history-write-failures.jsonl` beside the DB (newest 500
+  kept), and collection health reports it with the sources it covered. A
+  history write failure never fails the cycle.
 - Expected cadence for health is 300 s (the shipped plist interval);
   `WORLD_INTEL_HISTORY_CADENCE_S` and
   `WORLD_INTEL_HISTORY_CADENCES=source=seconds,...` override it.
 
+### Fixed
+- A collector source task that ended in a `BaseException` that is not an
+  `Exception` (for example a cancelled task) made the cycle raise a
+  `TypeError` while tallying results, after the fetches finished, so that
+  cycle returned no summary and recorded no history. It now counts as a
+  failure and is recorded as an error capture.
+
 ### Notes
+- Known limits, stated in `intel_collection_health`'s `cannot_prove` and
+  the `history` module docs: stale data are seen only through the
+  fetcher's expired-cache fallback or a top-level `_stale` marker (a
+  source that awaits a fetch another task started reads live);
+  observation retention prunes by collection time, so a value unchanged
+  for longer than `WORLD_INTEL_HISTORY_DAYS` is stored again and its first
+  sighting reads as that later capture; a collector and a server that
+  resolve different cache paths keep different run logs.
 - The cycle summary's `successes` still counts a source that returned
   `{"error": ...}` (unchanged, pinned by an existing test); that run's
   history capture is an error.

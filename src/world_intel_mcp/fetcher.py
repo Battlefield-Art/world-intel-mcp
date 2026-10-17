@@ -3,13 +3,18 @@
 All external HTTP calls in world-intel-mcp go through this module.
 Stale-data fallback: when an API call fails, the last-known-good cached
 response is returned (marked with _stale=True) so dashboards never go blank.
+Source modules that rebuild their response drop that marker, so every
+stale serve is also appended to the caller's ``recording_stale_serves()``
+log, which the collector reads per source run.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
@@ -64,6 +69,45 @@ class BinaryResult:
     @property
     def ok(self) -> bool:
         return self.content is not None
+
+
+@dataclass(frozen=True)
+class StaleServe:
+    """One expired cache entry served because the live fetch failed."""
+
+    source: str
+    cache_key: str
+    age_seconds: float
+
+
+# The logs of every recording_stale_serves() block active in this context.
+# asyncio tasks inherit a copy of the context, so a task started inside a
+# block (asyncio.gather of sub-fetches) appends to the same lists.
+_STALE_SERVE_LOGS: contextvars.ContextVar[tuple[list[StaleServe], ...]] = (
+    contextvars.ContextVar("world_intel_stale_serve_logs", default=())
+)
+
+
+@contextlib.contextmanager
+def recording_stale_serves() -> Iterator[list[StaleServe]]:
+    """Collect the stale-cache serves made while the block runs.
+
+    Scoped to the current task and the tasks it starts, so concurrent
+    callers (one per collector source, one per MCP tool call) each see
+    only their own serves, whatever ``source`` name the fetches used.
+    Blocks nest: an outer block also sees an inner block's serves. A
+    caller that awaits a fetch another task started does not see that
+    task's serves.
+    """
+    served: list[StaleServe] = []
+    outer = _STALE_SERVE_LOGS.get()
+    reset_point = _STALE_SERVE_LOGS.set(outer + (served,))
+    try:
+        yield served
+    finally:
+        _STALE_SERVE_LOGS.reset(reset_point)
+
+
 _source_locks: dict[str, asyncio.Lock] = {}
 _source_last_call: dict[str, float] = {}
 
@@ -331,7 +375,8 @@ class Fetcher:
         response instead of receiving it silently. Non-dict responses
         (raw text/XML, lists) can't carry an inline marker the same way,
         so the circuit breaker's per-source stale-serve count is the
-        signal there.
+        signal there. Every serve, whatever its type, is also appended to
+        each active ``recording_stale_serves()`` log.
         """
         meta = self.cache.get_stale_meta(cache_key)
         if meta is None:
@@ -344,6 +389,9 @@ class Fetcher:
             cache_key,
             age_seconds,
         )
+        serve = StaleServe(source, cache_key, round(age_seconds, 1))
+        for log in _STALE_SERVE_LOGS.get():
+            log.append(serve)
         if isinstance(value, dict):
             value["_stale"] = True
             value["_stale_age_seconds"] = round(age_seconds, 1)

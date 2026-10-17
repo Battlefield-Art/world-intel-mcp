@@ -2674,18 +2674,21 @@ def history_health(ctx: click.Context, source: str | None) -> None:
     table.add_column("State")
     table.add_column("Last attempt")
     table.add_column("Last success")
+    table.add_column("Last ok")
     table.add_column("Fails", justify="right")
     table.add_column("Latest observed")
     table.add_column("Reason")
     styles = {"ok": "green", "degraded": "yellow", "never_run": "dim"}
     for row in data["sources"]:
         state = row["state"]
-        label = f"{state}, overdue" if state == "failing" and row.get("overdue") else state
+        overdue = state in ("failing", "stale") and row.get("overdue")
+        label = f"{state}, overdue" if overdue else state
         table.add_row(
             _cell(row["source"]),
             Text(label, style=styles.get(state, "red")),
             _cell(row.get("last_attempt_at") or "-"),
             _cell(row.get("last_success_at") or "-"),
+            _cell(row.get("last_ok_at") or "-"),
             str(row.get("consecutive_failures", "-")),
             _cell(row.get("latest_observed_at") or "-"),
             _cell(row.get("last_reason") or ""),
@@ -2699,6 +2702,7 @@ def history_health(ctx: click.Context, source: str | None) -> None:
         f"({storage['payload_bytes_compressed']:,} bytes compressed), "
         f"{storage['observations']} observations in {storage['series']} series."
     )
+    _print_data_gaps(data)
     for line in data["cannot_prove"]:
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 
@@ -2732,6 +2736,8 @@ def history_captures(
             console.print(f"[yellow]Gap:[/yellow] {escape(cap['payload_note'])}")
         if cap.get("payload") is not None:
             _print_json(cap["payload"])
+        elif cap.get("payload_outline") is not None:
+            _print_json(cap["payload_outline"])
         return
 
     captures = data["captures"]
@@ -2860,6 +2866,7 @@ def history_revisions(
                 rev["revised_collected_at"],
             )
         console.print(table)
+    _print_data_gaps(data)
     for line in data["cannot_prove"]:
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 
