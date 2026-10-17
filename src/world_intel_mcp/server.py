@@ -82,7 +82,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("world-intel-mcp")
 
-server = Server("world-intel-mcp")
+from . import __version__  # noqa: E402
+from .guide import SERVER_INSTRUCTIONS  # noqa: E402
+
+# version: serverInfo.version at initialize (without it the SDK reports
+# its own version). instructions: points a connecting model at the
+# research guide before its first tool call.
+server = Server("world-intel-mcp", version=__version__, instructions=SERVER_INSTRUCTIONS)
 
 # Shared infrastructure lives in runtime.py (Phase 26 split); the local
 # aliases remain as the module's public face — external readers (and the

@@ -23,7 +23,7 @@ TOOLS: list[Tool] = [
     # --- Conflict (3 tools) ---
     Tool(
         name="intel_acled_events",
-        description="Get armed conflict events from ACLED. Optional: country (name), days (default 7), limit (default 100). Requires ACLED_ACCESS_TOKEN.",
+        description="Get armed conflict events from ACLED. Optional: country (name), days (default 7), limit (default 100). Requires ACLED_EMAIL and ACLED_PASSWORD.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -43,7 +43,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_ucdp_events",
-        description="Get state-based violence events from UCDP GED. No API key needed. Optional: days (default 30).",
+        description="Get organized violence events (state-based, non-state and one-sided) from UCDP GED. Requires UCDP_ACCESS_TOKEN; without it, or when the API refuses it, returns an error. Optional: days (default 30), limit (page size, default 100).",
         inputSchema={
             "type": "object",
             "properties": {
@@ -54,7 +54,7 @@ TOOLS: list[Tool] = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max results (default 100)",
+                    "description": "Page size (default 100, max 1000); every page is fetched, so this does not cap results",
                     "default": 100,
                 },
             },

@@ -32,6 +32,11 @@ class Cache:
     def __init__(self, db_path: Path | None = None):
         explicit_path = db_path is not None
         self.db_path = Path(db_path) if db_path is not None else _default_db_path()
+        # Kept apart from db_path so a reader (the source-health resource)
+        # can tell that the temp-dir fallback below replaced the database
+        # it asked for.
+        self.requested_path = self.db_path
+        self.fell_back = False
         self._conn: sqlite3.Connection | None = None
         try:
             self._init_db()
@@ -47,6 +52,7 @@ class Cache:
             )
             self.close()
             self.db_path = fallback
+            self.fell_back = True
             self._init_db()
 
     def _init_db(self) -> None:
