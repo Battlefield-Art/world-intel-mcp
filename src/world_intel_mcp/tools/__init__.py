@@ -31,6 +31,7 @@ from . import (  # noqa: E402
     history,
     infrastructure,
     intelligence,
+    lagged_connections,
     liquidity,
     markets,
     news_market,
@@ -59,6 +60,7 @@ _MODULES = [
     vector,
     aoi,
     history,
+    lagged_connections,
     system,
 ]
 
