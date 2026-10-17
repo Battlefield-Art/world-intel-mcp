@@ -16,13 +16,19 @@ http and https, a never-loaded or failed panel showing no figures, the
 liquidity board keeping units and keeping amounts apart from flows, and the
 collection health panel listing problems and its cannot_prove text.
 
+The controller block (``research-panel``) runs the same way against a
+stand-in page: fake elements, a fetch the test answers by hand, a clock it
+sets and the 5 s interval it steps. Those tests pin one state per query, a
+kept copy after a failed refresh, refresh only while open and visible, the
+60 s cadence, no duplicate request, Esc and the age measured to now.
+
 Uses Starlette's TestClient without the context manager so lifespan
 (default-path Cache, vector store) never runs.
 
-Gaps / not covered: the controller half of the page (fetch, tabs, refresh
-timer, Esc) runs only in a browser and is checked by driving the dashboard
-live, not here; the JS tests skip when no JavaScript runtime is on PATH; no
-route is load tested.
+Gaps / not covered: the controller runs under a stand-in page, not a
+browser, so layout, real events and the sanitizer behind safe() are checked
+only by driving the dashboard live; the JS tests skip when no JavaScript
+runtime is on PATH (and fail under CI); no route is load tested.
 """
 
 from __future__ import annotations
@@ -723,6 +729,96 @@ def _js(tmp_path: Path, calls: list) -> list:
     return json.loads(proc.stdout)
 
 
+# The controller block (research-panel) runs against this stand-in for the
+# page: elements with the ids and classes it reads, a fetch whose answers the
+# scenario releases by hand, a clock it sets (Date.now) and the 5 s interval
+# it captures and steps. safe() is the identity here; its use is pinned by
+# test_research_markup_is_assigned_through_the_sanitizer.
+_FAKE_PAGE = r"""
+var CLOCK = { t: 1760727848000 };
+Date.now = function() { return CLOCK.t; };
+var RENDERS = [], REQUESTS = [], TICKS = [];
+function el(id, attrs, parent) {
+    var e = { id: id, hidden: false, value: '', attrs: attrs || {}, handlers: {}, cls: {}, parent: parent || null, _html: '' };
+    e.classList = { toggle: function(c, on) { e.cls[c] = on === undefined ? !e.cls[c] : !!on; } };
+    e.addEventListener = function(type, fn) { (e.handlers[type] = e.handlers[type] || []).push(fn); };
+    e.getAttribute = function(n) { return n in e.attrs ? e.attrs[n] : null; };
+    e.closest = function() { return e.parent; };
+    e.tagName = attrs && attrs.tag || 'DIV';
+    e.fire = function(type, ev) { (e.handlers[type] || []).forEach(function(fn) { fn(ev || { target: e, key: '' }); }); };
+    Object.defineProperty(e, 'innerHTML', { get: function() { return e._html; }, set: function(v) { e._html = v; RENDERS.push(v); } });
+    return e;
+}
+var CTL = {
+    liquidity: el('ctl-liq', { 'data-rs-for': 'liquidity' }),
+    situations: el('ctl-sit', { 'data-rs-for': 'situations' }),
+    stories: el('ctl-top', { 'data-rs-for': 'stories' })
+};
+var E = {
+    researchPanel: el('researchPanel'), researchToggle: el('researchToggle'), rsClose: el('rsClose'),
+    rsRefresh: el('rsRefresh'), rsBody: el('rsBody'),
+    rsLiqSort: el('rsLiqSort', { tag: 'SELECT' }, CTL.liquidity), rsSitHours: el('rsSitHours', { tag: 'SELECT' }, CTL.situations),
+    rsSitSort: el('rsSitSort', { tag: 'SELECT' }, CTL.situations), rsSitKind: el('rsSitKind', { tag: 'SELECT' }, CTL.situations),
+    rsTopHours: el('rsTopHours', { tag: 'SELECT' }, CTL.stories), rsTopOutlets: el('rsTopOutlets', { tag: 'SELECT' }, CTL.stories)
+};
+E.researchPanel.hidden = true;
+E.rsLiqSort.value = 'biggest_move'; E.rsSitHours.value = '24'; E.rsSitSort.value = 'covered'; E.rsSitKind.value = 'all';
+E.rsTopHours.value = '24'; E.rsTopOutlets.value = '3';
+var TABS = ['liquidity', 'situations', 'stories', 'health'].map(function(n) { return el('tab-' + n, { 'data-rs-tab': n }); });
+var SELECTS = ['rsLiqSort', 'rsSitHours', 'rsSitSort', 'rsSitKind', 'rsTopHours', 'rsTopOutlets'].map(function(k) { return E[k]; });
+globalThis.$ = function(sel) { return E[sel.replace('#', '')]; };
+globalThis.$$ = function(sel) {
+    if (sel === '.rs-tab') return TABS;
+    if (sel === '.rs-ctl') return [CTL.liquidity, CTL.situations, CTL.stories];
+    if (sel === '.rs-ctl select') return SELECTS;
+    throw new Error('unexpected selector ' + sel);
+};
+var DOC = el('document');
+DOC.hidden = false;
+globalThis.document = DOC;
+globalThis.safe = function(h) { return h; };
+globalThis._helpOverlay = null;
+globalThis.setInterval = function(fn, ms) { TICKS.push({ fn: fn, ms: ms }); return TICKS.length; };
+globalThis.fetch = function(url) {
+    return new Promise(function(resolve, reject) { REQUESTS.push({ url: url, at: CLOCK.t, resolve: resolve, reject: reject }); });
+};
+async function settle() { for (var i = 0; i < 5; i++) await new Promise(function(r) { setTimeout(r, 0); }); }
+async function answer(i, status, body) {
+    REQUESTS[i].resolve({ status: status, text: function() { return Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)); } });
+    await settle();
+}
+async function fail(i, message) { REQUESTS[i].reject(new Error(message)); await settle(); }
+async function advance(ms) {  // the clock moves in 5 s steps; each step runs the captured interval
+    for (var t = 0; t < ms; t += 5000) { CLOCK.t += 5000; TICKS.forEach(function(k) { k.fn(); }); await settle(); }
+}
+function body() { return E.rsBody.innerHTML; }
+function urls() { return REQUESTS.map(function(r) { return r.url; }); }
+var OUT = {};
+"""
+
+
+def _controller(tmp_path: Path, scenario: str, payloads: dict) -> dict:
+    """Run the render and controller blocks of index.html against the fake
+    page, then ``scenario`` (top-level await allowed); returns OUT."""
+    src = _INDEX.read_text()
+    script = tmp_path / "research_controller.mjs"
+    script.write_text(
+        _FAKE_PAGE
+        + "var P = " + json.dumps(payloads) + ";\n"
+        + _section(src, "research-render") + "\n"
+        + _section(src, "research-panel") + "\n"
+        + "try {\n" + scenario + "\n} catch (e) { OUT.scenario_error = String(e && e.stack || e); }\n"
+        + "console.log(JSON.stringify(OUT));\n"
+    )
+    proc = subprocess.run(
+        [*_js_command(), str(script)], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert "scenario_error" not in out, out["scenario_error"]
+    return out
+
+
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -907,6 +1003,125 @@ def test_kept_copy_age_is_measured_to_now(tmp_path) -> None:
     assert f"Showing the copy loaded {_CLOCK}, 61 s before that attempt. That copy is 62 min old now." in text
     assert f"Loaded {_CLOCK}, 62 min ago; refreshes every 60 s" in _Markup(old_loaded).text
     assert f"Loaded {_CLOCK}; refreshes every 60 s" in _Markup(fresh_loaded).text
+
+
+_LIQ = "/api/liquidity-board?sort="
+
+
+def _liquidity_payloads() -> dict:
+    old = copy.deepcopy(_BOARD)
+    old["indicators"][0]["label"] = "Answer to the old query"
+    return {"board": _BOARD, "old": old}
+
+
+def test_controller_one_state_per_query_drops_the_late_answer(tmp_path) -> None:
+    """A control changed while a request is out sends the new query at once;
+    the old query's answer, arriving late, is never shown for the new one."""
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        E.rsLiqSort.value = 'newest';
+        E.rsLiqSort.fire('change');
+        OUT.urls = urls();
+        await answer(0, 200, P.old);
+        OUT.after_old = body();
+        await answer(1, 200, P.board);
+        OUT.after_new = body();
+    """, _liquidity_payloads())
+    assert out["urls"] == [_LIQ + "biggest_move", _LIQ + "newest"]
+    assert "Answer to the old query" not in out["after_old"]
+    assert "Loading: first request sent" in out["after_old"]
+    assert "Fed total assets" in out["after_new"]
+    assert "Answer to the old query" not in out["after_new"]
+
+
+def test_controller_refreshes_every_60_s_only_while_open_and_visible(tmp_path) -> None:
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await answer(0, 200, P.board);
+        OUT.interval_ms = TICKS.map(function(k) { return k.ms; });
+        await advance(55000);
+        OUT.at_55 = REQUESTS.length;
+        await advance(5000);
+        OUT.at_60 = REQUESTS.length;
+        OUT.second_after_ms = REQUESTS[1].at - REQUESTS[0].at;
+        E.rsRefresh.fire('click');
+        OUT.refresh_while_in_flight = REQUESTS.length;
+        await answer(1, 200, P.board);
+        document.hidden = true;
+        await advance(180000);
+        OUT.while_hidden = REQUESTS.length;
+        document.hidden = false;
+        await advance(5000);
+        OUT.visible_again = REQUESTS.length;
+        await answer(2, 200, P.board);
+        E.rsClose.fire('click');
+        OUT.closed = E.researchPanel.hidden;
+        await advance(180000);
+        OUT.while_closed = REQUESTS.length;
+    """, _liquidity_payloads())
+    assert out["interval_ms"] == [5000]
+    assert out["at_55"] == 1
+    assert out["at_60"] == 2
+    assert out["second_after_ms"] == 60_000
+    assert out["refresh_while_in_flight"] == 2  # no duplicate request
+    assert out["while_hidden"] == 2
+    assert out["visible_again"] == 3
+    assert out["closed"] is True
+    assert out["while_closed"] == 3
+
+
+def test_controller_failed_refresh_keeps_the_copy_and_first_failure_is_unavailable(tmp_path) -> None:
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await fail(0, 'offline');
+        OUT.first_failed = body();
+        E.rsRefresh.fire('click');
+        await answer(1, 200, P.board);
+        OUT.loaded = body();
+        await advance(60000);
+        await answer(2, 503, { error: 'FRED down' });
+        OUT.refresh_failed = body();
+    """, _liquidity_payloads())
+    first = _Markup(out["first_failed"]).text
+    assert "UNAVAILABLE request failed: Error: offline" in first
+    assert "Fed total assets" not in first
+    assert "Fed total assets" in out["loaded"]
+    kept = _Markup(out["refresh_failed"]).text
+    assert "REFRESH FAILED HTTP 503: FRED down" in kept
+    assert "Fed total assets" in kept  # the earlier good copy, still shown
+    assert "That copy is 60 s old now." in kept
+
+
+def test_controller_passes_now_and_esc_closes_the_panel(tmp_path) -> None:
+    """Reopened five minutes after the last load, the panel says how long
+    ago that copy loaded before the refresh answers; Esc closes it."""
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await answer(0, 200, P.board);
+        document.fire('keydown', { key: 'Escape', target: document });
+        OUT.closed_by_esc = E.researchPanel.hidden;
+        CLOCK.t += 300000;
+        E.researchToggle.fire('click');
+        OUT.reopened = RENDERS[RENDERS.length - 2];
+        OUT.requests = REQUESTS.length;
+    """, _liquidity_payloads())
+    assert out["closed_by_esc"] is True
+    assert "Loaded " in out["reopened"] and ", 5 min ago; refreshes every 60 s" in out["reopened"]
+    assert out["requests"] == 2
+
+
+def test_attempt_error_table(tmp_path) -> None:
+    cases = [
+        (200, {"count": 0}, None),
+        (503, {"error": "x"}, "x"),
+        (200, {"error": {"a": 1}}, '{"a":1}'),
+        (500, {"detail": "x"}, "no error message in the response"),
+        (502, None, "response was not JSON"),
+        (200, [], "response was not JSON"),
+        (None, None, "no response"),
+    ]
+    out = _js(tmp_path, [["researchAttemptError", http, data] for http, data, _ in cases])
+    assert out == [expected for _, _, expected in cases]
 
 
 def test_no_comparable_feed_reads_as_not_measurable_never_as_no_growth(tmp_path) -> None:
