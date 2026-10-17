@@ -20,8 +20,9 @@ Publishers, as measured on 2026-10-17 (HTTP status, robots.txt, terms):
   through the GOV.UK Content API (200, keyless, at most 10 requests per second
   per client). The time series is published only as an ODS spreadsheet, on
   assets.publishing.service.gov.uk (robots.txt 404). ODS is a zip of XML, read
-  here with zipfile and ElementTree, so no new dependency. GOV.UK content is
-  under the Open Government Licence v3.0.
+  here with zipfile and the standard library's expat parser, streamed with
+  DTDs refused, so no new dependency. GOV.UK content is under the Open
+  Government Licence v3.0.
 * Frontex is not built. Its monthly detections file is XLSX only and sits under
   /assets/, which https://www.frontex.europa.eu/robots.txt (200) disallows for
   every user agent. Nothing under /assets/ is requested.
@@ -51,6 +52,17 @@ Gaps / not covered:
   2026-10-17 their figures matched the ODS).
 * robots.txt is not re-read at run time; the CBP path rule is pinned as read on
   2026-10-17.
+* Redirects: the shared fetcher follows them, and only the first URL is
+  checked against the host, scheme and robots.txt rules, so a redirect could
+  reach a path those rules refuse and the response would name the first URL.
+  Download caps are checked after the whole decoded body is in memory. Both
+  are fetcher behaviour and are left to the fetcher.
+* Memory, measured 2026-10-17 (peak RSS growth): the ODS limits bound what the
+  reader keeps and what expat holds, but zipfile reads the whole central
+  directory when it opens an archive (400,000 empty entries, a 35 MB file:
+  about 230 MB), bounded only by the 32 MiB download cap. The CBP CSV is parsed
+  whole: a crafted 64 MiB file with every row a new citizenship took about
+  470 MB (the live 6.7 MB file about 21 MB).
 * Neither file has a person identifier, so neither series counts unique
   people; the responses say so as a tool note, not in the publishers' words.
 """
@@ -64,16 +76,20 @@ import io
 import json
 import logging
 import re
+import string
 import time
 import weakref
-import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
+from xml.parsers import expat
+
+import httpx
 
 from ..fetcher import BinaryResult, Fetcher
 
@@ -98,7 +114,8 @@ def _usage(source: str, error: str) -> dict[str, Any]:
 
 
 def _degraded(source: str, error: str, reason: str) -> dict[str, Any]:
-    return {"error": error, "degraded": True, "reason": reason, "source": source, "timestamp": _now()}
+    return {"error": error, "degraded": True, "reason": reason, "data_gaps": [f"No figures: {error}."],
+            "source": source, "timestamp": _now()}
 
 
 def _is_int(value: Any) -> bool:
@@ -128,6 +145,17 @@ class _SourceError(Exception):
         super().__init__(message)
         self.reason = reason
         self.message = message
+
+
+def _unreadable(reason: str, what: str, exc: Exception) -> _SourceError:
+    """Any failure to read a downloaded file is a format problem with a reason, never a bare
+    error: a parser fault (RecursionError, an encrypted zip member, csv.Error, a wrong JSON type)
+    would otherwise skip the stale copy and reach the client as a traceback. MemoryError is
+    not caught by callers, so running out of memory is never reported as a bad file."""
+    if isinstance(exc, ValueError):
+        return _SourceError(reason, f"{what} not readable: {exc}")
+    logger.warning("%s not readable", what, exc_info=exc)
+    return _SourceError(reason, f"{what} not readable: {type(exc).__name__}: {exc}")
 
 
 _refresh_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
@@ -195,7 +223,7 @@ CBP_SOURCE = "cbp"
 CBP_DATASET_PAGE = "https://www.cbp.gov/document/stats/nationwide-encounters"
 CBP_STATS_PAGE = "https://www.cbp.gov/newsroom/stats/nationwide-encounters"
 CBP_CACHE_KEY = "border_crossings:cbp_encounters"
-_CBP_SCHEMA = 1
+_CBP_SCHEMA = 2  # 2: unreadable-byte rows and skipped links are recorded
 _CBP_TTL = 43200  # 12 h; CBP posts one file a month
 _CBP_PAGE_MAX_BYTES = 8 * 1024 * 1024
 _CBP_CSV_MAX_BYTES = 64 * 1024 * 1024  # the August 2026 file is 6.7 MB
@@ -206,6 +234,12 @@ _CBP_FILE_NAME = re.compile(
     r"/nationwide-encounters-fy(?P<fy_from>\d{2})-fy(?P<fy_to>\d{2})(?:-(?P<month>[a-z]{3}))?-aor(?:_(?P<dup>\d+))?\.csv$"
 )
 _CBP_FILE_FOLDER = re.compile(r"^/sites/default/files/(\d{4}-\d{2})/[^/]+$")
+# Any encounters CSV link, to name the ones the file-name rule above cannot read; the by-state
+# files are a different table, read by nothing here, so they are not named.
+_CBP_ENCOUNTERS_CSV = re.compile(r"nationwide-encounters[^/]*\.csv$", re.IGNORECASE)
+_CBP_STATE_CSV = re.compile(r"-state(?:_\d+)?\.csv$", re.IGNORECASE)
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
 _LAST_MODIFIED = re.compile(r"Last Modified:\s*([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),\s*(\d{4})")
 
 CBP_REGIONS = {"southwest": "Southwest Land Border", "northern": "Northern Land Border", "other": "Other"}
@@ -279,8 +313,10 @@ _CBP_UNIT = "encounters (enforcement events) per calendar month"
 _CBP_DATE_SEMANTICS = (
     "Each figure counts the encounters in one calendar month. CBP labels months by fiscal year (1 October to "
     "30 September), so October to December belong to the next fiscal year: FY2026 October is October 2025. "
-    "'(FYTD)' is CBP's label for the fiscal year in progress. Figures are as of the file's posting "
-    "(dataset.file_date) and can change in later files until CBP's fiscal-year close."
+    "'(FYTD)' is CBP's label for the fiscal year in progress. A fiscal year's period_end is 30 September, "
+    "except for the year the file ends in, where it is the last day of the file's last month (the data end). "
+    "Figures are as of the file's posting (dataset.file_date) and can change in later files until CBP's "
+    "fiscal-year close."
 )
 _CBP_NOTES = (
     _FLOW_NOT_STOCK,
@@ -329,10 +365,19 @@ def _shift_months(period: str, delta: int) -> str:
 def parse_cbp_csv(text: str) -> dict[str, Any]:
     """Aggregate CBP's encounters CSV into compact cells, summing out the area of responsibility.
 
-    Raises ValueError when the header lacks a needed column or no data row is readable.
+    A row that cannot be read is counted in ``unreadable_rows`` and left out: a short row, a bad
+    number or month, an empty dimension, U+FFFD (a byte that was not UTF-8) in a column read
+    here, a record the CSV reader rejects, or one that spans lines (a quote left open; none of
+    CBP's fields holds a newline), counted once per line. A row whose U+FFFD sits only in a
+    column not read here (such as the area of responsibility) is counted, and noted in
+    ``rows_with_bad_bytes_elsewhere``. Raises ValueError when the header lacks a needed column
+    or no data row is readable.
     """
-    reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
-    names = [name.strip() for name in next(reader, None) or []]
+    reader = csv.reader(io.StringIO(text.lstrip("\ufeff"), newline=""))
+    try:
+        names = [name.strip() for name in next(reader, None) or []]
+    except csv.Error as exc:
+        raise ValueError(f"CBP file header not readable: {exc}") from exc
     missing = [column for column in _CBP_COLUMNS.values() if column not in names]
     if missing:
         raise ValueError(f"CBP file lacks the columns {', '.join(missing)}")
@@ -341,14 +386,29 @@ def parse_cbp_csv(text: str) -> dict[str, Any]:
     vocab: dict[str, dict[str, int]] = {dim: {} for dim in _CBP_DIMS}
     totals: dict[tuple, int] = defaultdict(int)
     fiscal_year_labels: dict[str, str] = {}
-    rows = unreadable = 0
-    for row in reader:
+    rows = unreadable = bad_bytes_elsewhere = 0
+    line = reader.line_num
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            break
+        except csv.Error:
+            span = max(reader.line_num - line, 1)
+            rows, unreadable, line = rows + span, unreadable + span, reader.line_num
+            continue
+        span, line = reader.line_num - line, reader.line_num
         if not any(cell.strip() for cell in row):
+            continue
+        if span > 1:
+            rows, unreadable = rows + span, unreadable + span
             continue
         rows += 1
         try:
             if len(row) < width:
                 raise ValueError("short row")
+            if any("\ufffd" in row[i] for i in index.values()):
+                raise ValueError("a byte that is not UTF-8")
             label = row[index["fiscal_year"]].strip()
             match = re.match(r"(\d{4})\b", label)
             if match is None:
@@ -364,6 +424,7 @@ def parse_cbp_csv(text: str) -> dict[str, Any]:
         except ValueError:
             unreadable += 1
             continue
+        bad_bytes_elsewhere += any("\ufffd" in cell for cell in row)
         keys = tuple(vocab[dim].setdefault(value, len(vocab[dim])) for dim, value in zip(_CBP_DIMS, values))
         fiscal_year_labels.setdefault(str(fiscal_year), label)
         totals[(period, *keys)] += count
@@ -381,6 +442,7 @@ def parse_cbp_csv(text: str) -> dict[str, Any]:
         "cells": [[position[key[0]], *key[1:], count] for key, count in totals.items()],
         "rows": rows,
         "unreadable_rows": unreadable,
+        "rows_with_bad_bytes_elsewhere": bad_bytes_elsewhere,
     }
 
 
@@ -441,14 +503,62 @@ def _page_text(page: _PageParser) -> str:
     return " ".join("".join(page.chunks).split())
 
 
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986 section 5.2.4 for an absolute path: "." and ".." segments resolved."""
+    segments = path.split("/")[1:]
+    kept: list[str] = []
+    for segment in segments:
+        if segment == "..":
+            if kept:
+                kept.pop()
+        elif segment != ".":
+            kept.append(segment)
+    trailing = bool(kept) and bool(segments) and segments[-1] in (".", "..")
+    return "/" + "/".join(kept) + ("/" if trailing else "")
+
+
+def _normalized_path(raw_path: str) -> str:
+    """A request path as the server resolves it (RFC 3986 section 6.2.2): escapes of unreserved
+    characters decoded (so %61 is "a" and %2E%2E is ".."), other escapes upper-cased, then
+    dot segments removed."""
+    def unescape(match: re.Match) -> str:
+        char = chr(int(match.group(1), 16))
+        return char if char in _UNRESERVED else "%" + match.group(1).upper()
+
+    return _remove_dot_segments(_ESCAPE.sub(unescape, raw_path))
+
+
 def _cbp_link(href: str) -> tuple[str, str, bool] | None:
-    """(absolute URL, path, robots.txt allows it) of a link on www.cbp.gov, else None."""
-    url = urljoin(CBP_DATASET_PAGE, href).split("#", 1)[0]
-    parts = urlsplit(url)
-    if parts.scheme != "https" or parts.hostname != _CBP_HOST:
+    """(URL to request, its path, robots.txt allows it) of a link on https://www.cbp.gov, else None.
+
+    Only https on the standard port with no credentials is accepted. The URL is rebuilt from
+    the normalized path and must come back from httpx with that exact path, so the robots.txt
+    rule is checked on the path httpx sends, not on the link as written: a dot segment or a
+    percent-escape cannot reach the disallowed directory. A path that reaches it only once
+    every escape is decoded (an encoded "/") is treated as disallowed too.
+    """
+    try:
+        first = httpx.URL(urljoin(CBP_DATASET_PAGE, href.strip()))
+        if first.scheme != "https" or first.host != _CBP_HOST or first.port is not None or first.userinfo:
+            return None
+        raw_path, _, query = first.raw_path.decode("ascii").partition("?")
+        path = _normalized_path(raw_path)
+        target = path + (f"?{query}" if query else "")
+        url = f"https://{_CBP_HOST}{target}"
+        # httpx 0.28 sends a normalized path unchanged (no difference in 300,000 random paths
+        # tried); this refuses the link should a later httpx parse it differently.
+        if httpx.URL(url).raw_path.decode("ascii") != target:
+            return None
+    except (httpx.InvalidURL, ValueError):  # ValueError covers UnicodeDecodeError and urljoin's
         return None
-    allowed = not any(parts.path.startswith(prefix) for prefix in _CBP_DISALLOWED_PREFIXES)
-    return url, parts.path, allowed
+    decoded = _remove_dot_segments(unquote(path))
+    allowed = not any(p.startswith(prefix) for p in (path, decoded) for prefix in _CBP_DISALLOWED_PREFIXES)
+    return url, path, allowed
+
+
+def _shown(href: str) -> str:
+    """A link as written, for a message: any credentials replaced by ***, at most 200 characters."""
+    return re.sub(r"//[^/@]*@", "//***@", href.strip())[:200]
 
 
 def _us_date(value: str) -> str | None:
@@ -456,6 +566,44 @@ def _us_date(value: str) -> str | None:
         return datetime.strptime(value, "%m/%d/%Y").date().isoformat()
     except ValueError:
         return None
+
+
+def _file_rank(path: str) -> tuple | None:
+    """Rank of an encounters-by-AOR file from its name, or None when the name cannot be read."""
+    name = _CBP_FILE_NAME.search(path)
+    month = (name["month"] or "").upper() if name else ""
+    if name is None or (month and month not in _MONTHS):
+        return None
+    folder = _CBP_FILE_FOLDER.match(path)
+    return (
+        int(name["fy_to"]),
+        (_MONTHS.index(month) - 9) % 12 + 1 if month else 12,  # through which fiscal month: OCT=1 .. SEP=12
+        folder.group(1) if folder else "",
+        int(name["dup"] or -1),
+    )
+
+
+def _skipped_links(page: _PageParser) -> list[str]:
+    """Encounters CSV links (by-state files aside) that ``_latest_file`` cannot consider: off
+    https://www.cbp.gov (another host or scheme, a port, credentials), not a URL at all, or
+    named in a way the file-name rule cannot read (say "-sept-"). Any of them may be newer than
+    the file read, so the response names them instead of falling back to an older file in
+    silence."""
+    skipped: list[str] = []
+    for href, _text in page.anchors:
+        try:
+            path = urlsplit(urljoin(CBP_DATASET_PAGE, href.strip())).path
+        except ValueError:
+            path = href.strip()  # a link that does not parse is judged by its text
+        if not _CBP_ENCOUNTERS_CSV.search(path) or _CBP_STATE_CSV.search(path):
+            continue
+        link = _cbp_link(href)
+        if link is not None and _file_rank(link[1]) is not None:
+            continue
+        shown = _shown(href) if link is None else link[0]
+        if shown not in skipped:
+            skipped.append(shown)
+    return skipped
 
 
 def _latest_file(page: _PageParser) -> dict[str, Any] | None:
@@ -466,17 +614,9 @@ def _latest_file(page: _PageParser) -> dict[str, Any] | None:
         if link is None:
             continue
         url, path, allowed = link
-        name = _CBP_FILE_NAME.search(path)
-        month = (name["month"] or "").upper() if name else ""
-        if name is None or (month and month not in _MONTHS):
+        rank = _file_rank(path)
+        if rank is None:
             continue
-        folder = _CBP_FILE_FOLDER.match(path)
-        rank = (
-            int(name["fy_to"]),
-            (_MONTHS.index(month) - 9) % 12 + 1 if month else 12,  # through which fiscal month: OCT=1 .. SEP=12
-            folder.group(1) if folder else "",
-            int(name["dup"] or -1),
-        )
         if not allowed:
             if newest_disallowed is None or rank > newest_disallowed[0]:
                 newest_disallowed = (rank, url)
@@ -503,10 +643,12 @@ def latest_cbp_file(html: str) -> dict[str, Any] | None:
     """The newest nationwide encounters CSV (by area of responsibility) on CBP's dataset page.
 
     Ranked by its last fiscal year, then the fiscal month it runs through (from the
-    file name), then its upload folder. A link under a path robots.txt disallows, or off
-    www.cbp.gov, is never chosen; when such a link looks newer than the one chosen, its
-    URL is returned as ``newer_disallowed_url`` so the response can say so. ``file_date``
-    and ``size_bytes`` come from the page's file table (its Date and Size columns).
+    file name), then its upload folder. A link under a path robots.txt disallows (judged on
+    the normalized path, see ``_cbp_link``), or off https://www.cbp.gov, is never chosen;
+    when a disallowed link looks newer than the one chosen, its URL is returned as
+    ``newer_disallowed_url`` so the response can say so. ``url`` is the URL as requested
+    (rebuilt from the normalized path). ``file_date`` and ``size_bytes`` come from the
+    page's file table (its Date and Size columns).
     """
     return _latest_file(_parse_page(html))
 
@@ -532,22 +674,31 @@ async def _fetch_cbp_dataset(fetcher: Fetcher) -> dict[str, Any]:
     )
     if page_result.content is None:
         raise _SourceError("cbp_fetch_failed", f"CBP dataset page unavailable: {_why(page_result)}")
-    page = _parse_page(page_result.content.decode("utf-8", errors="replace"))
-    latest = _latest_file(page)
+    try:
+        page = _parse_page(page_result.content.decode("utf-8", errors="replace"))
+        latest, skipped, text = _latest_file(page), _skipped_links(page), _page_text(page)
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise _unreadable("cbp_unexpected_format", "CBP dataset page", exc) from exc
     if latest is None:
         raise _SourceError(
             "cbp_unexpected_format",
             "CBP's dataset page lists no nationwide encounters CSV by area of responsibility at a path "
-            "robots.txt allows",
+            "robots.txt allows" + (f"; links it has that this tool cannot read: {', '.join(skipped[:5])}"
+                                   if skipped else ""),
         )
     csv_result = await fetcher.get_bytes(latest["url"], CBP_SOURCE, headers=_HEADERS, max_bytes=_CBP_CSV_MAX_BYTES)
     if csv_result.content is None:
         raise _SourceError("cbp_fetch_failed", f"CBP encounters file unavailable: {_why(csv_result)}")
     try:
-        dataset = parse_cbp_csv(csv_result.content.decode("utf-8-sig"))
-    except ValueError as exc:  # includes UnicodeDecodeError
-        raise _SourceError("cbp_unexpected_format", f"CBP encounters file not readable: {exc}") from exc
-    text = _page_text(page)
+        # A byte that is not UTF-8 becomes U+FFFD, which parse_cbp_csv counts per row instead of
+        # failing the file over it.
+        dataset = parse_cbp_csv(csv_result.content.decode("utf-8-sig", errors="replace"))
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise _unreadable("cbp_unexpected_format", "CBP encounters file", exc) from exc
     dataset["meta"] = {
         "title": latest["title"],
         "url": latest["url"],
@@ -556,6 +707,7 @@ async def _fetch_cbp_dataset(fetcher: Fetcher) -> dict[str, Any]:
         "file_size_bytes": latest["size_bytes"],
         "page_last_modified": _last_modified(text),
         "newer_disallowed_url": latest["newer_disallowed_url"],
+        "skipped_links": skipped,
         "fetched_at": _now(),
     }
     dataset["page_caveats_missing"] = [c for c in _CBP_PAGE_CAVEATS if " ".join(c.split()) not in text]
@@ -667,6 +819,14 @@ async def fetch_us_border_encounters(
         gaps.append(
             f"{dataset['unreadable_rows']} of the file's {dataset['rows']} rows could not be read and are not counted."
         )
+    if dataset["rows_with_bad_bytes_elsewhere"]:
+        gaps.append(f"{dataset['rows_with_bad_bytes_elsewhere']} row(s) of the file have bytes that are not UTF-8 in "
+                    "columns this tool does not read (such as the area of responsibility); they are counted.")
+    if meta["skipped_links"]:
+        shown = meta["skipped_links"]
+        gaps.append(f"CBP's dataset page links {len(shown)} encounters file(s) this tool cannot read (off "
+                    "https://www.cbp.gov, or named outside the pattern it ranks), so a newer file may have been "
+                    f"passed over: {', '.join(shown[:5])}{' ...' if len(shown) > 5 else ''}.")
     if meta.get("newer_disallowed_url"):
         gaps.append(f"CBP lists a newer-looking encounters file at a path its robots.txt disallows "
                     f"({meta['newer_disallowed_url']}); it is not read, so these may not be CBP's newest figures.")
@@ -698,7 +858,7 @@ async def fetch_us_border_encounters(
         entry: dict[str, Any] = {
             "fiscal_year": fiscal_year,
             "period_start": f"{fiscal_year - 1}-10-01",
-            "period_end": f"{fiscal_year}-09-30",
+            "period_end": min(f"{fiscal_year}-09-30", latest_end),  # the data end, for the year in progress
             "months_reported": len(members),
             "complete": len(members) == 12,
             "fiscal_year_to_date": "FYTD" in label.upper(),
@@ -778,13 +938,28 @@ _UK_TTL = 10800  # 3 h; its change history shows 72 updates from 1 August to 16 
 _UK_API_MAX_BYTES = 8 * 1024 * 1024
 _UK_ODS_MAX_BYTES = 32 * 1024 * 1024  # the 16 October 2026 file is 76,787 bytes
 _UK_FILE_HOSTS = {"assets.publishing.service.gov.uk", "www.gov.uk"}
+_UK_SHEETS = ("SB_01", "SB_02", "Notes")  # the sheets read; any other sheet is skipped unread
 _ODS_TYPE = "application/vnd.oasis.opendocument.spreadsheet"
-_ODS_MAX_XML_BYTES = 64 * 1024 * 1024  # the live content.xml is 2.5 MB
+# Limits for one file, over every sheet read, each checked before anything is expanded; a file
+# past one is refused. The 16 October 2026 file: content.xml 2.5 MB, nested 10 deep, 117 distinct
+# names; the three sheets read hold 3,683 rows, 15,633 cells and 6,371 characters of text.
+_ODS_MAX_XML_BYTES = 16 * 1024 * 1024
 _ODS_MAX_COLUMNS = 256
 _ODS_MAX_ROWS = 200_000
-_T = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
-_O = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
-_X = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+_ODS_MAX_CELLS = 1_000_000
+_ODS_MAX_TEXT = 4 * 1024 * 1024  # characters
+_ODS_MAX_DEPTH = 10_000
+_ODS_MAX_NAMES = 2_000  # distinct element, attribute and namespace-prefix names
+# Bytes between two "<": expat holds a start tag, with all its attributes, until it closes, at
+# about 24 times its size (1,000,000 attributes: 10.9 MB of XML, 265 MB). Nothing in a tag can be
+# "<", so this bounds every tag; a text run that long is refused too. The live file's longest: 706.
+_ODS_MAX_RUN = 1024 * 1024
+_ODS_CHUNK = 64 * 1024
+# Names as expat reports them with namespace_separator=" ": "<namespace URI> <local name>".
+_T = "urn:oasis:names:tc:opendocument:xmlns:table:1.0 "
+_O = "urn:oasis:names:tc:opendocument:xmlns:office:1.0 "
+_X = "urn:oasis:names:tc:opendocument:xmlns:text:1.0 "
+_ODS_TYPED = ("float", "percentage", "currency", "date", "boolean", "time")
 
 _UK_MEASURE = (
     "Migrants and boats detected crossing the English Channel in small boats and arriving in the UK "
@@ -795,7 +970,11 @@ _UK_UNIT = "people (migrants) and boats per day or week; preventions per week"
 _UK_DATE_SEMANTICS = (
     "SB_01 'Date' is the day of arrival. SB_02 'Week ending' is the Sunday that closes a Monday-to-Sunday week "
     "(period_start is six days earlier); the Home Office notes the activity may have occurred on any day "
-    "within that week. Months, years and year to date are this tool's sums of SB_01 days. "
+    "within that week. Months, years and year to date are this tool's sums of SB_01 days. Year to date runs "
+    "from 1 January to the file's last day; prior_year is the same calendar dates a year earlier (29 February "
+    "compares with 28 February). prior_year and the changes are given only when every day of both spans has an "
+    "SB_01 row, so neither side is a partial sum; the spans differ by one day when one of them holds 29 "
+    "February. year_to_date.complete, days_reported and days_in_period describe the current span. "
     "dataset.public_updated_at is when GOV.UK last changed the publication."
 )
 _UK_NOTES = (
@@ -811,112 +990,336 @@ _UK_TERMS = "Open Government Licence v3.0 (GOV.UK terms); the time series is Cro
 _UK_NOTE_ROW = re.compile(r"^\d+\.\s")
 
 
-def _repeat(element: ET.Element, attribute: str) -> int:
-    raw = element.get(_T + attribute)
+class UnreadableCell:
+    """A typed ODS cell whose value, or a cell whose repeat count, could not be read. It keeps
+    its column, so the cells before it keep their positions: a caller that needs the column has
+    no figure there and says so, and one that does not can name it as unused."""
+
+    __slots__ = ("detail",)
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, UnreadableCell) and other.detail == self.detail
+
+    def __hash__(self) -> int:
+        return hash((UnreadableCell, self.detail))
+
+    def __repr__(self) -> str:
+        return f"UnreadableCell({self.detail!r})"
+
+
+def _brief(value: Any) -> str:
+    """repr of a value read from a file, cut to 40 characters, for a message."""
+    return repr(value[:40] if isinstance(value, str) else value)
+
+
+def _repeat_count(raw: str | None) -> int | None:
+    """A table:number-*-repeated value (1 when absent), or None when it is not a number."""
     if raw is None:
         return 1
     try:
         return max(int(raw), 1)
     except ValueError:
-        raise ValueError(f"unreadable table:{attribute} {raw!r}") from None
+        return None
 
 
-def _ods_inline(element: ET.Element) -> str:
-    parts = [element.text or ""]
-    for child in element:
-        if child.tag == _X + "s":
-            try:
-                parts.append(" " * min(max(int(child.get(_X + "c", "1")), 1), 1024))
-            except ValueError:
-                parts.append(" ")
-        elif child.tag == _X + "tab":
-            parts.append("\t")
-        elif child.tag == _X + "line-break":
-            parts.append("\n")
-        elif child.tag not in (_O + "annotation", _X + "note"):
-            parts.append(_ods_inline(child))
-        parts.append(child.tail or "")
-    return "".join(parts)
+def _spaces(raw: str | None) -> int:
+    """How many spaces a text:s stands for: its text:c, at least 1 and at most 1,024."""
+    try:
+        return min(max(int(raw or "1"), 1), 1024)
+    except ValueError:
+        return 1
 
 
-def _ods_text(cell: ET.Element) -> str:
-    paragraphs: list[str] = []
-
-    def walk(node: ET.Element) -> None:
-        for child in node:
-            if child.tag in (_X + "p", _X + "h"):
-                paragraphs.append(_ods_inline(child))
-            elif child.tag != _O + "annotation":  # cell comments are not cell content
-                walk(child)
-
-    walk(cell)
-    return "\n".join(paragraphs)
-
-
-def _ods_value(cell: ET.Element) -> Any:
-    kind = cell.get(_O + "value-type")
+def _ods_typed(kind: str, attrs: dict[str, str]) -> Any:
+    """The value of a typed cell, read from its attributes (never from its display text)."""
     if kind in ("float", "percentage", "currency"):
-        raw = cell.get(_O + "value")
+        raw = attrs.get(_O + "value")
         try:
             return float(raw)
         except (TypeError, ValueError):
-            raise ValueError(f"unreadable number {raw!r}") from None
+            return UnreadableCell(f"unreadable number {_brief(raw)}")
     if kind == "date":
-        raw = cell.get(_O + "date-value") or ""
+        raw = attrs.get(_O + "date-value") or ""
         try:
             moment = datetime.fromisoformat(raw)
         except ValueError:
-            raise ValueError(f"unreadable date {raw!r}") from None
+            return UnreadableCell(f"unreadable date {_brief(raw)}")
         if moment.tzinfo is None and moment.time() == datetime.min.time():
             return moment.date()
         return moment
     if kind == "boolean":
-        return (cell.get(_O + "boolean-value") or "").lower() == "true"
+        return (attrs.get(_O + "boolean-value") or "").lower() == "true"
     if kind == "time":
-        return cell.get(_O + "time-value")
-    if kind == "string" and cell.get(_O + "string-value") is not None:
-        return cell.get(_O + "string-value")
-    text = _ods_text(cell)
-    return text if text else None
+        return attrs.get(_O + "time-value")
+    return attrs[_O + "string-value"]  # a string cell that carries its value as an attribute
 
 
-def _ods_row(row: ET.Element) -> list[Any]:
-    values: list[Any] = []
-    pending_blank = 0
-    for cell in row:
-        if cell.tag not in (_T + "table-cell", _T + "covered-table-cell"):
-            continue
-        repeat = _repeat(cell, "number-columns-repeated")
-        value = _ods_value(cell)
+class _OdsReader:
+    """content.xml streamed through expat: no tree is built and nothing recurses. A sheet not
+    asked for is skipped without collecting anything; everything kept (rows, cells, text) counts
+    against one budget for the whole file, checked before a repeat count is expanded. Nesting
+    depth, the number of distinct names and the length of a tag are capped too, because expat
+    keeps a record of every open element, every name it has seen and the whole of the tag it is
+    reading, whichever sheet they are in."""
+
+    def __init__(self, sheets: Iterable[str] | None) -> None:
+        self.wanted = None if sheets is None else set(sheets)
+        self.tables: dict[str, list[list[Any] | None]] = {}
+        self.sheets_seen = 0
+        self.rows_kept = self.cells_kept = self.text_kept = 0
+        self.names: set[str] = set()
+        self.depth = 0
+        # Depth of the open sheet, row, text cell and paragraph (0: none open). The content of
+        # an element that is not read is skipped up to its end tag, at depth skip_to.
+        self.sheet_at = self.row_at = self.cell_at = self.para_at = self.skip_to = 0
+        self.sheet: list[list[Any] | None] = []
+        self.row: list[Any] = []
+        self.row_repeat: str | None = None
+        self.blank = 0  # blank cells after the row's last value: counted, never expanded
+        self.row_done = False  # the row's later cells are not read
+        self.cell_repeat = 1
+        self.text = io.StringIO()
+        self.paragraphs = 0
+        parser = expat.ParserCreate(namespace_separator=" ")
+        parser.buffer_text = True
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        # Entities can only be declared in a DTD, and ODF content.xml never has one, so refusing
+        # it in the parser rules out entity expansion and external entities in any encoding.
+        parser.StartDoctypeDeclHandler = self._refuse_dtd
+        parser.EntityDeclHandler = self._refuse_dtd
+        parser.StartNamespaceDeclHandler = self._prefix
+        self.parser = parser
+        self._read_content()
+
+    def read(self, handle: Any) -> dict[str, list[list[Any] | None]]:
+        run = 0  # bytes since the last "<"
+        try:
+            while chunk := handle.read(_ODS_CHUNK):
+                first = chunk.find(b"<")
+                if run + (len(chunk) if first == -1 else first) > _ODS_MAX_RUN:
+                    raise ValueError(f"ODS content.xml holds a tag or text run longer than {_ODS_MAX_RUN >> 20} MiB; "
+                                     "refused")
+                last = chunk.rfind(b"<")
+                run = run + len(chunk) if last == -1 else len(chunk) - last - 1
+                self.parser.Parse(chunk, False)
+            self.parser.Parse(b"", True)
+        except expat.ExpatError as exc:
+            raise ValueError(f"ODS content.xml is not well-formed XML: {exc}") from exc
+        return self.tables
+
+    @staticmethod
+    def _refuse_dtd(*_args: Any) -> None:
+        raise ValueError("ODS content.xml declares a DTD; refused")
+
+    def _read_content(self) -> None:
+        self.parser.StartElementHandler = self._start
+        self.parser.EndElementHandler = self._end
+        self.parser.CharacterDataHandler = self._data
+
+    def _skip_content(self) -> None:
+        """Skip what is inside the element just opened; its own end tag is handled as usual."""
+        self.skip_to = self.depth
+        self.parser.StartElementHandler = self._skip_start
+        self.parser.EndElementHandler = self._skip_end
+        self.parser.CharacterDataHandler = None
+
+    def _skip_start(self, name: str, attrs: dict[str, str]) -> None:
+        self._enter(name, attrs)
+
+    def _skip_end(self, name: str) -> None:
+        if self.depth == self.skip_to:
+            self.skip_to = 0
+            self._read_content()
+            self._end(name)
+        else:
+            self.depth -= 1
+
+    def _enter(self, name: str, attrs: dict[str, str]) -> None:
+        self.depth += 1
+        if self.depth > _ODS_MAX_DEPTH:
+            raise ValueError(f"ODS content.xml nests elements more than {_ODS_MAX_DEPTH:,} deep; refused")
+        if name not in self.names:
+            self._new_name(name)
+        for key in attrs:
+            if key not in self.names:
+                self._new_name(key)
+
+    def _prefix(self, prefix: str | None, _uri: str | None) -> None:
+        key = f"xmlns:{prefix or ''}"
+        if key not in self.names:
+            self._new_name(key)
+
+    def _new_name(self, name: str) -> None:
+        if len(self.names) >= _ODS_MAX_NAMES:
+            raise ValueError(f"ODS content.xml uses more than {_ODS_MAX_NAMES:,} distinct element, attribute "
+                             "and prefix names; refused")
+        self.names.add(name)
+
+    def _start(self, name: str, attrs: dict[str, str]) -> None:
+        self._enter(name, attrs)
+        if self.cell_at:
+            self._cell_content(name, attrs)
+        elif self.row_at:
+            if self.row_done or name not in (_T + "table-cell", _T + "covered-table-cell"):
+                self._skip_content()  # only a row's own cells are its cells
+            else:
+                self._open_cell(attrs)
+        elif self.sheet_at:
+            if name == _T + "table-row":
+                self.row_at, self.row, self.row_repeat = self.depth, [], attrs.get(_T + "number-rows-repeated")
+                self.blank, self.row_done = 0, False
+            elif name == _T + "table":
+                self._skip_content()  # a table inside a sheet is not one of its rows
+        elif name == _T + "table":
+            self._open_sheet(attrs)
+
+    def _open_sheet(self, attrs: dict[str, str]) -> None:
+        self.sheets_seen += 1
+        name = attrs.get(_T + "name") or f"Sheet{self.sheets_seen}"
+        if self.wanted is not None and name not in self.wanted:
+            self._skip_content()
+            return
+        if name in self.tables:
+            raise ValueError(f"ODS file has two sheets named {_brief(name)}")
+        self.sheet = self.tables[name] = []
+        self.sheet_at = self.depth
+
+    def _open_cell(self, attrs: dict[str, str]) -> None:
+        raw = attrs.get(_T + "number-columns-repeated")
+        repeat = _repeat_count(raw)
+        if repeat is None:
+            # Where the next cell starts is unknown, so the row's later cells are not read.
+            self._add(UnreadableCell(f"unreadable table:number-columns-repeated {_brief(raw)}"), 1)
+            self.row_done = True
+            self._skip_content()
+            return
+        kind = attrs.get(_O + "value-type")
+        if kind in _ODS_TYPED or (kind == "string" and _O + "string-value" in attrs):
+            value = _ods_typed(kind, attrs)
+            if isinstance(value, str):
+                self._count_text(len(value))
+            self._add(value, repeat)
+            self._skip_content()  # a typed cell's display text is not its value
+            return
+        self.cell_at, self.cell_repeat = self.depth, repeat
+        self.text, self.paragraphs = io.StringIO(), 0
+
+    def _cell_content(self, name: str, attrs: dict[str, str]) -> None:
+        if self.para_at:
+            if name == _X + "s":
+                self._write(" " * _spaces(attrs.get(_X + "c")))
+            elif name == _X + "tab":
+                self._write("\t")
+            elif name == _X + "line-break":
+                self._write("\n")
+            elif name not in (_O + "annotation", _X + "note"):
+                return  # a span or a link only wraps text
+            self._skip_content()  # nothing inside these is the cell's text
+        elif name in (_X + "p", _X + "h"):
+            if self.paragraphs:
+                self._write("\n")
+            self.paragraphs += 1
+            self.para_at = self.depth
+        elif name in (_O + "annotation", _X + "note", _T + "table"):
+            self._skip_content()  # a comment, a note or a table inside the cell is not its text
+
+    def _data(self, data: str) -> None:
+        if self.para_at:
+            self._write(data)
+
+    def _write(self, text: str) -> None:
+        self._count_text(len(text))
+        self.text.write(text)
+
+    def _count_text(self, length: int) -> None:
+        self.text_kept += length
+        if self.text_kept > _ODS_MAX_TEXT:
+            raise ValueError(f"the ODS sheets read hold more than {_ODS_MAX_TEXT:,} characters of text; refused")
+
+    def _end(self, name: str) -> None:
+        depth = self.depth
+        self.depth -= 1
+        if depth == self.para_at:
+            self.para_at = 0
+        elif depth == self.cell_at:
+            self.cell_at = 0
+            text = self.text.getvalue()
+            self.text.close()
+            self._add(text if text else None, self.cell_repeat)
+        elif depth == self.row_at:
+            self.row_at = 0
+            self._close_row()
+        elif depth == self.sheet_at:
+            self.sheet_at = 0
+
+    def _add(self, value: Any, repeat: int) -> None:
         if value is None:
-            pending_blank += repeat  # counted, never expanded: trailing blanks are dropped
-            continue
-        if len(values) + pending_blank >= _ODS_MAX_COLUMNS:
-            break
-        values.extend([None] * pending_blank)
-        pending_blank = 0
-        values.extend([value] * min(repeat, _ODS_MAX_COLUMNS - len(values)))
-        if len(values) >= _ODS_MAX_COLUMNS:
-            break
-    return values
+            self.blank += repeat
+            return
+        row = self.row
+        if len(row) + self.blank >= _ODS_MAX_COLUMNS:
+            self.row_done = True
+            return
+        row.extend([None] * self.blank)
+        self.blank = 0
+        row.extend([value] * min(repeat, _ODS_MAX_COLUMNS - len(row)))
+        if len(row) >= _ODS_MAX_COLUMNS:
+            self.row_done = True
+
+    def _close_row(self) -> None:
+        values = self.row
+        if not values:
+            return  # a blank row is dropped, whatever its repeat count
+        repeat = _repeat_count(self.row_repeat)
+        unreadable = repeat is None
+        if unreadable:
+            repeat = 1  # how many rows it stands for is unknown: it is kept as one unreadable row
+        if self.rows_kept + repeat > _ODS_MAX_ROWS:
+            raise ValueError(f"the ODS sheets read hold more than {_ODS_MAX_ROWS:,} rows; refused")
+        cells = 0 if unreadable else repeat * len(values)
+        if self.cells_kept + cells > _ODS_MAX_CELLS:
+            raise ValueError(f"the ODS sheets read hold more than {_ODS_MAX_CELLS:,} cells; refused")
+        self.rows_kept += repeat
+        self.cells_kept += cells
+        if unreadable:
+            self.sheet.append(None)
+        else:
+            self.sheet.extend(list(values) for _ in range(repeat))
 
 
-def read_ods_tables(data: bytes) -> dict[str, list[list[Any]]]:
-    """Every sheet of an ODS spreadsheet as rows of cell values.
+def read_ods_tables(data: bytes, sheets: Iterable[str] | None = None) -> dict[str, list[list[Any] | None]]:
+    """The sheets of an ODS spreadsheet (every one, or those named in ``sheets``) as rows of cell values.
 
     Numbers come back as float, dates as ``datetime.date`` (``datetime`` when the cell has a
     time of day), booleans as bool, anything else as its text with paragraphs joined by newlines;
-    an empty cell is None. Blank rows are dropped and trailing blank cells trimmed, so the repeat
-    counts that pad a sheet to 16,384 columns and 1,048,576 rows are never expanded. Columns past
-    the 256th are not read. Raises ValueError for anything that is not a readable ODS spreadsheet.
+    an empty cell is None. A typed cell whose value cannot be read is an ``UnreadableCell`` in its
+    column, and a row whose repeat count cannot be read is None. Blank rows are dropped and
+    trailing blank cells trimmed, so the repeat counts that pad a sheet to 16,384 columns and
+    1,048,576 rows are never expanded. Columns past the 256th are not read, nor is any sheet
+    not asked for. Raises ValueError for anything that is not a readable ODS spreadsheet, for a
+    DTD, and for a file past one of these limits: in all the sheets read together, 200,000 rows,
+    1,000,000 cells or 4,194,304 characters of text; in content.xml, 16 MiB, elements nested
+    10,000 deep, 2,000 distinct names or a tag (or text run) longer than 1 MiB.
     """
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise ValueError("not an ODS file (not a zip archive)") from exc
+    reader = _OdsReader(sheets)
     try:
         with archive:
             names = set(archive.namelist())
+            for member in ("mimetype", "content.xml"):
+                # zipfile inflates a bzip2 or lzma chunk whole, however large it expands, so only
+                # the two methods ODF allows are opened; for those, zipfile stops a member at the
+                # size its directory entry gives, which the content.xml check below bounds.
+                if member in names and archive.getinfo(member).compress_type not in (
+                        zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    raise ValueError(f"ODS {member} is compressed with method "
+                                     f"{archive.getinfo(member).compress_type}, not stored or deflated")
             if "mimetype" in names:
                 with archive.open("mimetype") as handle:
                     mimetype = handle.read(200).decode("ascii", errors="replace").strip()
@@ -925,38 +1328,13 @@ def read_ods_tables(data: bytes) -> dict[str, list[list[Any]]]:
             if "content.xml" not in names:
                 raise ValueError("ODS file has no content.xml")
             if archive.getinfo("content.xml").file_size > _ODS_MAX_XML_BYTES:
-                raise ValueError("ODS content.xml is larger than 64 MiB")
+                raise ValueError(f"ODS content.xml is larger than {_ODS_MAX_XML_BYTES >> 20} MiB")
             with archive.open("content.xml") as handle:
-                xml_bytes = handle.read(_ODS_MAX_XML_BYTES + 1)
-    except (zipfile.BadZipFile, zlib.error, EOFError, OSError, NotImplementedError) as exc:
+                tables = reader.read(handle)
+    except (zipfile.BadZipFile, zlib.error, EOFError, OSError, NotImplementedError, RuntimeError) as exc:
+        # RuntimeError: an encrypted member; the others: a damaged or truncated archive.
         raise ValueError(f"ODS archive not readable: {exc}") from exc
-    if len(xml_bytes) > _ODS_MAX_XML_BYTES:
-        raise ValueError("ODS content.xml is larger than 64 MiB")
-    # Entities can only be declared in a DTD, so refusing one rules out entity
-    # expansion ("billion laughs") and external entities (XXE) before the
-    # standard-library parser runs;
-    # ODF content.xml never carries a DTD. A hardened third-party XML parser
-    # would be a new dependency.
-    if b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
-        raise ValueError("ODS content.xml declares a DTD; refused")
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as exc:
-        raise ValueError(f"ODS content.xml is not well-formed XML: {exc}") from exc
-    tables: dict[str, list[list[Any]]] = {}
-    for table in root.iter(_T + "table"):
-        name = table.get(_T + "name") or f"Sheet{len(tables) + 1}"
-        rows: list[list[Any]] = []
-        for row in table.iter(_T + "table-row"):
-            values = _ods_row(row)
-            if not values:
-                continue
-            repeat = _repeat(row, "number-rows-repeated")
-            if len(rows) + repeat > _ODS_MAX_ROWS:
-                raise ValueError(f"sheet {name!r} has more than {_ODS_MAX_ROWS} rows")
-            rows.extend(list(values) for _ in range(repeat))
-        tables[name] = rows
-    if not tables:
+    if reader.sheets_seen == 0:
         raise ValueError("ODS file has no sheets")
     return tables
 
@@ -965,11 +1343,14 @@ def _header(value: Any) -> str:
     return " ".join(value.split()).lower() if isinstance(value, str) else ""
 
 
-def _locate(tables: dict[str, list[list[Any]]], preferred: str, first: str) -> tuple[str, int, dict] | None:
+def _locate(tables: dict[str, list[list[Any] | None]], preferred: str,
+            first: str) -> tuple[str, int, dict] | None:
     """(sheet, header row index, column positions) of the table whose header names `first` and the arrivals."""
     order = [preferred, *[name for name in tables if name != preferred]] if preferred in tables else list(tables)
     for name in order:
         for i, row in enumerate(tables[name][:30]):
+            if row is None:
+                continue
             heads = [_header(value) for value in row]
             if first in heads and "migrants arrived" in heads and "boats arrived" in heads:
                 def find(label: str) -> int | None:
@@ -1022,15 +1403,28 @@ _UK_COLUMN_LABELS = {
 }
 
 
-def _uk_series(table: list[list[Any]], located: tuple[str, int, dict], keys: tuple[str, ...],
+def _unreadable_cells(row: list[Any], skip: set[int]) -> int:
+    return sum(isinstance(value, UnreadableCell) for j, value in enumerate(row) if j not in skip)
+
+
+def _uk_series(table: list[list[Any] | None], located: tuple[str, int, dict], keys: tuple[str, ...],
                gaps: list[str]) -> list[list[Any]]:
     sheet, header_row, columns = located
     for key in keys:
         if columns[key] is None:
             gaps.append(f"{sheet} has no {_UK_COLUMN_LABELS[key]!r} column; those figures are null.")
+    used = {columns[key] for key in ("when", *keys)} - {None}  # the date and the figures
     records: dict[str, list[Any]] = {}
     undated = unreadable = duplicates = 0
+    lost_rows = sum(row is None for row in table)
+    # Unreadable cells away from the date and figures (above the data, or in another column, Notes
+    # included: only a text cell can say "Revised") are named, not fatal.
+    elsewhere = sum(_unreadable_cells(row, set()) for row in table[:header_row + 1] if row is not None)
     for row in table[header_row + 1:]:
+        if row is None:
+            continue
+        elsewhere += _unreadable_cells(row, used)
+
         def cell(key: str) -> Any:
             col = columns[key]
             return row[col] if col is not None and col < len(row) else None
@@ -1053,20 +1447,26 @@ def _uk_series(table: list[list[Any]], located: tuple[str, int, dict], keys: tup
         note = cell("notes")
         record.append(isinstance(note, str) and "revised" in note.lower())
         records[day.isoformat()] = record
+    if lost_rows:
+        gaps.append(f"{lost_rows} row(s) of {sheet} could not be read (a repeat count that is not a number); "
+                    "any figures in them are not counted.")
     if undated:
         gaps.append(f"{undated} row(s) of {sheet} have no readable date and are not counted.")
     if unreadable:
         gaps.append(f"{unreadable} cell(s) of {sheet} are neither a count nor '-' and are read as null.")
     if duplicates:
         gaps.append(f"{duplicates} row(s) of {sheet} repeat an earlier date; the first is kept.")
+    if elsewhere:
+        gaps.append(f"{elsewhere} cell(s) of {sheet} outside the figures read could not be read; they are not used.")
     return [records[key] for key in sorted(records)]
 
 
-def parse_uk_small_boats(tables: dict[str, list[list[Any]]]) -> dict[str, Any]:
+def parse_uk_small_boats(tables: dict[str, list[list[Any] | None]]) -> dict[str, Any]:
     """Daily (SB_01) and weekly (SB_02) rows plus the numbered notes of the Home Office time series.
 
     Daily rows are [date, migrants, boats, uncontrolled, revised]; weekly rows are
     [week ending, migrants, boats, uncontrolled, prevented, events prevented, revised].
+    Rows and cells ``read_ods_tables`` could not read are left out and named in ``gaps``.
     Raises ValueError when there is no daily table or it has no dated rows.
     """
     gaps: list[str] = []
@@ -1085,11 +1485,22 @@ def parse_uk_small_boats(tables: dict[str, list[list[Any]]]) -> dict[str, Any]:
         weekly = _uk_series(tables[located_weekly[0]], located_weekly,
                             ("migrants", "boats", "uncontrolled", "prevented", "events"), gaps)
     notes: list[str] = []
+    lost_notes = elsewhere = 0
     for row in tables.get("Notes", []):
+        if row is None or (row and isinstance(row[0], UnreadableCell)):
+            lost_notes += 1
+            continue
+        elsewhere += _unreadable_cells(row, {0})
         if row and isinstance(row[0], str):
             text = "\n".join(line for line in (" ".join(part.split()) for part in row[0].split("\n")) if line)
             if _UK_NOTE_ROW.match(text):
                 notes.append(text)
+    if lost_notes:
+        gaps.append(f"{lost_notes} row(s) of the Notes sheet could not be read; any Home Office caveats in them "
+                    "are missing.")
+    if elsewhere:
+        gaps.append(f"{elsewhere} cell(s) of the Notes sheet outside its first column could not be read; they are "
+                    "not used.")
     if not notes:
         gaps.append("the ODS has no numbered notes on a Notes sheet; the Home Office caveats are missing.")
     return {"schema": _UK_SCHEMA, "daily": daily, "weekly": weekly, "notes": notes, "gaps": gaps}
@@ -1099,7 +1510,7 @@ def _uk_attachment(item: Any) -> dict[str, Any]:
     details = item.get("details") if isinstance(item, dict) else None
     attachments = details.get("attachments") if isinstance(details, dict) else None
     candidates = [
-        a for a in attachments or []
+        a for a in (attachments if isinstance(attachments, list) else [])
         if isinstance(a, dict)
         and (a.get("content_type") == _ODS_TYPE or str(a.get("filename") or "").lower().endswith(".ods"))
     ]
@@ -1107,13 +1518,21 @@ def _uk_attachment(item: Any) -> dict[str, Any]:
         raise _SourceError("uk_unexpected_format", "the GOV.UK publication lists no ODS time-series attachment")
     candidates.sort(key=lambda a: "time series" not in str(a.get("title") or "").lower())
     chosen = candidates[0]
-    url = urljoin("https://www.gov.uk/", str(chosen.get("url") or ""))
-    parts = urlsplit(url)
-    if parts.scheme != "https" or parts.hostname not in _UK_FILE_HOSTS:
+    href = chosen.get("url")
+    if not isinstance(href, str) or not href.strip():
+        raise _SourceError("uk_unexpected_format", "the time-series attachment has no URL")
+    # Checked as httpx parses it, since that is the URL requested: https on the standard port,
+    # no credentials, a GOV.UK file host and a path to a file.
+    try:
+        url = httpx.URL(urljoin("https://www.gov.uk/", href.strip()))
+    except (httpx.InvalidURL, ValueError):
+        url = None
+    if (url is None or url.scheme != "https" or url.host not in _UK_FILE_HOSTS or url.port is not None
+            or url.userinfo or url.path in ("", "/")):
         raise _SourceError("uk_unexpected_format",
-                           f"the time-series attachment is not on GOV.UK ({parts.hostname or 'no host'})")
+                           f"the time-series attachment is not a file on GOV.UK over https ({_shown(href)})")
     size = chosen.get("file_size")
-    return {"url": url, "title": chosen.get("title"), "file_size_bytes": size if _is_int(size) else None}
+    return {"url": str(url), "title": chosen.get("title"), "file_size_bytes": size if _is_int(size) else None}
 
 
 async def _fetch_uk_dataset(fetcher: Fetcher) -> dict[str, Any]:
@@ -1124,17 +1543,28 @@ async def _fetch_uk_dataset(fetcher: Fetcher) -> dict[str, Any]:
         raise _SourceError("uk_fetch_failed", f"GOV.UK Content API unavailable: {_why(api)}")
     try:
         item = json.loads(api.content)
-    except ValueError as exc:
-        raise _SourceError("uk_unexpected_format", f"GOV.UK Content API did not return JSON: {exc}") from exc
+    except MemoryError:
+        raise
+    except Exception as exc:  # ValueError for text that is not JSON, RecursionError for absurd nesting
+        raise _unreadable("uk_unexpected_format", "GOV.UK Content API response", exc) from exc
     attachment = _uk_attachment(item)
+    history = item["details"].get("change_history")  # _uk_attachment found item["details"] a dict
+    if history is not None and not isinstance(history, list):
+        raise _SourceError("uk_unexpected_format", "GOV.UK Content API response not readable: its change_history "
+                           f"is not a list ({type(history).__name__})")
     ods = await fetcher.get_bytes(attachment["url"], UK_SOURCE, headers=_HEADERS, max_bytes=_UK_ODS_MAX_BYTES)
     if ods.content is None:
         raise _SourceError("uk_fetch_failed", f"Home Office time series unavailable: {_why(ods)}")
     try:
-        dataset = parse_uk_small_boats(read_ods_tables(ods.content))
-    except ValueError as exc:
-        raise _SourceError("uk_unexpected_format", f"Home Office time series not readable: {exc}") from exc
-    history = [h for h in (item.get("details") or {}).get("change_history") or [] if isinstance(h, dict)]
+        tables = read_ods_tables(ods.content, _UK_SHEETS)
+        if not {"SB_01", "SB_02"} <= tables.keys():
+            tables = read_ods_tables(ods.content)  # a table renamed: _locate looks in every sheet
+        dataset = parse_uk_small_boats(tables)
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise _unreadable("uk_unexpected_format", "Home Office time series", exc) from exc
+    history = [h for h in history or [] if isinstance(h, dict)]
     newest = max(history, key=lambda h: str(h.get("public_timestamp") or ""), default={})
     dataset["meta"] = {
         "title": attachment["title"],
@@ -1257,24 +1687,36 @@ async def fetch_uk_small_boat_arrivals(
             "boats_uncontrolled_landings": _total(rows, 3),
         })
 
-    ytd_rows = [row for row in daily if row[0] >= f"{last_day.year:04d}-01-01"]
+    # Year to date against the same calendar dates a year earlier, compared only when every day of
+    # both spans has an SB_01 row: a sum over fewer days on one side would read as a fall.
+    ytd_start = date(last_day.year, 1, 1)
+    ytd_days = _iso_days(ytd_start, last_day)
+    ytd_rows = [by_date[d] for d in ytd_days if d in by_date]
     prior_start = date(last_day.year - 1, 1, 1)
     prior_end = (last_day.replace(day=28) if (last_day.month, last_day.day) == (2, 29) else last_day).replace(
         year=last_day.year - 1)
-    prior_rows = [by_date.get(d) for d in _iso_days(prior_start, prior_end)]
+    prior_days = _iso_days(prior_start, prior_end)
+    prior_rows = [by_date[d] for d in prior_days if d in by_date]
+    short = [f"{start} to {end} ({len(rows)} of {len(span)} days)"
+             for start, end, rows, span in ((ytd_start, last_day, ytd_rows, ytd_days),
+                                            (prior_start, prior_end, prior_rows, prior_days))
+             if len(rows) < len(span)]
     prior = None
-    if all(prior_rows):
+    if short:
+        gaps.append(f"SB_01 has no complete daily series for {' or '.join(short)}, so year to date has no "
+                    "prior-year comparison.")
+    else:
         prior = {"period_start": prior_start.isoformat(), "period_end": prior_end.isoformat(),
                  "migrants_arrived": _total(prior_rows, 1), "boats_arrived": _total(prior_rows, 2)}
-    else:
-        gaps.append(f"SB_01 has no complete daily series for {prior_start} to {prior_end}, so year to date has no "
-                    "prior-year comparison.")
     current_migrants, current_boats = _total(ytd_rows, 1), _total(ytd_rows, 2)
     prior_migrants = prior["migrants_arrived"] if prior else None
     prior_boats = prior["boats_arrived"] if prior else None
     year_to_date = {
-        "period_start": f"{last_day.year:04d}-01-01",
+        "period_start": ytd_start.isoformat(),
         "period_end": last_day.isoformat(),
+        "complete": len(ytd_rows) == len(ytd_days),
+        "days_reported": len(ytd_rows),
+        "days_in_period": len(ytd_days),
         "migrants_arrived": current_migrants,
         "boats_arrived": current_boats,
         "prior_year": prior,
