@@ -38,8 +38,8 @@
   call or with no metric at the 5 observations volatility needs. Reading
   the baselines no longer creates an empty database file.
 - The dashboard's Trends panel shows a count that could not be computed as
-  `?` instead of 0, stays visible when weekly trends report an error or
-  time out, and lists the data gaps, or the error when there are none.
+  a dimmed `?` instead of 0, stays visible when weekly trends report an
+  error or time out, and lists the error and every data gap.
 - Apply per-source request spacing to every HTTP retry, including JSON,
   text, XML and binary fetches.
 - Known open: each retry now waits out its source's spacing and the
