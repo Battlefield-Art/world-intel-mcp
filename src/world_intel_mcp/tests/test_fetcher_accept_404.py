@@ -2,15 +2,17 @@
 
 A 404 is normally a definitive answer: not retried, not a source
 failure. An API that answers "no data" with a 404 of a known shape can
-pass ``accept_404``, a predicate on the 404 body: a 404 it accepts stays
-a definitive answer, a 404 it rejects (an error page from a proxy in
-front of the API) is retried and counted as a failure like any other
-HTTP error status. Callers that pass no predicate are unaffected.
+pass ``accept_404`` (keyword-only), a predicate on the 404 body: a 404
+it accepts stays a definitive answer, a 404 it rejects (an error page
+from a proxy in front of the API) is retried and counted as a failure
+like any other HTTP error status. Callers that pass no predicate are
+unaffected.
 
 Gaps / not covered: a predicate that raises (the contract says it must
 not); get_text, get_json and get_xml have no such option.
 """
 
+import inspect
 from unittest.mock import AsyncMock
 
 import httpx
@@ -146,3 +148,16 @@ async def test_the_predicate_is_consulted_only_for_404(fetcher: Fetcher, sleep: 
     assert calls == []
     assert result.status == status
     assert result.ok is (status == 200)
+
+
+@respx.mock
+async def test_accept_404_is_keyword_only(fetcher: Fetcher, sleep: AsyncMock) -> None:
+    """A parameter another change adds after max_bytes can never be bound
+    to the predicate by position, nor the predicate to it."""
+    route = respx.get(_URL).mock(return_value=httpx.Response(404, content=_HTML_404))
+    param = inspect.signature(Fetcher.get_bytes).parameters["accept_404"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is None
+
+    with pytest.raises(TypeError):
+        await fetcher.get_bytes(_URL, "t", None, None, 1024, _json_object)
+    assert route.call_count == 0
