@@ -1613,18 +1613,40 @@ def _signed_pct(value: Any) -> str:
     return f"[{style}]{value:+.2f}%[/{style}]"
 
 
+def _session_cell(row: dict) -> Text:
+    """Session date, the prior session the return starts from, and the
+    story's exchange-local time, so a return over more than one session
+    or a misplaced story time shows on the row."""
+    lines = [str(row.get("session_date") or "-")]
+    if row.get("prior_session_date"):
+        lines.append(f"from {row['prior_session_date']}")
+    story_time = row.get("published_local") or row.get("story", {}).get("first_published")
+    if story_time:
+        lines.append(f"story {story_time}")
+    return _cell("\n".join(lines))
+
+
 @main.command(name="news-reaction")
 @click.option("--category", "-c", default=None, help="RSS category (finance, technology, energy, ...)")
 @click.option("--limit", "-n", default=150, type=int, help="News items to cluster (max 300)")
 @click.option("--min-size", default=2, type=int, help="Minimum articles per story (1 includes single-article stories)")
+@click.option("--max-age-hours", default=None, type=float, help="Leave out stories older than this (default 168)")
 @click.option("--no-countries", is_flag=True, help="Skip the country-index rows")
 @click.pass_context
 def news_reaction(
-    ctx: click.Context, category: str | None, limit: int, min_size: int, no_countries: bool
+    ctx: click.Context,
+    category: str | None,
+    limit: int,
+    min_size: int,
+    max_age_hours: float | None,
+    no_countries: bool,
 ) -> None:
     """Market move on the session of each story naming a company or country."""
     from .analysis.news_market import fetch_news_market_reaction
 
+    kwargs: dict[str, Any] = {}
+    if max_age_hours is not None:
+        kwargs["max_age_hours"] = max_age_hours
     data = _run(
         fetch_news_market_reaction(
             _get_fetcher(),
@@ -1632,16 +1654,21 @@ def news_reaction(
             limit=limit,
             min_cluster_size=min_size,
             include_countries=not no_countries,
+            **kwargs,
         )
     )
     if _bail_on_error(ctx, data):
         return
 
     s = data.get("summary", {})
+    dropped = s.get("stories_dropped_by_age") or 0
+    aged_out = (
+        f"; {dropped} stories older than {s.get('max_age_hours', 0):g} h left out" if dropped else ""
+    )
     console.print(
         f"[bold]News vs market reaction[/bold]: {s.get('stories_considered', 0)} stories, "
         f"{s.get('stories_with_entities', 0)} naming a company or country; "
-        f"{s.get('unmapped', 0)} unmapped, {s.get('excluded', 0)} excluded as ambiguous"
+        f"{s.get('unmapped', 0)} unmapped, {s.get('excluded', 0)} excluded as ambiguous{aged_out}"
     )
     console.print(f"[dim]{escape(str(data.get('interpretation', '')))}[/dim]\n")
 
@@ -1660,7 +1687,7 @@ def news_reaction(
             _cell(r.get("story", {}).get("headline", "")),
             _cell(r.get("entity", {}).get("name", "")),
             _cell(f"{r.get('symbol', '')} vs {r.get('benchmark') or 'none'}"),
-            _cell(r.get("session_date") or "-"),
+            _session_cell(r),
             _signed_pct(r.get("stock_return_pct")),
             _signed_pct(r.get("benchmark_return_pct")),
             _signed_pct(r.get("excess_return_pct")),
@@ -1684,7 +1711,7 @@ def news_reaction(
                 _cell(r.get("story", {}).get("headline", "")),
                 _cell(r.get("entity", {}).get("name", "")),
                 _cell(r.get("symbol", "")),
-                _cell(r.get("session_date") or "-"),
+                _session_cell(r),
                 _signed_pct(r.get("index_return_pct")),
                 "[dim]n/a[/dim]" if z is None else f"{z:+.2f}",
                 _cell(status if status == "measured" else f"{status}: {r.get('gap', '')}"),

@@ -15,13 +15,15 @@ TOOLS: list[Tool] = [
         name="intel_news_market_reaction",
         description=(
             "Companies and countries named in recent news story clusters, mapped to tickers "
-            "(SEC-confirmed for US listings) and country indices, with the move on the story's "
-            "market session from Yahoo daily bars: stock, benchmark (SPY or the exchange "
-            "country's index) and excess return; country index return with a trailing z-score. "
-            "A story after the close maps to the next session, weekends and holidays to the next "
-            "trading day, all in the exchange's timezone. Unmapped and ambiguous names are "
-            "listed with reasons; a failed quote is a data gap, never a 0% move. Same-session "
-            "co-movement, not causation; not a trading signal."
+            "from the entity table (US tickers annotated with their SEC registrant when SEC "
+            "lists them) and country indices, with the move on the story's market session from "
+            "Yahoo daily bars: stock, benchmark (SPY or the exchange country's index) and excess "
+            "return; country index return with a trailing z-score. A story after the close maps "
+            "to the next session, weekends and holidays to the next trading day, all in the "
+            "exchange's timezone; a session not yet closed or not yet final is pending. Unmapped "
+            "and ambiguous names are listed with reasons; a failed quote or an expired cached "
+            "copy is a data gap, never a 0% move. Same-session co-movement, not causation; not "
+            "a trading signal."
         ),
         inputSchema={
             "type": "object",
@@ -55,6 +57,11 @@ TOOLS: list[Tool] = [
                     "description": "Cap on tickers and indices fetched in one call (default 40, max 60)",
                     "default": 40,
                 },
+                "max_age_hours": {
+                    "type": "number",
+                    "description": "Leave out stories older than this many hours (default 168, max 2160)",
+                    "default": 168,
+                },
             },
         },
     ),
@@ -64,6 +71,9 @@ TOOLS: list[Tool] = [
 async def _news_market_reaction(arguments: dict[str, Any]) -> Any:
     from ..analysis.news_market import fetch_news_market_reaction
 
+    extra: dict[str, Any] = {}
+    if arguments.get("max_age_hours") is not None:
+        extra["max_age_hours"] = arguments["max_age_hours"]
     return await fetch_news_market_reaction(
         runtime.fetcher,
         category=arguments.get("category"),
@@ -72,6 +82,7 @@ async def _news_market_reaction(arguments: dict[str, Any]) -> Any:
         min_cluster_size=arguments.get("min_cluster_size", 2),
         include_countries=arguments.get("include_countries", True),
         max_symbols=arguments.get("max_symbols", 40),
+        **extra,
     )
 
 

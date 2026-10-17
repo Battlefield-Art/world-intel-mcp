@@ -5,29 +5,45 @@
 ### Added: news vs market reaction
 - `intel_news_market_reaction` (CLI: `intel news-reaction`): the companies and
   countries named in recent story clusters, mapped to a listing (the entity
-  table's ticker, confirmed against SEC's company_tickers.json for US
-  listings) or to the country's primary index (the table `intel_country_stocks`
-  uses), with the move on the story's market session from Yahoo daily bars.
-  Company rows give the stock's close-to-close return (adjusted closes), the
-  benchmark's return over the same two dates (SPY for US listings, the
-  exchange country's index otherwise) and the excess return; country rows
-  give the index return and a z-score against its previous up-to-20 sessions.
+  table's ticker; a US ticker is annotated with its registrant when SEC's
+  company_tickers.json lists it) or to the country's primary index (the table
+  `intel_country_stocks` uses), with the move on the story's market session
+  from Yahoo daily bars. Company rows give the stock's close-to-close return
+  (adjusted closes), the benchmark's return over the same two dates (SPY for
+  US listings, the exchange country's index otherwise) and the excess return;
+  country rows give the index return and a z-score against its previous
+  up-to-20 sessions.
 - Session rule, stated in every response: the story time (earliest
-  `published` in the cluster) is converted to the exchange's timezone; before
-  the regular close on a trading day it is that session, at or after the close
-  the next one, and a weekend or holiday (read from the listing's own bars)
-  maps to the next trading day. A session that has not closed is `pending`.
-- Honest gaps: a failed quote, a missing benchmark bar, a stock series missing
-  a day its benchmark traded, a story timestamp later than the collection time
-  and a story older than the bar range are each a `data_gap` row with the
-  reason and no number, never a 0% move. Unmapped names (private companies,
+  `published` in the cluster; that article also gives the headline and link)
+  is converted to the exchange's timezone; before the regular close on a
+  trading day it is that session, at or after the close the next one, and a
+  weekend or holiday (read from the listing's own bars) maps to the next
+  trading day. Each row names the close it used (`close_time_used`). A
+  session that has not closed, or whose last bar Yahoo has not finalized
+  (its regularMarketTime is before the close), is `pending`.
+- Honest gaps: a failed quote, an expired cached chart or SEC file served
+  during an outage, a missing benchmark bar, a stock series missing a day its
+  benchmark traded (also between the two dates of a return), a cluster whose
+  articles map to different sessions, a story timestamp later than the
+  collection time and a story older than the bar range are each a `data_gap`
+  row or line with the reason and no number, never a 0% move. A bar Yahoo
+  fills for a day without trading (open, high, low and close equal to the
+  previous close, no volume) is dropped, not read as a 0% session.
+  `data_gaps` also names a listing whose Yahoo close differs from its zone's
+  standard close, and a chart without adjusted closes. Stories whose earliest
+  article is older than `max_age_hours` (default 168) are left out and
+  counted. Unmapped names (companies without a ticker in the entity table,
   countries without an index) are listed, not dropped. Company names that are
   also common words (apple, amazon, meta, shell, bp, alphabet, chevron,
   samsung) are excluded with a stated reason unless the headlines carry a
-  corroborating term or an article comes from a feed category where the
-  company sense dominates (a hyphen-joined use such as "meta-analysis" does
-  not count). Responses say they describe same-session co-movement, not
-  causation, and are not a trading signal. Tools 139 -> 140.
+  corroborating term or an article comes from a feed where the company sense
+  dominates (a hyphen-joined use such as "meta-analysis" does not count); a
+  phrase marking the other sense ("big apple", "amazon rainforest", "chevron
+  ruling", "25 bp") excludes the name. A country gets an index row only when
+  the headlines use its name; one named only by a demonym, capital or code,
+  or inside a longer name such as "Gulf of Mexico", is listed as excluded.
+  Responses say they describe same-session co-movement, not causation, and
+  are not a trading signal. Tools 139 -> 140.
 
 ## 0.11.0 - 2026-10-12
 
