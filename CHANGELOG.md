@@ -30,7 +30,10 @@ responses say so. `limit=0` returns the full history.
   separate and never summed. US M3 is reported as discontinued (FRED M3SL ends at
   2006-02-01).
 - `intel_fed_liquidity_series`: WALCL, WDTGAL, WTREGEN, RRPONTSYD or M2SL with full
-  history; blank source dates (2,833 for RRPONTSYD) are counted, not read as zero.
+  history; blank source dates (2,833 for RRPONTSYD on 2026-10-17, 2,679 of them
+  before 2013-09-23, when daily values begin) are counted, not read as zero.
+  Net liquidity therefore starts at 2003-02-12 with 523 earlier or unaligned
+  weeks skipped and counted, the last of them 2013-09-18.
 - `intel_ecb_series`: any ECB BSI or ILM series by SDMX key, with units, scale,
   titles and provisional flags taken from the response. A growth rate's change is
   reported in points, not as a percent of a percent.
