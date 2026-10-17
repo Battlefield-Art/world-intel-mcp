@@ -414,6 +414,46 @@ source here, and no proxy is substituted for any of these measures.
   escalation tests stub only ACLED and military flights and would
   otherwise reach Nominatim, GDELT, USGS and FIRMS live.
 
+### Added: border crossings (flows)
+- `intel_us_border_encounters`: U.S. CBP encounters per calendar month
+  (Border Patrol Title 8 apprehensions, Field Operations Title 8
+  inadmissibles, Title 42 expulsions), read from the newest CSV on CBP's
+  public dataset page, which spans four fiscal years (October 2022 to
+  August 2026 when written). Nationwide or one land border region, all
+  components or USBP / OFO, optionally one citizenship as CBP names it;
+  with the latest month against the same month a year earlier, fiscal-year
+  totals (the year in progress compared with the same months of the prior
+  year, only when every one is published), breakdowns by component,
+  encounter type and demographic, and the top citizenships with CBP's
+  OTHER bucket reported apart and never ranked. CBP's fiscal months are
+  mapped to calendar months (FY2026 October is October 2025).
+- `intel_uk_small_boat_arrivals`: Home Office daily and weekly counts of
+  migrants and boats detected crossing the English Channel in small boats,
+  with uncontrolled landings and the weekly migrants and events prevented
+  by French authorities; month and year sums of the daily rows, and the
+  year to date against the same span a year earlier. Read through the
+  GOV.UK Content API and the published ODS time series, parsed with the
+  standard library (zipfile + ElementTree, no new dependency). The
+  publisher's numbered notes are quoted from the file on every refresh.
+- Both are flows (events per period), stated in every response with units,
+  date semantics and the publisher's caveats, and kept apart from the
+  UNHCR and World Bank year-end stocks. Neither file has a person
+  identifier, so neither counts unique people (said in each response as a
+  tool note, not as the publisher's words).
+- An outage is a degraded error with no figures; a failed refresh serves
+  the last good copy marked `stale` with its age. A '-' in the UK file is
+  null, never 0; a CBP month with no rows inside the file's coverage is 0,
+  because CBP lists only non-zero cells, and months outside it are never
+  invented. Weekly UK totals are checked against their seven days and any
+  mismatch is named in `data_gaps`.
+- Requests use an identifying User-Agent, two per refresh (the listing,
+  then the file), cached 12 h (CBP) and 3 h (UK). Paths that robots.txt
+  disallows are never requested; a newer-looking CBP file at such a path
+  is named in `data_gaps` instead.
+- Frontex is not built: its only data file is an XLSX under `/assets/`,
+  which its robots.txt disallows (measured 2026-10-17, see ROADMAP Phase 28).
+- Tools 139 -> 141.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

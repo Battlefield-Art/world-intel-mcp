@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **152 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **154 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -50,7 +50,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Country Intelligence** | 3 | Country brief, country stocks, financial centers |
 | **Prediction Markets** | 1 | Polymarket event contracts |
 | **Elections** | 1 | Global election calendar with risk scoring |
-| **Displacement and Migration** | 5 | UNHCR refugee/IDP data, origin -> destination corridors since 1951, year-over-year surge detection; World Bank net migration and migrant stock |
+| **Displacement and Migration** | 7 | UNHCR refugee/IDP data, origin -> destination corridors since 1951, year-over-year surge detection; World Bank net migration and migrant stock; border crossings as flows (CBP monthly encounters, UK small-boat arrivals), never mixed with the year-end stocks |
 | **Shipping** | 1 | Dry bulk shipping stress index |
 | **Government** | 1 | USAspending.gov federal contracts |
 | **Traffic** | 2 | Road traffic flow, real-time incidents |
@@ -68,7 +68,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 | **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
 
-**Total: 152 tools** across 30+ intelligence domains.
+**Total: 154 tools** across 30+ intelligence domains.
 
 ---
 
@@ -418,7 +418,7 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 |------|-------------|
 | `intel_election_calendar` | Global election calendar with risk scoring |
 
-### Displacement and migration (5)
+### Displacement and migration (7)
 | Tool | Description |
 |------|-------------|
 | `intel_displacement_summary` | UNHCR refugee/IDP statistics, top 30 origins |
@@ -426,6 +426,8 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 | `intel_migration_surges` | Largest year-over-year increases and decreases by origin and corridor, plus IDPs, sized against population |
 | `intel_migration_history` | One country's yearly series since 1951 as an origin or a host, with its peak and largest waves |
 | `intel_net_migration` | World Bank net migration and migrant stock: latest ranking, regions, or one country since 1960 |
+| `intel_us_border_encounters` | CBP encounters per month over the four fiscal years in CBP's newest file (from October 2022 as of October 2026; apprehensions, inadmissibles, Title 42 expulsions): nationwide or by land border region, by component and citizenship, with same-month prior-year change and fiscal-year totals. Events, not unique people |
+| `intel_uk_small_boat_arrivals` | Home Office daily and weekly small-boat arrivals across the English Channel (migrants, boats, uncontrolled landings) with French-reported preventions, month and year sums, and year to date vs last year. Provisional operational data |
 
 ### Aviation (5)
 | Tool | Description |

@@ -18,6 +18,7 @@ from ..sources import (
     prediction,
     displacement,
     migration,
+    border_crossings,
     cyber,
     ai_watch,
     health,
@@ -46,7 +47,7 @@ TOOLS: list[Tool] = [
             },
         },
     ),
-    # --- Displacement and migration (5 tools) ---
+    # --- Displacement and migration (7 tools) ---
     Tool(
         name="intel_displacement_summary",
         description="Get UNHCR refugee/displacement statistics by country of origin. No API key needed.",
@@ -128,6 +129,52 @@ TOOLS: list[Tool] = [
                 "country": {"type": "string", "description": "Country (ISO-3, ISO-2 or name) for its series"},
                 "region": {"type": "string", "description": "World Bank region code or name to filter the ranking (e.g. SSF, ECS)"},
                 "limit": {"type": "integer", "description": "Entries per ranking (default 20)"},
+            },
+        },
+    ),
+    Tool(
+        name="intel_us_border_encounters",
+        description=(
+            "U.S. CBP encounters per month (Border Patrol apprehensions, OFO inadmissibles, Title 42 "
+            "expulsions) from CBP's public dataset: nationwide or one land border region, by component, "
+            "optionally one citizenship, with same-month prior-year change, fiscal-year totals and the top "
+            "citizenships. A flow of events, not unique people and not a stock. No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "region": {
+                    "type": "string",
+                    "enum": ["nationwide", *border_crossings.CBP_REGIONS],
+                    "description": "Land border region (default nationwide; 'other' = ports and sectors away from the land borders)",
+                },
+                "component": {
+                    "type": "string",
+                    "enum": ["all", *border_crossings.CBP_COMPONENTS],
+                    "description": "usbp = Border Patrol between ports of entry, ofo = Field Operations at ports (default all)",
+                },
+                "citizenship": {
+                    "type": "string",
+                    "description": "Citizenship as CBP names it (e.g. MEXICO, 'CHINA, PEOPLES REPUBLIC OF', OTHER); default all",
+                },
+                "months": {"type": "integer", "description": "Months of series to return (default 13)"},
+            },
+        },
+    ),
+    Tool(
+        name="intel_uk_small_boat_arrivals",
+        description=(
+            "UK Home Office counts of migrants and boats detected crossing the English Channel in small boats "
+            "(provisional operational data): latest days and weeks, French-reported preventions per week, "
+            "month and year sums, and year to date vs the same span last year. A flow of arrivals, not a "
+            "stock. No API key needed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Latest daily rows to return (default 14)"},
+                "weeks": {"type": "integer", "description": "Latest weekly rows to return (default 8)"},
+                "months": {"type": "integer", "description": "Calendar months of sums to return (default 13)"},
             },
         },
     ),
@@ -439,6 +486,25 @@ async def _net_migration(arguments: dict[str, Any]) -> Any:
     )
 
 
+async def _us_border_encounters(arguments: dict[str, Any]) -> Any:
+    return await border_crossings.fetch_us_border_encounters(
+        runtime.fetcher,
+        region=arguments.get("region", "nationwide"),
+        component=arguments.get("component", "all"),
+        citizenship=arguments.get("citizenship"),
+        months=arguments.get("months", 13),
+    )
+
+
+async def _uk_small_boat_arrivals(arguments: dict[str, Any]) -> Any:
+    return await border_crossings.fetch_uk_small_boat_arrivals(
+        runtime.fetcher,
+        days=arguments.get("days", 14),
+        weeks=arguments.get("weeks", 8),
+        months=arguments.get("months", 13),
+    )
+
+
 async def _cyber_threats(arguments: dict[str, Any]) -> Any:
     return await cyber.fetch_cyber_threats(
         runtime.fetcher, limit=arguments.get("limit", 50)
@@ -543,6 +609,8 @@ HANDLERS = {
     "intel_migration_surges": _migration_surges,
     "intel_migration_history": _migration_history,
     "intel_net_migration": _net_migration,
+    "intel_us_border_encounters": _us_border_encounters,
+    "intel_uk_small_boat_arrivals": _uk_small_boat_arrivals,
     "intel_cyber_threats": _cyber_threats,
     "intel_news_feed": _news_feed,
     "intel_trending_keywords": _trending_keywords,
