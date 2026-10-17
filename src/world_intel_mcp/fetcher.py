@@ -41,6 +41,7 @@ _SOURCE_RATE_LIMITS: dict[str, float] = {
     "acled": 2.0,  # API key based
     "nga": 2.0,  # govt API
     "sec-edgar": 1.0,  # SEC EDGAR — be polite
+    "fred-graph": 1.0,  # fred.stlouisfed.org robots.txt: Crawl-delay: 1
     # adsb.lol globe_history heatmaps are ~14 MB each; one at a time,
     # spaced, so a cold baseline never bursts the community server.
     "adsblol-history": 2.0,
