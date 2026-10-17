@@ -882,16 +882,26 @@ def _collector_roster() -> list[str]:
     (level INFO); in this process, where nothing configures the root
     logger, that would attach a stderr handler and start printing a line
     per upstream request. The root logger's handlers and level are put
-    back as they were. Called on the event loop thread, so no other
-    request reconfigures logging in between."""
+    back as they were, on every path: basicConfig can add its handler and
+    then raise (an unknown WORLD_INTEL_LOG_LEVEL). Called on the event loop
+    thread, so no other request reconfigures logging in between. Raises
+    _RosterUnavailable when the collector module cannot be imported."""
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
-    from world_intel_mcp.collector import SOURCES
-
-    for handler in [h for h in root.handlers if h not in handlers]:
-        root.removeHandler(handler)
-    root.setLevel(level)
+    try:
+        from world_intel_mcp.collector import SOURCES
+    except Exception as exc:
+        raise _RosterUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        for handler in [h for h in root.handlers if h not in handlers]:
+            root.removeHandler(handler)
+        root.setLevel(level)
     return [name for name, _, _, _ in SOURCES]
+
+
+class _RosterUnavailable(Exception):
+    """The collector roster could not be read; the history store was not
+    involved."""
 
 
 def _read_collection_health(db_path: Path, roster: list[str], source: str | None) -> dict:
@@ -911,12 +921,17 @@ async def api_collection_health(request):
     (``?source=`` for one source). A store that cannot be opened or read is
     a 503 with the reason and the database path, never a list of zeros; a
     database the collector never wrote reports every source ``never_run``;
-    an unknown source is a 404 naming the known ones."""
+    an unknown source is a 404 naming the known ones; a collector module
+    that cannot be imported is a 503 saying so, not blaming the store."""
     source = request.query_params.get("source") or None
+    try:
+        roster = _collector_roster()
+    except _RosterUnavailable as exc:
+        logger.warning("Collector roster unavailable: %s", exc)
+        return JSONResponse({"error": f"collector roster unavailable: {exc}"}, status_code=503)
     db_path = None
     try:
         db_path = _history_db_path()
-        roster = _collector_roster()
         data = await asyncio.to_thread(_read_collection_health, db_path, roster, source)
     except Exception as exc:
         logger.warning("Collection health unavailable: %s", exc)

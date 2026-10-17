@@ -631,6 +631,30 @@ def test_reading_the_roster_leaves_root_logging_as_it_was(monkeypatch) -> None:
     assert roster == [name for name, _, _, _ in collector.SOURCES]
 
 
+def test_roster_import_failure_restores_logging_and_names_the_roster(client, tmp_path, monkeypatch) -> None:
+    """basicConfig adds its handler, then rejects a lowercase level and the
+    collector import raises. The handler and level are still put back (the
+    next import would otherwise find a handler and succeed with it left
+    attached), and the 503 names the roster, not the history store."""
+    import world_intel_mcp
+    from world_intel_mcp import collector
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    monkeypatch.delitem(sys.modules, "world_intel_mcp.collector")
+    monkeypatch.setattr(world_intel_mcp, "collector", collector)
+    monkeypatch.setenv("WORLD_INTEL_LOG_LEVEL", "debug")
+    monkeypatch.setattr(dashboard_app, "_history_db_path", lambda: tmp_path / "cache.db")
+    for _ in range(2):  # the same answer every time, not a 503 then a 200
+        r = client.get("/api/collection-health")
+        assert (r.status_code, r.json()) == (
+            503, {"error": "collector roster unavailable: ValueError: Unknown level: 'debug'"}
+        )
+        assert root.handlers == []
+        assert root.level == logging.WARNING
+
+
 # ---------------------------------------------------------------------------
 # Page: static checks (no JavaScript runtime needed)
 # ---------------------------------------------------------------------------
