@@ -71,7 +71,12 @@
   fails too, the lost cycle is appended to
   `<cache db>-history-write-failures.jsonl` beside the DB (newest 500
   kept), and collection health reports it with the sources it covered. A
-  history write failure never fails the cycle.
+  history write failure never fails the cycle. The record is rewritten
+  through an exclusive temp file (`mkstemp`: random name, mode 0600)
+  renamed into place, and is never read or written through a symlink. A
+  symlink, FIFO or other non-regular file at its path is not read: the
+  collector replaces it (logged, and noted in the new record as
+  `replaced_unread`), and health names one it finds in its data gaps.
 - Expected cadence for health is 300 s (the shipped plist interval);
   `WORLD_INTEL_HISTORY_CADENCE_S` and
   `WORLD_INTEL_HISTORY_CADENCES=source=seconds,...` override it.

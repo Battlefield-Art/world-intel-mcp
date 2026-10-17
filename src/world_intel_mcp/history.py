@@ -50,7 +50,9 @@ success only from a live capture, so a source served from stale cache
 reads ``stale`` and goes overdue on schedule. When a cycle's write fails
 twice (a locked or unwritable DB), the collector appends a record of the
 lost cycle to ``<db>-history-write-failures.jsonl`` beside the DB (newest
-500 kept), which ``collection_health`` reports.
+500 kept), which ``collection_health`` reports. That file is rewritten
+through an exclusive temp file and never read or written through a
+symlink.
 
 Registering an extractor (the public API)::
 
@@ -120,10 +122,14 @@ Gaps / not covered:
 - A collector and a server that resolve different cache paths keep
   different run logs; health then reads ``never_run`` for every source and
   says where it looked.
+- The lost-cycle record is read when it is a regular file, whoever owns
+  it: in a DB directory another local user can write, that user can plant
+  records there (as they can tamper with the DB itself).
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -131,6 +137,7 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import time
 import zlib
@@ -645,6 +652,79 @@ def write_failures_path(db_path: Path | str) -> Path:
     return db_path.with_name(db_path.name + _WRITE_FAILURES_SUFFIX)
 
 
+# open() flags for reading the lost-cycle record: never through a symlink,
+# never blocking on a FIFO (0 where the OS has no such flag).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_SYMLINK_REFUSED = "is a symlink; not followed"
+_NOT_REGULAR_REFUSED = "is not a regular file; not read"
+
+
+def _record_refusal(path: Path) -> str | None:
+    """Why the lost-cycle record at ``path`` is not read, judged by the
+    entry itself (``lstat``), or None when it is absent, a regular file, or
+    cannot be inspected (opening it then raises that error)."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return _SYMLINK_REFUSED
+    if not stat.S_ISREG(mode):
+        return _NOT_REGULAR_REFUSED
+    return None
+
+
+def _read_record(path: Path) -> tuple[str | None, str | None]:
+    """(text, None); (None, None) when there is no record yet; or
+    (None, why) when it is refused.
+
+    A symlink is never followed (an ``lstat`` check, and ``O_NOFOLLOW``
+    where the OS has it in case the name is swapped after the check) and
+    only a regular file is read, so a name planted beside the DB, in a
+    directory another user can write, cannot point the read at another
+    file or hang it on a FIFO. Undecodable bytes are replaced, so such a
+    line counts as unreadable instead of raising.
+    """
+    refused = _record_refusal(path)
+    if refused:
+        return None, refused
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        # O_NOFOLLOW on a symlink: ELOOP (Linux, macOS) or EMLINK (FreeBSD).
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            return None, _SYMLINK_REFUSED
+        raise
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return None, _NOT_REGULAR_REFUSED
+        return fh.read().decode("utf-8", errors="replace"), None
+
+
+def _replace_privately(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through an exclusive temp file beside it.
+
+    ``mkstemp`` creates the temp file with O_EXCL, an unpredictable name
+    and mode 0600, and it is renamed over ``path``. ``path`` itself is
+    never opened, so a symlink there is replaced, not written through. The
+    temp file is removed on any error.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as exc:
+            logger.warning("Could not remove the temp file %s: %s", tmp, exc)
+        raise
+
+
 def record_write_failure(
     db_path: Path | str, outcomes: Iterable[SourceOutcome], error: str,
     now: float | None = None,
@@ -652,9 +732,13 @@ def record_write_failure(
     """Keep a lasting record of a cycle whose history write failed.
 
     Written beside the DB, not in it (the DB may be what failed), newest
-    ``_WRITE_FAILURES_KEPT`` records kept. Returns the file, or None when
-    it could not be written either; that is logged, and the collector log
-    is then the only trace of the lost cycle.
+    ``_WRITE_FAILURES_KEPT`` records kept, through an exclusive temp file
+    renamed into place. The record is never read or written through a
+    symlink: a symlink (or anything but a regular file) at its path is
+    replaced unread, which is logged and noted in the new record as
+    ``replaced_unread``. Returns the file, or None when it could not be
+    written either; that is logged, and the collector log is then the only
+    trace of the lost cycle.
     """
     now = time.time() if now is None else now
     path = write_failures_path(db_path)
@@ -665,12 +749,13 @@ def record_write_failure(
         "sources": sorted({outcome.source for outcome in outcomes}),
     }
     try:
-        lines = path.read_text().splitlines() if path.exists() else []
+        text, refused = _read_record(path)
+        if refused:
+            logger.error("Not reading the lost-cycle record %s: it %s; replacing it", path, refused)
+            record["replaced_unread"] = f"{path} {refused}"
+        lines = (text or "").splitlines()
         lines = (lines + [json.dumps(record, separators=(",", ":"))])[-_WRITE_FAILURES_KEPT:]
-        partial = path.with_name(path.name + ".tmp")
-        partial.write_text("\n".join(lines) + "\n")
-        os.chmod(partial, 0o600)
-        os.replace(partial, path)
+        _replace_privately(path, "\n".join(lines) + "\n")
     except OSError as exc:
         logger.error("Could not record the history write failure at %s: %s", path, exc)
         return None
@@ -678,15 +763,22 @@ def record_write_failure(
 
 
 def read_write_failures(db_path: Path | str, now: float | None = None) -> tuple[list[dict], int]:
-    """(lost-cycle records inside the run-log retention window, unreadable count)."""
+    """(lost-cycle records inside the run-log retention window, unreadable count).
+
+    A record file that is a symlink or not a regular file is not read; it
+    is logged and counts as one unreadable record.
+    """
     path = write_failures_path(db_path)
     try:
-        text = path.read_text()
-    except FileNotFoundError:
-        return [], 0
+        text, refused = _read_record(path)
     except OSError as exc:
         logger.warning("Could not read %s: %s", path, exc)
         return [], 1
+    if refused:
+        logger.warning("Not reading the lost-cycle record %s: it %s", path, refused)
+        return [], 1
+    if text is None:
+        return [], 0
     keep_days = retention_days()["capture_days"]
     now = time.time() if now is None else now
     cutoff = now - keep_days * 86400 if keep_days > 0 else None
@@ -1150,8 +1242,13 @@ class HistoryStore:
                 "can be off (unrecorded_attempts per source)"
             )
         if unreadable_failures:
+            refused = _record_refusal(record_file)
             gaps.append(
-                f"{unreadable_failures} lost-cycle record(s) in {record_file} could not be read"
+                f"the lost-cycle record {record_file} {refused}, so cycles whose history "
+                "write failed are not counted here"
+                if refused
+                else f"{unreadable_failures} lost-cycle record(s) in {record_file} could not "
+                "be read"
             )
         return {
             "sources": rows,

@@ -12,8 +12,11 @@ the collector attaches, at fixed times.
 
 import asyncio
 import json
+import os
 import sqlite3
+import stat
 import tempfile
+import threading
 import time
 import types
 from urllib.parse import unquote
@@ -612,6 +615,136 @@ def test_unwritable_failure_record_is_logged_not_raised(tmp_path, caplog) -> Non
     missing_dir = tmp_path / "gone" / "cache.db"
     assert history.record_write_failure(missing_dir, [], "boom") is None
     assert "Could not record the history write failure" in caplog.text
+
+
+# The symlink and FIFO tests below need POSIX (symlinks, os.mkfifo,
+# O_NOFOLLOW), as CI (Ubuntu) and macOS provide.
+_LOST = [SourceOutcome("wildfires", T0)]
+
+
+def _without_hanging(fn, fifo):
+    """(fn's result, whether it blocked). A reader blocked opening the FIFO
+    is released by opening its write end, so a regression fails, not hangs."""
+    out = {}
+    thread = threading.Thread(target=lambda: out.update(result=fn()), daemon=True)
+    thread.start()
+    thread.join(5)
+    blocked = thread.is_alive()
+    if blocked:
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        thread.join(5)
+    return out.get("result"), blocked
+
+
+def test_failure_record_is_never_written_through_a_symlink(tmp_path, caplog) -> None:
+    db = tmp_path / "cache.db"
+    path = history.write_failures_path(db)
+    targets = [tmp_path / "other-file-1", tmp_path / "other-file-2"]
+    for target in targets:
+        target.write_text("not ours\n")
+        target.chmod(0o644)
+    (tmp_path / (path.name + ".tmp")).symlink_to(targets[0])  # the old fixed temp name
+    path.symlink_to(targets[1])
+
+    assert history.record_write_failure(db, _LOST, "boom", now=T0) == path
+    for target in targets:
+        assert target.read_text() == "not ours\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert not path.is_symlink() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    (line,) = path.read_text().splitlines()
+    record = json.loads(line)
+    assert (record["error"], record["replaced_unread"]) == (
+        "boom", f"{path} is a symlink; not followed"
+    )
+    assert f"Not reading the lost-cycle record {path}: it is a symlink; not followed" in caplog.text
+    # Nothing else was created: no temp file is left behind.
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [path.name, path.name + ".tmp", "other-file-1", "other-file-2"]
+    )
+
+
+def test_lost_cycle_reader_does_not_follow_a_symlink(tmp_path, caplog) -> None:
+    db = tmp_path / "cache.db"
+    path = history.write_failures_path(db)
+    elsewhere = tmp_path / "elsewhere.jsonl"
+    elsewhere.write_text(
+        json.dumps({"failed_at_ts": T0, "error": "planted", "sources": ["wildfires"]}) + "\n"
+    )
+    path.symlink_to(elsewhere)
+    assert history.read_write_failures(db, now=T0) == ([], 1)
+    assert f"Not reading the lost-cycle record {path}: it is a symlink; not followed" in caplog.text
+    s = HistoryStore(db)
+    try:
+        health = s.collection_health(["wildfires"], now=T0)
+    finally:
+        s.close()
+    assert health["history_write_failures"]["count"] == 0
+    assert (
+        f"the lost-cycle record {path} is a symlink; not followed, so cycles whose history "
+        "write failed are not counted here"
+    ) in health["data_gaps"]
+
+
+def test_a_name_swapped_after_the_check_is_still_refused(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(history, "_record_refusal", lambda path: None)  # the lstat check missed it
+    (tmp_path / "elsewhere").write_text("x\n")
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(tmp_path / "elsewhere")
+    assert history._read_record(link) == (None, "is a symlink; not followed")
+    fifo = tmp_path / "fifo.jsonl"
+    os.mkfifo(fifo)
+    result, blocked = _without_hanging(lambda: history._read_record(fifo), fifo)
+    assert (result, blocked) == ((None, "is not a regular file; not read"), False)
+
+
+def test_a_fifo_at_the_record_path_is_refused_without_blocking(tmp_path) -> None:
+    db = tmp_path / "cache.db"
+    path = history.write_failures_path(db)
+    os.mkfifo(path)
+    result, blocked = _without_hanging(lambda: history.read_write_failures(db, now=T0), path)
+    assert (result, blocked) == (([], 1), False)
+    assert history.record_write_failure(db, _LOST, "boom", now=T0) == path
+    assert json.loads(path.read_text())["replaced_unread"] == f"{path} is not a regular file; not read"
+
+
+def test_a_failed_record_write_leaves_no_temp_file(tmp_path, caplog) -> None:
+    db = tmp_path / "cache.db"
+    path = history.write_failures_path(db)
+    path.mkdir()
+    (path / "keep").write_text("x")
+    assert history.record_write_failure(db, _LOST, "boom", now=T0) is None
+    assert "Could not record the history write failure" in caplog.text
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]
+    assert (path / "keep").read_text() == "x"
+    s = HistoryStore(db)
+    try:
+        gaps = s.collection_health(["wildfires"], now=T0)["data_gaps"]
+    finally:
+        s.close()
+    assert (
+        f"the lost-cycle record {path} is not a regular file; not read, so cycles whose "
+        "history write failed are not counted here"
+    ) in gaps
+
+
+def test_undecodable_lost_cycle_lines_count_as_unreadable(tmp_path) -> None:
+    db = tmp_path / "cache.db"
+    history.record_write_failure(db, _LOST, "boom", now=T0)
+    with history.write_failures_path(db).open("ab") as fh:
+        fh.write(b"\xff\xfe not utf-8\n")
+    records, unreadable = history.read_write_failures(db, now=T0)
+    assert ([r["error"] for r in records], unreadable) == (["boom"], 1)
+    assert history.record_write_failure(db, _LOST, "again", now=T0 + 1) is not None
+
+
+def test_health_reports_a_record_it_cannot_inspect(tmp_path) -> None:
+    db = tmp_path / ("d" * 236 + ".db")  # the record's file name is over NAME_MAX
+    s = HistoryStore(db)
+    try:
+        gaps = s.collection_health(["wildfires"], now=T0)["data_gaps"]
+    finally:
+        s.close()
+    assert f"1 lost-cycle record(s) in {history.write_failures_path(db)} could not be read" in gaps
 
 
 # ---------------------------------------------------------------------------
