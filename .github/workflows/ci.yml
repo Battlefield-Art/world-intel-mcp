@@ -9,6 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A full run takes a few minutes. A hung test (a deadlocked asyncio
+    # lock prints nothing and uses no CPU) fails the job here instead of
+    # holding the runner until the 6-hour platform default.
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
