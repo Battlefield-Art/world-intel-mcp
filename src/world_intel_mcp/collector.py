@@ -79,8 +79,12 @@ SOURCES = [
     # News (2)
     ("news_feed", "sources.news", "fetch_news_feed", {}),
     ("trending_keywords", "sources.news", "fetch_trending_keywords", {}),
-    # Prediction (1)
+    # Prediction (3)
     ("prediction_markets", "sources.prediction", "fetch_prediction_markets", {}),
+    # Kalshi: the Economics category's top series (Fed, CPI, gas prices);
+    # the unfiltered scan reads 4 MB pages of far-dated events instead.
+    ("kalshi_markets", "sources.kalshi", "fetch_kalshi_markets", {"category": "Economics", "limit": 50}),
+    ("prediction_compare", "sources.prediction_cross", "fetch_prediction_compare", {"category": "Economics"}),
     # Aviation (4)
     ("airport_delays", "sources.aviation", "fetch_airport_delays", {}),
     ("domestic_flights", "sources.aviation", "fetch_domestic_flights", {}),
@@ -162,7 +166,7 @@ DOMAIN_GROUPS = {
     "maritime": ["nav_warnings"],
     "climate": ["climate_anomalies"],
     "news": ["news_feed", "trending_keywords"],
-    "prediction": ["prediction_markets"],
+    "prediction": ["prediction_markets", "kalshi_markets", "prediction_compare"],
     "aviation": ["airport_delays", "domestic_flights", "bizjet_cohort", "military_cohort"],
     "cyber": ["cyber_threats"],
     "space": ["space_weather", "launch_schedule"],

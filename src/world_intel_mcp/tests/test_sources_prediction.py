@@ -2,7 +2,9 @@
 
 Gaps / not covered: real Gamma API schema drift; the module's documented
 "empty results on upstream failure" contract carries no degraded marker,
-which is asserted as-is (see the api-down test).
+which is asserted as-is (see the api-down test). Superseded 2026-10-17:
+the outage markers (error/degraded, stale on an expired-cache serve) are
+now pinned by the Phase 24.5 regression tests at the end of this file.
 """
 
 import asyncio as asyncio_mod
@@ -96,9 +98,9 @@ async def test_fetch_prediction_markets_parses_and_sorts(fetcher: Fetcher) -> No
 async def test_fetch_prediction_markets_api_down(
     fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure returns the documented empty shape. Observation
-    (flagged in review, not fixed): there is no degraded/error marker, so
-    an outage is shape-identical to a market lull."""
+    """Upstream failure keeps the documented empty shape. It now also
+    carries error/degraded markers (fixed 2026-10-17, ROADMAP Phase 24.5;
+    see the regression tests at the end of this file)."""
 
     async def _no_sleep(*args, **kwargs) -> None:
         return None
@@ -125,6 +127,86 @@ async def test_fetch_prediction_markets_non_list_response(fetcher: Fetcher) -> N
     result = await fetch_prediction_markets(fetcher)
     assert result["markets"] == []
     assert result["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# ROADMAP Phase 24.5: an outage must be distinguishable from "no markets".
+# Written failing-first against the pre-fix module (which returned the
+# bare empty shape above with no marker).
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_outage_carries_error_and_degraded_not_bare_empty(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _no_sleep(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio_mod, "sleep", _no_sleep)
+    respx.get(url__regex=r".*gamma-api\.polymarket\.com.*").mock(
+        return_value=httpx.Response(503)
+    )
+
+    result = await fetch_prediction_markets(fetcher)
+
+    # Existing keys kept (additive fix), outage marked.
+    assert result["markets"] == [] and result["count"] == 0
+    assert result["source"] == "polymarket"
+    assert result["degraded"] is True
+    assert "unavailable" in result["error"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_non_list_response_is_marked_degraded(fetcher: Fetcher) -> None:
+    respx.get(url__regex=r".*gamma-api\.polymarket\.com.*").mock(
+        return_value=httpx.Response(200, json={"unexpected": "dict"})
+    )
+
+    result = await fetch_prediction_markets(fetcher)
+    assert result["degraded"] is True
+    assert "expected a list" in result["error"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_quiet_market_is_not_marked_as_outage(fetcher: Fetcher) -> None:
+    """The other half of the distinction: a live empty list is a real
+    answer and must not carry the outage markers."""
+    respx.get(url__regex=r".*gamma-api\.polymarket\.com.*").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    result = await fetch_prediction_markets(fetcher)
+    assert result["count"] == 0
+    assert "error" not in result
+    assert "degraded" not in result
+    assert "stale" not in result
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_stale_list_serve_is_marked_stale(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gamma returns a list, which cannot carry the fetcher's inline
+    _stale marker; the breaker's stale counter is the signal."""
+
+    async def _no_sleep(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio_mod, "sleep", _no_sleep)
+    fetcher.cache.set("prediction:polymarket:20", _MARKETS[:2], -10)  # expired
+    respx.get(url__regex=r".*gamma-api\.polymarket\.com.*").mock(
+        return_value=httpx.Response(500)
+    )
+
+    result = await fetch_prediction_markets(fetcher)
+    assert result["count"] == 2
+    assert result["stale"] is True
+    assert result["data_gaps"] == ["served from expired cache after a failed live fetch"]
 
 
 def test_parse_outcome_prices() -> None:

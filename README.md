@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **142 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -45,7 +45,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Space Weather** | 1 | NOAA SWPC (Kp index, solar flares, alerts) |
 | **Social & Sanctions** | 3 | Reddit velocity, OFAC SDN list, nuclear test site monitoring |
 | **Country Intelligence** | 3 | Country brief, country stocks, financial centers |
-| **Prediction Markets** | 1 | Polymarket event contracts |
+| **Prediction Markets** | 4 | Polymarket and Kalshi event contracts, the same event on both venues side by side with a stated match confidence, and settled markets scored against their earlier prices (Brier) |
 | **Elections** | 1 | Global election calendar with risk scoring |
 | **Displacement and Migration** | 5 | UNHCR refugee/IDP data, origin -> destination corridors since 1951, year-over-year surge detection; World Bank net migration and migrant stock |
 | **Shipping** | 1 | Dry bulk shipping stress index |
@@ -64,7 +64,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 139 tools** across 30+ intelligence domains.
+**Total: 142 tools** across 30+ intelligence domains.
 
 ---
 
@@ -129,6 +129,9 @@ intel markets              # stock indices
 intel earthquakes --min-mag 5.0
 intel migration-surges     # year-over-year displacement jumps (UNHCR)
 intel migration-flows -o Sudan
+intel kalshi -c Economics  # Kalshi open markets by volume
+intel prediction-compare -c Economics   # same event on Kalshi and Polymarket
+intel prediction-settled   # Brier scores on settled markets
 intel status               # cache + circuit breaker health
 ```
 
@@ -147,7 +150,7 @@ collector.py  (daemon)    ─┘
 - **CircuitBreaker**: Per-source tracking. 3 consecutive failures trips for 5 minutes. Each RSS feed gets its own breaker.
 - **Cache**: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 - **VectorStore**: Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim). Async background worker queue for non-blocking storage. Enables semantic search across all accumulated intelligence.
-- **Collector**: Standalone daemon that fetches all 55 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
+- **Collector**: Standalone daemon that fetches all 57 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
 - **Sources** (`sources/*.py`): 30+ modules, each exports `async def fetch_*(fetcher, **kwargs) -> dict`.
 - **Analysis** (`analysis/*.py`): Cross-domain synthesis — signal aggregation, instability indexing, NLP, company enrichment, macro composite.
 - **Config** (`config/*.py`): Curated datasets — 22 hotspots, 70+ bases, 40 ports, 24 pipelines, 24 nuclear facilities, 34 cables, 48 datacenters, 27 spaceports, 82 exchanges.
@@ -322,10 +325,13 @@ collector.py  (daemon)    ─┘
 |------|-------------|
 | `intel_climate_anomalies` | Open-Meteo temperature/precipitation anomalies |
 
-### Prediction Markets (1)
+### Prediction Markets (4)
 | Tool | Description |
 |------|-------------|
 | `intel_prediction_markets` | Polymarket prediction contracts |
+| `intel_kalshi_markets` | Kalshi open markets from its public market data (no account), ranked by volume; YES implied probabilities with the venue's units stated; filter by category or series. Says which events it scanned and whether the scan was complete |
+| `intel_prediction_compare` | The same event on Kalshi and Polymarket: deterministic matching (quantities, years, end dates, negation and outcome side must agree), a `match_confidence` with reasons per pair, the price gap, the closest rejected pairs and why, and unmatched counts per venue |
+| `intel_prediction_settled` | Settled markets on both venues with the outcome, the YES price at fixed offsets before close, and a Brier score per venue and offset with sample size, distinct events, selection and exclusions. A venue without price history is not scored |
 
 ### Elections (1)
 | Tool | Description |
