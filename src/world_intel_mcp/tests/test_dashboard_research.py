@@ -35,11 +35,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import types
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -379,6 +382,59 @@ def test_top_stories_empty_result_is_200(client, fetcher, monkeypatch) -> None:
     _stub(monkeypatch, news_signals, "fetch_top_stories", empty)
     r = client.get("/api/top-stories")
     assert (r.status_code, r.json()) == (200, empty)
+
+
+async def _probe_loop(path: str, gaps: list, done: dict) -> httpx.Response:
+    """GET ``path`` on the app in this event loop (no portal thread), while
+    a ticker records the longest stretch the loop could not run it."""
+
+    async def ticker() -> None:
+        last = time.monotonic()
+        while not done:
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    transport = httpx.ASGITransport(app=dashboard_app.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+        tick = asyncio.create_task(ticker())
+        try:
+            return await c.get(path)
+        finally:
+            done["at"] = time.monotonic()
+            await tick
+
+
+async def test_top_stories_clustering_runs_off_the_event_loop_and_under_the_budget(monkeypatch) -> None:
+    """The real fetch_top_stories over a feed read that answered. Clustering
+    is seconds of CPU over a 7 d window; it runs in a worker thread, so the
+    dashboard keeps serving meanwhile, and the route's budget answers 504
+    with its reason instead of waiting for it."""
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    def slow_cluster(rows, similarity_threshold):
+        threads.append(threading.get_ident())
+        time.sleep(0.8)
+        return []
+
+    async def feed(fetcher, **kwargs):
+        return {"items": [], "feeds_ok": 119, "feeds_failed": []}
+
+    monkeypatch.setattr(news, "fetch_news_feed", feed)
+    monkeypatch.setattr(news_signals, "cluster_articles", slow_cluster)
+    monkeypatch.setattr(dashboard_app, "_ensure_fetcher", lambda: object())
+
+    gaps: list[float] = []
+    r = await _probe_loop("/api/top-stories?hours=168", gaps, {})
+    assert r.status_code == 200 and r.json()["stories"] == []
+    assert threads and threads[0] != loop_thread
+    assert max(gaps) < 0.4, max(gaps)  # the 0.8 s of clustering never held the loop
+
+    monkeypatch.setattr(dashboard_app, "_RESEARCH_TIMEOUT_S", 0.2)
+    r = await _probe_loop("/api/top-stories?hours=168", [], {})
+    assert (r.status_code, r.json()) == (504, {"error": "top stories timed out after 0.2 s", "timeout": True})
 
 
 # ---------------------------------------------------------------------------

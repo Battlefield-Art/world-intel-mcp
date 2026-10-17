@@ -792,7 +792,10 @@ async def fetch_top_stories(
 
     win = _Windows(feed, hours, now)
     rows = win.current
-    raw = cluster_articles(rows, similarity_threshold=threshold)
+    # Clustering compares headline pairs: seconds of CPU over a 7 d window.
+    # In a worker thread it leaves the caller's event loop serving other
+    # requests, and a caller's timeout can fire while it runs.
+    raw = await asyncio.to_thread(cluster_articles, rows, similarity_threshold=threshold)
 
     stories = []
     for c in raw:
