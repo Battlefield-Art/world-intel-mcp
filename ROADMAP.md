@@ -2,7 +2,7 @@
 
 **Benchmark**: [koala73/worldmonitor](https://github.com/koala73/worldmonitor)
 **Updated**: 2026-10-12 (0.11.0: aircraft-cohort early warning, cross-border migration)
-**Current tools**: 139 (138 intel + 1 status)
+**Current tools**: 140 (139 intel + 1 status)
 
 ---
 
@@ -579,7 +579,7 @@ dashboard.
 | 1 | Story breadth | News clusters carry a distinct-outlet count; a top-stories view ranks by how many outlets carry a story | :red_circle: |
 | 1 | Liquidity and flows | Fed balance sheet, Treasury General Account, reverse repo and net liquidity (FRED keyless CSV), money supply (US M2, euro area M1/M2/M3, never summed), ECB, ICI fund flows and ETF net issuance, FINRA margin statistics, BLS series; amounts kept separate from flows | :red_circle: |
 | 1 | Kalshi + cross-venue markets | Kalshi public market data next to Polymarket; same-event comparison with an explicit match confidence; settled markets scored against pre-settlement prices (Brier) | :red_circle: |
-| 1 | News vs market reaction | Companies and countries named in story clusters mapped to tickers / country indices; same-day move against a benchmark | :red_circle: |
+| 1 | News vs market reaction | Companies and countries named in story clusters mapped to tickers / country indices; same-day move against a benchmark | :white_check_mark: Built 2026-10-17, unreleased: `intel_news_market_reaction` and `intel news-reaction`. Company rows: stock, benchmark (SPY, or the exchange country's index) and excess return on the story's session; country rows: index return with a trailing z-score. Session rule in the exchange's timezone (after close = next session; weekends and holidays read from the listing's own bars). Open: `^TASI` and `^TA125` (Saudi and Israel in the country-index table) return 404 on Yahoo, so those benchmarks are data gaps; story times inherit `sources/news.py`'s RSS timestamp offset until that is fixed |
 | 2 | Connections with timing offsets | Correlation between retained series over a shared sample, tested at leads and lags, with minimum sample size and false-discovery control; states that it does not prove causation | :red_circle: |
 | 2 | Day timeline | What every retained source recorded for a given day, by observation date or collection date | :red_circle: |
 | 3 | Dashboard views | Liquidity board, situations, top stories, collection health panels | :red_circle: |
@@ -671,8 +671,8 @@ suite, and a live MCP stdio session.
 
 | Category | Current | Notes |
 |----------|---------|-------|
-| Total MCP tools | 139 | 138 intelligence tools + `intel_status` |
-| Tool parity | 139 / 139 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
+| Total MCP tools | 140 | 139 intelligence tools + `intel_status` |
+| Tool parity | 140 / 140 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
 | Tests in repo | 991 | 973 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 973 passed, 18 deselected); full suite requires `.[dev]` |

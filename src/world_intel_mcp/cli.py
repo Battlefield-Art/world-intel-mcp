@@ -1605,6 +1605,108 @@ def shipping_cmd(ctx: click.Context) -> None:
     console.print(table)
 
 
+def _signed_pct(value: Any) -> str:
+    """A measured percent, coloured; a missing one says so, never 0%."""
+    if value is None:
+        return "[dim]n/a[/dim]"
+    style = "green" if value >= 0 else "red"
+    return f"[{style}]{value:+.2f}%[/{style}]"
+
+
+@main.command(name="news-reaction")
+@click.option("--category", "-c", default=None, help="RSS category (finance, technology, energy, ...)")
+@click.option("--limit", "-n", default=150, type=int, help="News items to cluster (max 300)")
+@click.option("--min-size", default=2, type=int, help="Minimum articles per story (1 includes single-article stories)")
+@click.option("--no-countries", is_flag=True, help="Skip the country-index rows")
+@click.pass_context
+def news_reaction(
+    ctx: click.Context, category: str | None, limit: int, min_size: int, no_countries: bool
+) -> None:
+    """Market move on the session of each story naming a company or country."""
+    from .analysis.news_market import fetch_news_market_reaction
+
+    data = _run(
+        fetch_news_market_reaction(
+            _get_fetcher(),
+            category=category,
+            limit=limit,
+            min_cluster_size=min_size,
+            include_countries=not no_countries,
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    s = data.get("summary", {})
+    console.print(
+        f"[bold]News vs market reaction[/bold]: {s.get('stories_considered', 0)} stories, "
+        f"{s.get('stories_with_entities', 0)} naming a company or country; "
+        f"{s.get('unmapped', 0)} unmapped, {s.get('excluded', 0)} excluded as ambiguous"
+    )
+    console.print(f"[dim]{escape(str(data.get('interpretation', '')))}[/dim]\n")
+
+    table = Table(title="Companies", box=box.SIMPLE_HEAVY)
+    table.add_column("Story", max_width=48)
+    table.add_column("Company", style="bold")
+    table.add_column("Ticker")
+    table.add_column("Session")
+    table.add_column("Stock", justify="right")
+    table.add_column("Benchmark", justify="right")
+    table.add_column("Excess", justify="right")
+    table.add_column("Status")
+    for r in data.get("company_reactions", []):
+        status = r.get("status", "")
+        table.add_row(
+            _cell(r.get("story", {}).get("headline", "")),
+            _cell(r.get("entity", {}).get("name", "")),
+            _cell(f"{r.get('symbol', '')} vs {r.get('benchmark') or 'none'}"),
+            _cell(r.get("session_date") or "-"),
+            _signed_pct(r.get("stock_return_pct")),
+            _signed_pct(r.get("benchmark_return_pct")),
+            _signed_pct(r.get("excess_return_pct")),
+            _cell(status if status == "measured" else f"{status}: {r.get('gap', '')}"),
+        )
+    console.print(table)
+
+    if not no_countries:
+        table = Table(title="Countries", box=box.SIMPLE_HEAVY)
+        table.add_column("Story", max_width=48)
+        table.add_column("Country", style="bold")
+        table.add_column("Index")
+        table.add_column("Session")
+        table.add_column("Index move", justify="right")
+        table.add_column("z", justify="right")
+        table.add_column("Status")
+        for r in data.get("country_reactions", []):
+            status = r.get("status", "")
+            z = r.get("zscore")
+            table.add_row(
+                _cell(r.get("story", {}).get("headline", "")),
+                _cell(r.get("entity", {}).get("name", "")),
+                _cell(r.get("symbol", "")),
+                _cell(r.get("session_date") or "-"),
+                _signed_pct(r.get("index_return_pct")),
+                "[dim]n/a[/dim]" if z is None else f"{z:+.2f}",
+                _cell(status if status == "measured" else f"{status}: {r.get('gap', '')}"),
+            )
+        console.print(table)
+
+    # Unmapped names are listed, not dropped; one line per name and reason.
+    unmapped: dict[tuple[str, str], int] = {}
+    for row in data.get("unmapped", []):
+        key = (str(row.get("entity", {}).get("name", "")), str(row.get("reason", "")))
+        unmapped[key] = unmapped.get(key, 0) + 1
+    for (name, reason), count in unmapped.items():
+        stories = f" ({count} stories)" if count > 1 else ""
+        console.print(f"[dim]Unmapped:[/dim] {escape(name)}{stories}: {escape(reason)}")
+    for row in data.get("excluded", []):
+        console.print(
+            f"[yellow]Excluded:[/yellow] {escape(str(row.get('entity', {}).get('name', '')))}"
+            f" in \"{escape(str(row.get('story', '')))}\": {escape(str(row.get('reason', '')))}"
+        )
+    _print_data_gaps(data)
+
+
 # ---------------------------------------------------------------------------
 # Social & Health
 # ---------------------------------------------------------------------------

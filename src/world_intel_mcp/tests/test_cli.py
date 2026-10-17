@@ -2688,3 +2688,137 @@ def test_aoi_changes_error_dict_json_mode_passes_raw_dict(
     assert result.exit_code == 0
     assert '"error"' in result.output
     assert "store exploded" in result.output
+
+
+# ---------------------------------------------------------------------------
+# News vs market reaction
+# ---------------------------------------------------------------------------
+
+# Rows trimmed from a live run on 2026-10-17 (technology and energy feeds).
+_NEWS_REACTION = {
+    "company_reactions": [
+        {
+            "story": {"headline": "British watchdog seeks tougher terms around Microsoft's dominance"},
+            "entity": {"type": "company", "name": "Microsoft"},
+            "symbol": "MSFT",
+            "benchmark": "SPY",
+            "session_date": "2026-10-16",
+            "status": "measured",
+            "stock_return_pct": -1.9261,
+            "benchmark_return_pct": -1.1065,
+            "excess_return_pct": -0.8196,
+        },
+        {
+            "story": {"headline": "Aramco CEO Warns Oil Squeeze is [red]Serious[/red]"},
+            "entity": {"type": "company", "name": "Aramco"},
+            "symbol": "2222.SR",
+            "benchmark": "^TASI",
+            "status": "data_gap",
+            "gap": "no daily bars for benchmark ^TASI",
+        },
+    ],
+    "country_reactions": [
+        {
+            "story": {"headline": "China Adjusts VAT Exemption For Exported Vehicles"},
+            "entity": {"type": "country", "iso3": "CHN", "name": "China"},
+            "symbol": "000001.SS",
+            "session_date": "2026-10-16",
+            "status": "measured",
+            "index_return_pct": 0.2376,
+            "zscore": 0.73,
+        },
+        {
+            "story": {"headline": "India becomes the latest country to report rogue AI agent activity"},
+            "entity": {"type": "country", "iso3": "IND", "name": "India"},
+            "symbol": "^NSEI",
+            "status": "pending",
+            "gap": "no ^NSEI session on or after 2026-10-17 yet (last bar 2026-10-16)",
+        },
+    ],
+    "unmapped": [{"story": "x", "entity": {"name": "Openai"}, "reason": "no public listing"}],
+    "excluded": [
+        {
+            "story": "Shell fire hits border town",
+            "entity": {"type": "company", "name": "Shell"},
+            "reason": "'shell' is also an artillery round",
+        }
+    ],
+    "summary": {"stories_considered": 146, "stories_with_entities": 22, "unmapped": 1, "excluded": 1},
+    "data_gaps": ["^TASI: Yahoo chart returned no data (request failed or symbol unknown)"],
+    "interpretation": "Same-session co-movement only. This is not a trading signal.",
+}
+
+
+def test_news_reaction_renders_rows_gaps_and_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    import world_intel_mcp.analysis.news_market as news_market
+
+    calls: list = []
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(_NEWS_REACTION, calls))
+    result = _invoke("news-reaction", "-c", "finance", "--limit", "80", "--min-size", "1")
+    assert result.exit_code == 0
+    assert calls == [{"category": "finance", "limit": 80, "min_cluster_size": 1, "include_countries": True}]
+    out = result.output
+    assert "146 stories, 22 naming a company or country; 1 unmapped, 1 excluded as ambiguous" in out
+    assert "not a trading signal" in out
+    assert "MSFT vs SPY" in out
+    assert "-1.93%" in out and "-1.11%" in out and "-0.82%" in out
+    assert "+0.24%" in out and "+0.73" in out
+    # A gap renders n/a and its reason, never a 0% move
+    assert "data_gap: no daily bars for benchmark ^TASI" in out
+    assert "pending: no ^NSEI session on or after 2026-10-17" in out
+    assert "+0.00%" not in out and "-0.00%" not in out
+    assert "n/a" in out
+    # Remote headline markup renders literally
+    assert "[red]Serious[/red]" in out
+    assert "Excluded: Shell" in out
+    assert "Gap: ^TASI: Yahoo chart returned no data" in out
+
+
+def test_news_reaction_lists_unmapped_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    import world_intel_mcp.analysis.news_market as news_market
+
+    no_listing = "no public listing in the entity table (private or unlisted)"
+    no_index = "no primary index mapped for RUS in the table intel_country_stocks uses"
+    data = {
+        **_NEWS_REACTION,
+        "unmapped": [
+            {"story": "a", "entity": {"type": "company", "name": "Openai"}, "reason": no_listing},
+            {"story": "b", "entity": {"type": "company", "name": "Openai"}, "reason": no_listing},
+            {"story": "c", "entity": {"type": "country", "name": "Russia"}, "reason": no_index},
+        ],
+    }
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(data))
+    result = _invoke("news-reaction")
+    assert result.exit_code == 0
+    out = " ".join(result.output.split())
+    assert f"Unmapped: Openai (2 stories): {no_listing}" in out
+    assert f"Unmapped: Russia: {no_index}" in out
+
+
+def test_news_reaction_no_countries_skips_country_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    import world_intel_mcp.analysis.news_market as news_market
+
+    calls: list = []
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(_NEWS_REACTION, calls))
+    result = _invoke("news-reaction", "--no-countries")
+    assert result.exit_code == 0
+    assert calls[0]["include_countries"] is False
+    assert "Countries" not in result.output
+    assert "China Adjusts VAT" not in result.output
+
+
+def test_news_reaction_error_dict_and_json_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    import world_intel_mcp.analysis.news_market as news_market
+
+    err = {"error": "news feed returned no items; nothing to measure (feeds down or empty)"}
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(err))
+    result = _invoke("news-reaction")
+    assert result.exit_code == 0
+    assert "Error: news feed returned no items" in result.output
+    assert "Companies" not in result.output
+
+    monkeypatch.setattr(news_market, "fetch_news_market_reaction", _fake(_NEWS_REACTION))
+    result = _invoke("--json-output", "news-reaction")
+    assert result.exit_code == 0
+    assert '"excess_return_pct": -0.8196' in result.output
+    assert "Companies" not in result.output
