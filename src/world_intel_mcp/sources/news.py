@@ -6,6 +6,7 @@ search via the GDELT 2.0 Doc API. No API keys required.
 """
 
 import asyncio
+import functools
 import logging
 import re
 import string
@@ -317,6 +318,29 @@ SOURCE_TIERS: dict[str, str] = {
     "E&E News": "specialty",
 }
 
+# Feeds that are sister editions of one publisher. Story breadth counts
+# outlets, not feeds: BBC World and BBC Mundo carrying a story is one
+# outlet's coverage. Feeds not listed are their own outlet.
+FEED_OUTLETS: dict[str, str] = {
+    "BBC World": "BBC",
+    "BBC Mundo": "BBC",
+    "DW News": "DW",
+    "DW Español": "DW",
+    "DW Deutsch": "DW",
+    "DW Europe": "DW",
+    "France24": "France 24",
+    "France24 Français": "France 24",
+    "UN News": "UN News",
+    "UN News Español": "UN News",
+    "UN News Français": "UN News",
+}
+
+
+def outlet_for(feed_name: str) -> str:
+    """The publisher behind a feed name (the feed name itself if unmapped)."""
+    return FEED_OUTLETS.get(feed_name, feed_name)
+
+
 _STOPWORDS: set[str] = {
     "the",
     "a",
@@ -485,15 +509,17 @@ _PUNCT_RE = re.compile(f"[{re.escape(string.punctuation)}]")
 def _parse_published(entry: dict) -> str | None:
     """Parse an RSS entry's published date to ISO 8601 UTC string.
 
-    feedparser stores the parsed time struct in ``published_parsed``.
-    Falls back to the raw ``published`` string if parsing fails.
+    feedparser stores the parsed time struct in ``published_parsed``, in
+    UTC. ``calendar.timegm`` reads it as UTC; ``time.mktime`` (used before
+    2026-10-17) read it as local time and shifted every stamp by the host's
+    UTC offset. Falls back to the raw ``published`` string if parsing fails.
     """
-    import time as _time
+    from calendar import timegm
 
     parsed_tuple = entry.get("published_parsed")
     if parsed_tuple is not None:
         try:
-            epoch = _time.mktime(parsed_tuple[:9])
+            epoch = timegm(parsed_tuple[:9])
             dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except (ValueError, TypeError, OverflowError):
@@ -503,7 +529,7 @@ def _parse_published(entry: dict) -> str | None:
     updated_tuple = entry.get("updated_parsed")
     if updated_tuple is not None:
         try:
-            epoch = _time.mktime(updated_tuple[:9])
+            epoch = timegm(updated_tuple[:9])
             dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except (ValueError, TypeError, OverflowError):
@@ -525,6 +551,30 @@ def _truncate(text: str | None, max_len: int = 200) -> str:
 # ---------------------------------------------------------------------------
 # Function 1: RSS News Feed Aggregation
 # ---------------------------------------------------------------------------
+
+# In-flight all-feeds reads, keyed by (fetcher, event loop, feed set);
+# an entry lives only while its read runs.
+_INFLIGHT_READS: dict[tuple, asyncio.Future] = {}
+
+
+def _release_read(key: tuple, task: asyncio.Future) -> None:
+    if _INFLIGHT_READS.get(key) is task:
+        del _INFLIGHT_READS[key]
+    if not task.cancelled():
+        # Retrieved here so a read every caller abandoned never logs
+        # "exception was never retrieved"; awaiting callers still get it.
+        task.exception()
+
+
+def _stale_serves(fetcher: Fetcher, source: str) -> int:
+    """How many times the fetcher has served ``source`` from an expired copy.
+
+    Text payloads carry no inline ``_stale`` marker (fetcher._stale_fallback
+    counts them on the breaker instead), so a change in this count across
+    one fetch is the only sign that a feed came back as old cached XML.
+    """
+    count = fetcher.breaker.status().get(source, {}).get("total_stale_serves", 0)
+    return count if isinstance(count, int) else 0
 
 
 async def fetch_news_feed(
@@ -571,6 +621,14 @@ async def fetch_news_feed(
         categories_to_fetch = dict(_RSS_FEEDS)
 
     all_items: list[dict] = []
+    # Feeds whose fetch failed or timed out. A dead feed used to contribute
+    # an empty list exactly like a quiet one, so a full outage read as a
+    # slow news day (ROADMAP Phase 24.5).
+    failed_feeds: list[str] = []
+    # Feeds whose live fetch failed but came back as an expired cached copy.
+    # In a running deployment the cache is warm, so an outage mostly looks
+    # like this, not like failed_feeds.
+    stale_feeds: list[str] = []
 
     async def _fetch_single_feed(
         feed_name: str,
@@ -579,9 +637,11 @@ async def fetch_news_feed(
     ) -> list[dict]:
         """Fetch and parse a single RSS feed, returning extracted items."""
         safe_name = feed_name.lower().replace(" ", "_")
+        source = f"rss:{safe_name}"
+        stale_before = _stale_serves(fetcher, source)
         xml_text = await fetcher.get_xml(
             url,
-            source=f"rss:{safe_name}",
+            source=source,
             cache_key=f"news:rss:{safe_name}",
             cache_ttl=300,
             timeout=8.0,
@@ -589,7 +649,10 @@ async def fetch_news_feed(
 
         if xml_text is None:
             logger.debug("No data from RSS feed %s (%s)", feed_name, url)
+            failed_feeds.append(feed_name)
             return []
+        if _stale_serves(fetcher, source) > stale_before:
+            stale_feeds.append(feed_name)
 
         parsed = feedparser.parse(xml_text)
         items: list[dict] = []
@@ -620,6 +683,7 @@ async def fetch_news_feed(
             )
         except asyncio.TimeoutError:
             logger.debug("RSS feed %s timed out", feed_name)
+            failed_feeds.append(feed_name)
             return []
 
     # Fetch feeds with concurrency cap to avoid saturating the httpx pool.
@@ -631,14 +695,31 @@ async def fetch_news_feed(
         async with sem:
             return await _safe_fetch(feed_name, url, cat)
 
-    all_tasks = [
-        _throttled(feed_name, url, cat)
-        for cat, feeds in categories_to_fetch.items()
-        for feed_name, url in feeds
-    ]
-    results = await asyncio.gather(*all_tasks)
+    async def _read_all() -> tuple[list[list[dict]], list[str], list[str]]:
+        results = await asyncio.gather(
+            *(
+                _throttled(feed_name, url, cat)
+                for cat, feeds in categories_to_fetch.items()
+                for feed_name, url in feeds
+            )
+        )
+        return results, sorted(failed_feeds), sorted(stale_feeds)
+
+    # Concurrent reads of one feed set share a single fetch per feed: the
+    # collector starts news_feed, trending_keywords, situations and
+    # top_stories in one gather, and each used to request every feed.
+    # shield() keeps a caller's cancellation (a per-source timeout) from
+    # cancelling the read the other callers are waiting on.
+    key = (id(fetcher), id(asyncio.get_running_loop()), tuple(categories_to_fetch))
+    shared = _INFLIGHT_READS.get(key)
+    if shared is None:
+        shared = asyncio.ensure_future(_read_all())
+        _INFLIGHT_READS[key] = shared
+        shared.add_done_callback(functools.partial(_release_read, key))
+    results, failed, stale = await asyncio.shield(shared)
     for items in results:
-        all_items.extend(items)
+        # Copies: concurrent callers must not share mutable item dicts.
+        all_items.extend(dict(item) for item in items)
 
     # Sort by published date descending (entries without dates go last)
     all_items.sort(
@@ -649,13 +730,31 @@ async def fetch_news_feed(
     # Apply limit
     all_items = all_items[:limit]
 
-    return {
+    feeds_attempted = sum(len(feeds) for feeds in categories_to_fetch.values())
+    result: dict = {
         "items": all_items,
         "count": len(all_items),
         "categories_fetched": list(categories_to_fetch.keys()),
+        "feeds_attempted": feeds_attempted,
+        "feeds_ok": feeds_attempted - len(failed) - len(stale),
+        "feeds_failed": failed,
+        # Served from an expired cached copy after a failed fetch: their
+        # items are kept (each carries its own publish time) but are old.
+        "feeds_stale": stale,
         "source": "rss-aggregator",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if feeds_attempted and result["feeds_ok"] == 0:
+        # No feed answered live: an outage, never "no news", whether or not
+        # old cached copies filled in. The items list keeps the normal shape
+        # so callers that only iterate still work.
+        error = f"All {feeds_attempted} RSS feeds failed or timed out"
+        if stale:
+            error += f" ({len(stale)} served from an expired cache copy)"
+        result["error"] = error
+        result["degraded"] = True
+        result["reason"] = "all_feeds_failed"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -716,12 +815,17 @@ async def fetch_trending_keywords(
     # Return top 50
     keywords = keywords[:50]
 
-    return {
+    result = {
         "keywords": keywords,
         "total_items_analyzed": len(items),
         "source": "keyword-analysis",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    # An RSS outage is not "nothing trending".
+    for key in ("error", "degraded", "reason"):
+        if key in feed_data:
+            result[key] = feed_data[key]
+    return result
 
 
 # ---------------------------------------------------------------------------

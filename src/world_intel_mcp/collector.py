@@ -76,9 +76,14 @@ SOURCES = [
     ("nav_warnings", "sources.maritime", "fetch_nav_warnings", {}),
     # Climate (1)
     ("climate_anomalies", "sources.climate", "fetch_climate_anomalies", {}),
-    # News (2)
+    # News (4)
     ("news_feed", "sources.news", "fetch_news_feed", {}),
     ("trending_keywords", "sources.news", "fetch_trending_keywords", {}),
+    # Ranked situations and outlet-breadth stories over the same RSS read:
+    # fetch_news_feed shares one in-flight read among concurrent callers,
+    # so these four request each feed once per cycle.
+    ("situations", "analysis.news_signals", "fetch_situations", {}),
+    ("top_stories", "analysis.news_signals", "fetch_top_stories", {}),
     # Prediction (1)
     ("prediction_markets", "sources.prediction", "fetch_prediction_markets", {}),
     # Aviation (4)
@@ -161,7 +166,7 @@ DOMAIN_GROUPS = {
     "infrastructure": ["internet_outages", "cable_health", "service_status"],
     "maritime": ["nav_warnings"],
     "climate": ["climate_anomalies"],
-    "news": ["news_feed", "trending_keywords"],
+    "news": ["news_feed", "trending_keywords", "situations", "top_stories"],
     "prediction": ["prediction_markets"],
     "aviation": ["airport_delays", "domestic_flights", "bizjet_cohort", "military_cohort"],
     "cyber": ["cyber_threats"],

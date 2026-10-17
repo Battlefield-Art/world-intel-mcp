@@ -254,6 +254,97 @@ def classify_event(text: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Hostility categories (headline heuristic for news_signals)
+#
+# Four kinds of hostile coverage between or toward countries. English
+# keywords over a headline, boundary-anchored like the categories above.
+# A keyword heuristic: it does not parse who acts on whom, negation
+# ("rules out strikes"), quotation, or sports and weather idiom beyond the
+# patterns pinned below. Non-English headlines match only through
+# spellings they share with English ("sanctions", "missile").
+# ---------------------------------------------------------------------------
+
+HOSTILITY_CATEGORIES: dict[str, list[str]] = {
+    "threat": [
+        "threat", "warns", "warned", "ultimatum", "retaliat", "vows revenge",
+        "vow revenge",
+    ],
+    "sanction": [
+        "sanction", "embargo", "blacklist", "export control", "export ban",
+        "asset freeze", "tariff", "trade war",
+    ],
+    "force": [
+        "airstrike", "air strike", "missile", "drone strike", "drone attack",
+        "attack", "bombing", "bombard", "shelling", "invasion", "invade",
+        "troops", "clash", "artillery", "offensive", "war", "raid",
+        "military strike", "strikes on", "strike on", "strike kill",
+        "strikes kill",
+    ],
+    "criticism": [
+        "condemn", "criticis", "criticiz", "denounce", "rebuke", "slams",
+        "slammed", "accuse", "accusation", "summons ambassador",
+        "summoned ambassador", "lambast",
+    ],
+}
+
+# Narrower than the default \bkw\w* stem where the stem would fire on
+# unrelated words: "war" not inside "warns"/"warrant"/"Warsaw", and not
+# a trade, price or culture war (a trade war counts as sanction); "raid"
+# not as "raiders" (sports teams); "attack" not as "attacker" (football);
+# "troops" not "troopship"-style compounds; "offensive" not before
+# remarks, comments or posts. Other idioms ("war on drugs", a "heart
+# attack") still match: a named limit.
+_HOSTILITY_OVERRIDES: dict[str, str] = {
+    "war": r"(?<!trade )(?<!price )(?<!culture )(?<!tariff )\bwars?\b(?! of words)",
+    "trade war": r"\btrade wars?\b",
+    "offensive": (
+        r"\boffensive\b(?! (?:remarks?|comments?|language|posts?|tweets?|jokes?|content))"
+    ),
+    "raid": r"\braid(?:s|ed)?\b",
+    "attack": r"\battack(?:s|ed|ing)?\b",
+    "clash": r"\bclash(?:es|ed)?\b",
+    "troops": r"\btroops\b",
+}
+
+_HOSTILITY_PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
+    cat: [
+        (
+            kw,
+            re.compile(_HOSTILITY_OVERRIDES[kw])
+            if kw in _HOSTILITY_OVERRIDES
+            else _compile_keyword(kw),
+        )
+        for kw in kws
+    ]
+    for cat, kws in HOSTILITY_CATEGORIES.items()
+}
+
+HOSTILITY_METHOD = (
+    "English keyword heuristic over headlines (classifier.HOSTILITY_CATEGORIES): "
+    "boundary-anchored stems, no parsing of who acts on whom, negation, "
+    "quotation or idiom; a headline can count in several categories. Written "
+    "for English: a non-English headline matches only through shared "
+    "spellings (French 'sanctions', 'missile'), so non-English coverage is "
+    "undercounted."
+)
+
+
+def classify_hostility(text: str) -> dict[str, list[str]]:
+    """Hostility categories a headline matches, with the keywords that hit.
+
+    Returns {category: [matched keywords]} for matching categories only;
+    an empty dict means no hostility keyword matched.
+    """
+    text_lower = (text or "").lower()
+    out: dict[str, list[str]] = {}
+    for cat, patterns in _HOSTILITY_PATTERNS.items():
+        hits = _matched_keywords(patterns, text_lower)
+        if hits:
+            out[cat] = hits
+    return out
+
+
 async def fetch_classify_event(fetcher, text: str) -> dict:
     """Classify a text event. Thin async wrapper for MCP dispatch."""
     return classify_event(text)

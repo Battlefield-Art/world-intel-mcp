@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **142 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -35,6 +35,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Maritime** | 2 | NGA navigation warnings, vessel snapshots |
 | **Aviation** | 5 | FAA airport delays, domestic flight snapshot, business-jet/military cohort early warning (adsb.lol live + globe_history heatmaps) |
 | **News & Media** | 3 | 119 RSS feeds (4-tier), GDELT, trending keywords |
+| **News Signals** | 3 | GDELT DOC timelines (daily volume, hostile-term volume, tone) per country or pair; RSS situations ranked by coverage, hostility or change; top stories by distinct-outlet count with attention growth |
 | **Intelligence Analysis** | 8 | Signal convergence, focal points, instability index, risk scores, escalation |
 | **NLP Intelligence** | 4 | Entity extraction, event classification, news clustering, keyword spikes |
 | **Strategic Synthesis** | 4 | Strategic posture, world brief, fleet report, population exposure |
@@ -64,7 +65,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 139 tools** across 30+ intelligence domains.
+**Total: 142 tools** across 30+ intelligence domains.
 
 ---
 
@@ -129,6 +130,9 @@ intel markets              # stock indices
 intel earthquakes --min-mag 5.0
 intel migration-surges     # year-over-year displacement jumps (UNHCR)
 intel migration-flows -o Sudan
+intel hostility Iran Israel --days 7   # daily hostile coverage (GDELT)
+intel situations --sort change         # ranked situations (RSS)
+intel top-stories -m 4                 # stories carried by 4+ outlets
 intel status               # cache + circuit breaker health
 ```
 
@@ -147,7 +151,7 @@ collector.py  (daemon)    ─┘
 - **CircuitBreaker**: Per-source tracking. 3 consecutive failures trips for 5 minutes. Each RSS feed gets its own breaker.
 - **Cache**: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 - **VectorStore**: Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim). Async background worker queue for non-blocking storage. Enables semantic search across all accumulated intelligence.
-- **Collector**: Standalone daemon that fetches all 55 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
+- **Collector**: Standalone daemon that fetches all 57 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
 - **Sources** (`sources/*.py`): 30+ modules, each exports `async def fetch_*(fetcher, **kwargs) -> dict`.
 - **Analysis** (`analysis/*.py`): Cross-domain synthesis — signal aggregation, instability indexing, NLP, company enrichment, macro composite.
 - **Config** (`config/*.py`): Curated datasets — 22 hotspots, 70+ bases, 40 ports, 24 pipelines, 24 nuclear facilities, 34 cables, 48 datacenters, 27 spaceports, 82 exchanges.
@@ -289,6 +293,13 @@ collector.py  (daemon)    ─┘
 | `intel_trending_keywords` | Trending terms with spike detection |
 | `intel_gdelt_search` | GDELT 2.0 global news search |
 
+### News Signals (3)
+| Tool | Description |
+|------|-------------|
+| `intel_hostility_timeline` | Per-day GDELT coverage of a country or a pair: article count, articles using threat / sanction / force / criticism terms (GDELT keyword match, terms listed in the response), average tone. A failed call or a day GDELT did not return is null and listed in `data_gaps`, never zero |
+| `intel_situations` | Situations between countries (headlines naming two or more) and inside a country (headlines naming one), ranked by most covered, most hostile (headline keyword heuristic) or biggest change against the prior window; the response defines each measure and names the feeds excluded from change figures |
+| `intel_top_stories` | Stories carried by at least `min_outlets` distinct outlets (sister feeds of one publisher count once), plus the countries and organizations whose headline mentions grew most |
+
 ### Intelligence Analysis (8)
 | Tool | Description |
 |------|-------------|
@@ -306,7 +317,7 @@ collector.py  (daemon)    ─┘
 |------|-------------|
 | `intel_extract_entities` | Named entity extraction (countries, leaders, orgs, CVEs, APTs) |
 | `intel_classify_event` | Event classification into 14 threat categories |
-| `intel_news_clusters` | Topic clustering by Jaccard similarity |
+| `intel_news_clusters` | Topic clustering by Jaccard similarity, with each cluster's distinct-outlet count |
 | `intel_keyword_spikes` | Keyword spike detection with Welford's algorithm |
 
 ### Strategic Synthesis (4)
