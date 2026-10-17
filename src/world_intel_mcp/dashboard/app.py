@@ -5,6 +5,7 @@ All data pulled from the same source modules used by the MCP server.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -50,7 +51,10 @@ from world_intel_mcp.sources import (
     traffic,
     webcams,
     migration,
+    liquidity,
 )
+from world_intel_mcp.analysis import news_signals
+from world_intel_mcp.history import HistoryStore
 from world_intel_mcp.analysis.alerts import fetch_alert_digest, fetch_weekly_trends
 from world_intel_mcp.analysis.posture import fetch_strategic_posture
 from world_intel_mcp.analysis.exposure import fetch_population_exposure
@@ -732,6 +736,199 @@ async def api_migration(request):
     return JSONResponse(payload, headers=cors)
 
 
+# ---------------------------------------------------------------------------
+# Research panels (ROADMAP Phase 29): liquidity board, situations, top
+# stories, collection health. Each route calls the function the matching MCP
+# tool calls and passes its payload through unchanged, so the partial-failure
+# markers it carries (unavailable rows, data_gaps, stale and degraded flags)
+# reach the page. Only whole-call failures become HTTP errors: a payload with
+# ``error`` is a 503 with the payload intact, a timeout a 504, an exception a
+# 503 with the reason. None of them answers with an empty list that could
+# read as "nothing happened".
+# ---------------------------------------------------------------------------
+
+_CORS = {"Access-Control-Allow-Origin": "*"}
+
+# The budget /api/stream gives its slow sources. The RSS panels read every
+# feed: 5 to 15 s per call measured 2026-10-17, warm cache included, as a
+# failed feed is not cached and each call retries it for up to 12 s.
+_RESEARCH_TIMEOUT_S = 90.0
+
+# Accepted values, as each MCP tool's input schema declares them.
+_LIQUIDITY_SORTS = ("biggest_move", "newest")
+_SITUATION_SORTS = ("covered", "hostile", "change")
+_SITUATION_KINDS = ("all", "between", "inside")
+
+
+def _query_number(params, name: str, default, kind, low, high):
+    """A numeric query parameter, or ``default`` when absent. Raises
+    ValueError (answered as a 400) when it does not parse or is outside
+    ``[low, high]``, so a request is never silently answered for other
+    values than it asked for."""
+    raw = params.get(name)
+    if raw is None:
+        return default
+    try:
+        value = kind(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number between {low} and {high}, got {raw!r}") from None
+    if not low <= value <= high:  # also refuses nan and inf
+        raise ValueError(f"{name} must be between {low} and {high}, got {raw!r}")
+    return value
+
+
+def _query_choice(params, name: str, choices: tuple[str, ...]) -> str:
+    value = params.get(name, choices[0])
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {', '.join(choices)}, got {value!r}")
+    return value
+
+
+async def _research_payload(name: str, coro) -> tuple[dict, int]:
+    """Await one research function: (payload, HTTP status). Only this
+    budget expiring is reported as the timeout; a TimeoutError raised
+    inside the function is a failure like any other exception."""
+    budget = asyncio.timeout(_RESEARCH_TIMEOUT_S)
+    try:
+        async with budget:
+            data = await coro
+    except Exception as exc:
+        if isinstance(exc, TimeoutError) and budget.expired():
+            logger.warning("Dashboard %s timed out after %gs", name, _RESEARCH_TIMEOUT_S)
+            return {"error": f"{name} timed out after {_RESEARCH_TIMEOUT_S:g} s", "timeout": True}, 504
+        logger.warning("Dashboard %s failed: %s", name, exc)
+        return {"error": f"{name} failed: {type(exc).__name__}: {str(exc)[:200]}"}, 503
+    return data, 503 if data.get("error") else 200
+
+
+def _bad_request(exc: ValueError) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=400, headers=_CORS)
+
+
+async def api_liquidity_board(request):
+    """``sources.liquidity.fetch_liquidity_board`` (``?sort=biggest_move|newest``).
+
+    Adds ``net_liquidity_method``: the liquidity module's own statement of
+    how the derived net liquidity row is computed (each term's units and
+    conversion, the RRP alignment, why the TGA term is the Wednesday level),
+    the block ``intel_net_liquidity`` returns as ``method``. It is attached
+    to failures too, so a board that could not compute still says what it
+    would have computed.
+    """
+    try:
+        sort = _query_choice(request.query_params, "sort", _LIQUIDITY_SORTS)
+    except ValueError as exc:
+        return _bad_request(exc)
+    payload, status = await _research_payload(
+        "liquidity board", liquidity.fetch_liquidity_board(_ensure_fetcher(), sort=sort)
+    )
+    payload.setdefault("net_liquidity_method", copy.deepcopy(liquidity.NET_LIQUIDITY_METHOD))
+    return JSONResponse(payload, status_code=status, headers=_CORS)
+
+
+async def api_situations(request):
+    """``analysis.news_signals.fetch_situations`` over the RSS feeds
+    (``?hours=1-168&sort=covered|hostile|change&kind=all|between|inside&limit=&min_articles=``).
+    Every RSS feed failing is the function's own error answer, a 503."""
+    params = request.query_params
+    try:
+        kwargs = {
+            "hours": _query_number(params, "hours", 24.0, float, 1, 168),
+            "sort": _query_choice(params, "sort", _SITUATION_SORTS),
+            "kind": _query_choice(params, "kind", _SITUATION_KINDS),
+            "limit": _query_number(params, "limit", 20, int, 1, 100),
+            "min_articles": _query_number(params, "min_articles", 2, int, 1, 1000),
+        }
+    except ValueError as exc:
+        return _bad_request(exc)
+    payload, status = await _research_payload(
+        "situations", news_signals.fetch_situations(_ensure_fetcher(), **kwargs)
+    )
+    return JSONResponse(payload, status_code=status, headers=_CORS)
+
+
+async def api_top_stories(request):
+    """``analysis.news_signals.fetch_top_stories``
+    (``?hours=1-168&min_outlets=&limit=&attention_limit=``)."""
+    params = request.query_params
+    try:
+        kwargs = {
+            "hours": _query_number(params, "hours", 24.0, float, 1, 168),
+            "min_outlets": _query_number(params, "min_outlets", 3, int, 1, 50),
+            "limit": _query_number(params, "limit", 10, int, 1, 50),
+            "attention_limit": _query_number(params, "attention_limit", 10, int, 1, 50),
+        }
+    except ValueError as exc:
+        return _bad_request(exc)
+    payload, status = await _research_payload(
+        "top stories", news_signals.fetch_top_stories(_ensure_fetcher(), **kwargs)
+    )
+    return JSONResponse(payload, status_code=status, headers=_CORS)
+
+
+def _history_db_path() -> Path:
+    """The cache database the dashboard's Fetcher opened. The collector
+    writes its run log into the cache database of the environment it runs
+    in, so this is the store ``intel_collection_health`` reads in an MCP
+    server configured the same way."""
+    return _ensure_fetcher().cache.db_path
+
+
+def _collector_roster() -> list[str]:
+    """The collector's source names, imported lazily as tools/history.py
+    does. Importing the collector module runs its ``logging.basicConfig``
+    (level INFO); in this process, where nothing configures the root
+    logger, that would attach a stderr handler and start printing a line
+    per upstream request. The root logger's handlers and level are put
+    back as they were. Called on the event loop thread, so no other
+    request reconfigures logging in between."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    from world_intel_mcp.collector import SOURCES
+
+    for handler in [h for h in root.handlers if h not in handlers]:
+        root.removeHandler(handler)
+    root.setLevel(level)
+    return [name for name, _, _, _ in SOURCES]
+
+
+def _read_collection_health(db_path: Path, roster: list[str], source: str | None) -> dict:
+    """Open the history store, read collection health, close. Runs in a
+    worker thread, so the store's SQLite connection is created and used on
+    that one thread and the read (which sums payload sizes) never stalls
+    the event loop that serves the SSE stream."""
+    store = HistoryStore(db_path)
+    try:
+        return store.collection_health(roster, source=source)
+    finally:
+        store.close()
+
+
+async def api_collection_health(request):
+    """``HistoryStore.collection_health`` on the dashboard cache's database
+    (``?source=`` for one source). A store that cannot be opened or read is
+    a 503 with the reason and the database path, never a list of zeros; a
+    database the collector never wrote reports every source ``never_run``;
+    an unknown source is a 404 naming the known ones."""
+    source = request.query_params.get("source") or None
+    db_path = None
+    try:
+        db_path = _history_db_path()
+        roster = _collector_roster()
+        data = await asyncio.to_thread(_read_collection_health, db_path, roster, source)
+    except Exception as exc:
+        logger.warning("Collection health unavailable: %s", exc)
+        return JSONResponse(
+            {
+                "error": f"history store unavailable: {type(exc).__name__}: {exc}",
+                "db_path": None if db_path is None else str(db_path),
+            },
+            status_code=503,
+            headers=_CORS,
+        )
+    return JSONResponse(data, status_code=404 if "error" in data else 200, headers=_CORS)
+
+
 async def api_health(request):
     """Health check."""
     return JSONResponse({"status": "ok"})
@@ -887,6 +1084,10 @@ app = Starlette(
         Route("/api/static", api_static),
         Route("/api/aois", api_aois),
         Route("/api/migration", api_migration),
+        Route("/api/liquidity-board", api_liquidity_board),
+        Route("/api/situations", api_situations),
+        Route("/api/top-stories", api_top_stories),
+        Route("/api/collection-health", api_collection_health),
         Route("/api/health", api_health),
         Route("/api/report/pdf", api_report_pdf),
         Route("/sse/vector-analytics", sse_vector_analytics),

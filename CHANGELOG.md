@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Added: dashboard research panels (Phase 29)
+- RESEARCH in the dashboard top bar (or the `p` key) opens four tabs:
+  liquidity board, situations, top stories and collection health. Each tab
+  loads from its own route when opened and refreshes every 60 s while the
+  panel is open: `/api/liquidity-board`, `/api/situations`,
+  `/api/top-stories`, `/api/collection-health`. Each route calls the
+  function the MCP tool calls (`fetch_liquidity_board`, `fetch_situations`,
+  `fetch_top_stories`, and `HistoryStore.collection_health` on the
+  dashboard cache's database) and passes its payload through; the
+  liquidity route adds the net liquidity `method` block.
+- Failures read as failures: a payload with `error` is a 503 with the
+  payload intact, an exception a 503 with the reason, the 90 s budget a
+  504, a bad parameter a 400 before anything is fetched. A panel never
+  shows figures it has not received: before the first answer it says so, a
+  failed first load shows UNAVAILABLE with the reason and the payload's
+  diagnostics (unavailable indicators, blocked sources, data gaps), and a
+  failed refresh keeps the earlier copy under a REFRESH FAILED banner with
+  the time it loaded. An answer to a query the controls have since changed
+  is dropped.
+- Liquidity rows keep the units each row states and are grouped by
+  measure, amounts outstanding apart from flows. Collection health lists
+  failing, degraded, not-attempted-recently and never-run sources and shows
+  `cannot_prove` as given; a database with no capture says every source
+  reads never_run and why.
+- Remote text is escaped by the renderers and sanitized again on
+  assignment; only http and https links are kept.
+- Reading the collector roster imports the collector module, whose
+  `logging.basicConfig` would attach a root handler in the dashboard
+  process; the root logger is put back as it was, so the first
+  collection-health request does not start printing every upstream request.
+
 ### Fixed: development runs no longer touch user databases
 - Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
   the cache: `$XDG_CACHE_HOME/world-intel-mcp/temporal.db` and
