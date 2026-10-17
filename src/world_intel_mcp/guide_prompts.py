@@ -388,8 +388,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "Escalation scores are weighted heuristics against fixed "
             "baselines, renormalized over the components actually measured. "
             "They are not probabilities of war. List the unavailable_components.",
+            "The escalation score's military component is 0 at every hotspot "
+            "whatever the aircraft data, during a flight outage too, and "
+            "unavailable_components does not list it: take military activity "
+            "from intel_military_surge and intel_theater_posture instead.",
             "Aircraft tracking sees only aircraft that broadcast a position, "
-            "and many military flights do not, so counts are a floor.",
+            "and many military flights do not, so counts are a floor. A "
+            "theater that no flight source answered for is listed in "
+            "intel_theater_posture's unavailable_theaters, and its regions in "
+            "intel_military_surge's unchecked_regions: its count is unknown, "
+            "not zero. With no source answering anywhere, both tools return "
+            "an error.",
         ),
     ),
     # --- markets and economy ---------------------------------------------
@@ -843,6 +852,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "ADS-B shows only aircraft whose transponders volunteer receivers "
             "pick up; many military and some private aircraft do not broadcast "
             "a usable position, so counts are a floor.",
+            "When intel_military_flights reports source none, no flight "
+            "source answered: it carries error, degraded and reason "
+            "military_flights_unavailable, and its empty aircraft list is "
+            "unknown, not an empty sky.",
             "An anomaly is a deviation from the same slot on earlier weeks. "
             "It is not evidence of anyone's intent.",
             "The anomaly check needs a learned cohort; a fresh install reports "
@@ -954,13 +967,25 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_shipping_index", "a stress score from shipping-linked ETF and equity prices"),
         ),
         limits=(
-            "The vessel snapshot counts navigational warnings, not ships. All "
-            "nine waterways share one score: naval_warnings counts naval "
-            "keywords across the whole warning feed, not near each waterway, "
-            "so read the warnings themselves before naming a waterway.",
-            "When the warning feed fails, every waterway reads clear with zero "
-            "warnings. An all-clear snapshot is unconfirmed until "
-            "intel_nav_warnings returns warnings.",
+            "The vessel snapshot counts navigational warnings, not ships. A "
+            "warning counts at a waterway only when a position its text states "
+            "lies within 300 km of the waterway's reference point "
+            "(matching_rule states the rule).",
+            "A naval warning that states no readable position counts at no "
+            "waterway and changes no status. It is listed in "
+            "unplaced_naval_warnings with the reason: read those before "
+            "calling any waterway clear.",
+            "A waterway status of unknown means the warning feed was "
+            "unavailable (error, degraded and reason say why), not a quiet "
+            "sea. A status of stale means the feed's newest warning is older "
+            "than stale_after_days: the counts describe the feed's last "
+            "update (status_as_of), not today. Check feed_stale and "
+            "newest_issue_date before calling any status current.",
+            "The navarea filter of intel_nav_warnings takes NGA area codes "
+            "(4, 12, A, P, C), their series names, or IV and XII for 4 and 12. "
+            "Other NAVAREAs arrive inside the A, P and C series, and asking "
+            "for one returns an error with reason navarea_not_carried, not a "
+            "count of 0.",
             "The shipping stress score is a market proxy, not a freight rate.",
         ),
     ),

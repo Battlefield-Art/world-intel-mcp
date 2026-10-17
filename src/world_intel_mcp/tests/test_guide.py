@@ -13,6 +13,7 @@ field name it cites against the package source, every count it states
 against the code, and the failure behaviour its limits warn about.
 """
 
+import asyncio
 import importlib
 import inspect
 import json
@@ -20,10 +21,13 @@ import os
 import re
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
+import respx
 from click.testing import CliRunner
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -34,6 +38,7 @@ from mcp.types import INVALID_PARAMS, Tool
 from world_intel_mcp import guide, guide_prompts
 from world_intel_mcp.cache import Cache
 from world_intel_mcp.circuit_breaker import CircuitBreaker
+from world_intel_mcp.fetcher import Fetcher
 
 # The registry file's own server fixture: it holds the temp cache override
 # while the tests that use it run, whenever the runtime binds its cache.
@@ -1156,6 +1161,226 @@ async def test_prompt_failure_warnings_match_the_code(monkeypatch) -> None:
     cut = await sanctions.fetch_sanctions_search(_SdnFetcher(), query="acme", limit=2)
     assert (by_alias["count"], by_alias["total_entities"]) == (0, 3)
     assert cut["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Maritime and flight limits against the code, through a real Fetcher with
+# every upstream mocked (respx refuses any request it has no route for)
+# ---------------------------------------------------------------------------
+
+_NGA = r".*msi\.nga\.mil.*"
+_ADSBLOL = r".*api\.adsb\.lol.*"
+_OPENSKY = r".*opensky-network\.org.*"
+_MONTHS = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
+# Due north of the Strait of Hormuz reference point, 26.57N 56.25E.
+_HORMUZ_289_KM = "NAVAL EXERCISE IN AREA 29-10.2N 056-15.0E."
+_HORMUZ_300_2_KM = "NAVAL EXERCISE IN AREA 29-16.2N 056-15.0E."
+_NO_POSITION = "NAVAL EXERCISE IN PROGRESS."
+
+
+async def _no_sleep(*args, **kwargs) -> None:
+    return None
+
+
+def _fetcher(tmp_path: Path, name: str) -> Fetcher:
+    """A Fetcher with its own cache, so one test can fetch the same URL
+    again, and a breaker that does not trip, so each of several concurrent
+    calls reaches its mocked route whatever order they run in."""
+    breaker = CircuitBreaker(failure_threshold=1000)
+    return Fetcher(cache=Cache(db_path=tmp_path / f"{name}.db"), breaker=breaker, default_timeout=5.0)
+
+
+def _nga(*warnings: tuple[str, str], days_ago: float = 0.1) -> httpx.Response:
+    """An NGA broadcast-warn payload of (area code, text) warnings, all
+    issued days_ago."""
+    when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    issued = f"{when:%d%H%M}Z {_MONTHS[when.month - 1]} {when.year}"
+    return httpx.Response(
+        200,
+        json={
+            "broadcast-warn": [
+                {"msgYear": 2026, "msgNumber": n, "navArea": area, "text": text, "issueDate": issued}
+                for n, (area, text) in enumerate(warnings, 1)
+            ]
+        },
+    )
+
+
+def _statuses(snapshot: dict) -> list[tuple[str, int, str]]:
+    return [(w["name"], w["naval_warnings"], w["status"]) for w in snapshot["waterways"]]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_maritime_prompt_states_the_waterway_matching_rule(tmp_path, monkeypatch) -> None:
+    from world_intel_mcp.sources import intelligence
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    text = _text("maritime-chokepoints")
+    assert "within 300 km of the waterway's reference point" in text
+    assert "counts at no waterway and changes no status" in text
+    assert "share one score" not in text and "reads clear" not in text
+    assert intelligence._WATERWAY_PROXIMITY_KM == 300.0
+
+    route = respx.get(url__regex=_NGA).mock(return_value=_nga(("P", _HORMUZ_289_KM), ("P", _HORMUZ_300_2_KM)))
+    placed = await intelligence.fetch_vessel_snapshot(_fetcher(tmp_path, "placed"))
+    hormuz = next(w for w in placed["waterways"] if w["name"] == "Strait of Hormuz")
+    assert (hormuz["naval_warnings"], hormuz["status"]) == (1, "advisory")
+    assert [d["distance_km"] for d in hormuz["warning_details"]] == [289.1]
+    assert {w["status"] for w in placed["waterways"] if w is not hormuz} == {"clear"}
+    assert placed["matching_rule"]["proximity_km"] == 300.0
+
+    # Positionless naval warnings are listed, and every status stays as it was.
+    route.mock(
+        return_value=_nga(
+            ("P", _HORMUZ_289_KM),
+            ("P", _HORMUZ_300_2_KM),
+            ("P", _NO_POSITION),
+            ("12", _NO_POSITION),
+            ("A", _NO_POSITION),
+        )
+    )
+    unplaced = await intelligence.fetch_vessel_snapshot(_fetcher(tmp_path, "unplaced"))
+    assert _statuses(unplaced) == _statuses(placed)
+    assert [(u["navarea"], u["reason"]) for u in unplaced["unplaced_naval_warnings"]] == [
+        ("P", "multi_navarea_series"),
+        ("12", "navarea_too_broad"),
+        ("A", "multi_navarea_series"),
+    ]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_maritime_prompt_unknown_and_stale_match_the_snapshot(tmp_path, monkeypatch) -> None:
+    from world_intel_mcp.sources import intelligence, maritime
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    text = _text("maritime-chokepoints")
+    assert "A waterway status of unknown means the warning feed was unavailable" in text
+    assert "A status of stale means the feed's newest warning is older than stale_after_days" in text
+
+    route = respx.get(url__regex=_NGA).mock(return_value=httpx.Response(500))
+    down = await intelligence.fetch_vessel_snapshot(_fetcher(tmp_path, "down"))
+    assert {w["status"] for w in down["waterways"]} == {"unknown"}
+    assert (down["degraded"], down["reason"]) == (True, "nga_msi_fetch_failed")
+    assert down["error"].startswith("NGA navigational warnings unavailable")
+
+    three = (("P", _HORMUZ_289_KM),) * 3
+    route.mock(return_value=_nga(*three))
+    current = await intelligence.fetch_vessel_snapshot(_fetcher(tmp_path, "current"))
+    assert ("Strait of Hormuz", 3, "critical") in _statuses(current)
+
+    # The same three warnings past the staleness threshold: no threat level.
+    route.mock(return_value=_nga(*three, days_ago=maritime.STALE_AFTER_DAYS + 1))
+    frozen = await intelligence.fetch_vessel_snapshot(_fetcher(tmp_path, "frozen"))
+    assert ("Strait of Hormuz", 3, "stale") in _statuses(frozen)
+    assert {w["status"] for w in frozen["waterways"]} == {"stale"}
+    assert frozen["feed_stale"] is True and frozen["stale_after_days"] == maritime.STALE_AFTER_DAYS
+    assert {w["status_as_of"] for w in frozen["waterways"]} == {frozen["newest_issue_date"]}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_maritime_prompt_navarea_codes_match_the_filter(fetcher) -> None:
+    from world_intel_mcp.sources import maritime
+
+    text = _text("maritime-chokepoints")
+    assert f"takes NGA area codes ({', '.join(maritime.NGA_AREA_CODES)}), their series names" in text
+    assert "returns an error with reason navarea_not_carried" in text
+    respx.get(url__regex=_NGA).mock(return_value=_nga(*((code, "NOTICE.") for code in maritime.NGA_AREA_CODES)))
+
+    def areas(response: dict) -> list[str]:
+        return [w["navarea"] for w in response["warnings"]]
+
+    assert areas(await maritime.fetch_nav_warnings(fetcher, navarea="4")) == ["4"]
+    assert areas(await maritime.fetch_nav_warnings(fetcher, navarea="IV")) == ["4"]
+    assert areas(await maritime.fetch_nav_warnings(fetcher, navarea="XII")) == ["12"]
+    assert areas(await maritime.fetch_nav_warnings(fetcher, navarea="HYDROPAC")) == ["P"]
+    other = await maritime.fetch_nav_warnings(fetcher, navarea="IX")
+    assert (other["count"], other["reason"]) == (0, "navarea_not_carried")
+    assert other["error"] and other["data_gaps"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_flight_outage_limits_match_flights_posture_and_surge(fetcher, tmp_path, monkeypatch) -> None:
+    from world_intel_mcp.analysis.temporal import TemporalBaseline
+    from world_intel_mcp.sources import intelligence, military
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db")))
+    assert "carries error, degraded and reason military_flights_unavailable" in _text("airspace-anomaly")
+    escalation = _text("hotspot-escalation")
+    assert (
+        "listed in intel_theater_posture's unavailable_theaters, and its regions in "
+        "intel_military_surge's unchecked_regions: its count is unknown, not zero."
+    ) in escalation
+    assert "With no source answering anywhere, both tools return an error." in escalation
+
+    respx.get(url__regex=_ADSBLOL).mock(return_value=httpx.Response(500))
+    opensky = respx.get(url__regex=_OPENSKY).mock(return_value=httpx.Response(500))
+    flights = await military.fetch_military_flights(fetcher)
+    assert (flights["source"], flights["aircraft"], flights["degraded"]) == ("none", [], True)
+    assert flights["reason"] == "military_flights_unavailable" and flights["error"]
+    posture = await military.fetch_theater_posture(fetcher)
+    surge = await intelligence.fetch_military_surge(fetcher)
+    assert posture["unavailable_theaters"] == list(military.THEATERS)
+    assert posture["reason"] == surge["reason"] == "military_flights_unavailable"
+    assert posture["error"] and surge["error"] and surge["regions_checked"] == 0
+
+    # One theater answered: the others are named, not counted as zero.
+    european = military.THEATERS["european"]["bbox"].split(",")[0]
+    opensky.mock(
+        side_effect=lambda request: httpx.Response(
+            200 if request.url.params.get("lamin") == european else 500, json={"states": []}
+        )
+    )
+    partial = _fetcher(tmp_path, "partial")
+    posture = await military.fetch_theater_posture(partial)
+    surge = await intelligence.fetch_military_surge(partial)
+    assert posture["unavailable_theaters"] == [name for name in military.THEATERS if name != "european"]
+    assert surge["unchecked_regions"] and surge["degraded"] is True
+    assert "error" not in posture and "error" not in surge
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_escalation_military_component_is_zero_whatever_the_aircraft(fetcher, tmp_path, monkeypatch) -> None:
+    from world_intel_mcp.config.countries import INTEL_HOTSPOTS
+    from world_intel_mcp.sources import intelligence, military
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    monkeypatch.delenv("ACLED_EMAIL", raising=False)
+    monkeypatch.delenv("ACLED_PASSWORD", raising=False)
+    assert (
+        "The escalation score's military component is 0 at every hotspot whatever the aircraft data, "
+        "during a flight outage too, and unavailable_components does not list it"
+    ) in _text("hotspot-escalation")
+
+    # 40 aircraft over every hotspot and at the centre of every theater box.
+    points = [(h["lat"], h["lon"]) for h in INTEL_HOTSPOTS.values()]
+    for info in military.THEATERS.values():
+        south, west, north, east = map(float, info["bbox"].split(","))
+        points.append(((south + north) / 2, (west + east) / 2))
+    aircraft = [
+        {"hex": f"ae{n:04x}", "flight": f"RCH{n}", "lat": lat, "lon": lon}
+        for n, (lat, lon) in enumerate(p for p in points for _ in range(40))
+    ]
+    adsblol = respx.get(url__regex=_ADSBLOL).mock(return_value=httpx.Response(200, json={"ac": aircraft}))
+    respx.get(url__regex=_OPENSKY).mock(return_value=httpx.Response(500))
+
+    posture = await military.fetch_theater_posture(fetcher)
+    assert all(theater["count"] > 0 for theater in posture["theaters"].values())
+    busy = await intelligence.fetch_hotspot_escalation(fetcher)
+    assert len(busy["hotspots"]) == len(INTEL_HOTSPOTS)
+    assert {h["components"]["military"] for h in busy["hotspots"]} == {0.0}
+    assert "military" not in busy["unavailable_components"]
+
+    # A flight outage reads the same, and is not listed either.
+    adsblol.mock(return_value=httpx.Response(500))
+    down = await intelligence.fetch_hotspot_escalation(_fetcher(tmp_path, "down"))
+    assert {h["components"]["military"] for h in down["hotspots"]} == {0.0}
+    assert down["unavailable_components"] == busy["unavailable_components"]
 
 
 # ---------------------------------------------------------------------------
