@@ -8,8 +8,10 @@ to avoid circular dependencies with source modules.
 import asyncio
 import logging
 import math
+import os
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger("world-intel-mcp.analysis.alerts")
 
@@ -234,6 +236,32 @@ async def fetch_alert_digest(fetcher) -> dict:
 # Weekly Trends
 # ---------------------------------------------------------------------------
 
+# A metric needs this many observations before its volatility is reported.
+_MIN_TREND_OBSERVATIONS = 5
+
+
+def _read_baselines(db_path: str) -> tuple[list[tuple], str | None]:
+    """Every baseline row, or the reason none could be read.
+
+    The file is opened read-only: reading trends must never leave an empty
+    database where the baselines were expected.
+    """
+    if not os.path.exists(db_path):
+        return [], f"no temporal baseline database at {db_path}"
+    try:
+        conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT key, count, mean, m2, updated_at FROM baselines"
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("Failed to read temporal baselines: %s", exc)
+        return [], f"could not read {db_path}: {exc}"
+    return rows, None
+
+
 async def fetch_weekly_trends(fetcher) -> dict:
     """Analyze weekly trends from temporal baselines.
 
@@ -241,33 +269,63 @@ async def fetch_weekly_trends(fetcher) -> dict:
     (coefficient of variation) for each tracked metric, and calls
     temporal_anomalies to get current deviations.
 
+    A failed input never reads as zero. ``data_gaps`` names every input
+    that failed or has no history to judge by. When the baseline database
+    is missing or unreadable, ``trend_count`` is None and ``error`` says
+    why; when anomaly detection fails, ``current_anomaly_count`` is None.
+
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
 
     Returns:
-        Dict with trends, trend_count, analysis_period, source.
+        Dict with trends, trend_count, current_anomalies,
+        current_anomaly_count, data_gaps, analysis_period, source, and
+        error when the baselines could not be read.
     """
     from ..analysis.temporal import _default_db_path
     from ..sources import intelligence
 
-    now = datetime.now(timezone.utc)
+    db_path = _default_db_path()
+    # Anomaly detection records this cycle's observations and creates the
+    # database on first use, so look first: a baseline born in this call has
+    # no history, which is not the same as a quiet week.
+    baseline_existed = os.path.exists(db_path)
+    data_gaps: list[str] = []
 
     # Get current anomalies
-    anomaly_data = await _safe_fetch(
-        intelligence.fetch_temporal_anomalies(fetcher), "temporal_anomalies"
-    )
+    current_anomalies: list[dict] = []
+    current_anomaly_count: int | None = None
+    try:
+        anomaly_data = await intelligence.fetch_temporal_anomalies(fetcher)
+    except Exception as exc:
+        logger.warning("Weekly trends: temporal anomalies failed: %s", exc)
+        data_gaps.append(f"Current anomalies: {type(exc).__name__}: {exc}")
+    else:
+        anomalies = (
+            anomaly_data.get("anomalies") if isinstance(anomaly_data, dict) else None
+        )
+        if isinstance(anomalies, list):
+            current_anomalies = anomalies
+            current_anomaly_count = len(anomalies)
+            data_gaps.extend(
+                f"Current anomalies: {gap}" for gap in anomaly_data.get("data_gaps") or []
+            )
+        else:
+            data_gaps.append(
+                "Current anomalies: anomaly detection returned no anomaly list"
+            )
 
     # Read baselines from SQLite
+    rows, baseline_problem = _read_baselines(db_path)
     trends: list[dict] = []
+    trend_count: int | None = None
 
-    try:
-        conn = sqlite3.connect(_default_db_path())
-        rows = conn.execute(
-            "SELECT key, count, mean, m2, updated_at FROM baselines WHERE count >= 5"
-        ).fetchall()
-        conn.close()
-
+    if baseline_problem is not None:
+        data_gaps.append(f"Baselines: {baseline_problem}")
+    else:
         for key, n, mean, m2, updated_at in rows:
+            if n < _MIN_TREND_OBSERVATIONS:
+                continue
             parts = key.split(":")
             if len(parts) < 2:
                 continue
@@ -293,22 +351,33 @@ async def fetch_weekly_trends(fetcher) -> dict:
                 "volatility_cv": round(cv, 1),
                 "last_updated": updated_at,
             })
+        trend_count = len(trends)
 
-    except (sqlite3.Error, OSError) as exc:
-        logger.warning("Failed to read temporal baselines: %s", exc)
+        if not baseline_existed:
+            data_gaps.append(
+                f"Baselines: none existed at {db_path} before this call, so "
+                "trends and anomalies have no history yet"
+            )
+        elif not any(row[1] >= _MIN_TREND_OBSERVATIONS for row in rows):
+            data_gaps.append(
+                "Baselines: no tracked metric has the "
+                f"{_MIN_TREND_OBSERVATIONS} observations volatility needs yet "
+                f"({len(rows)} tracked)"
+            )
 
     # Sort by volatility descending
     trends.sort(key=lambda t: t.get("volatility_cv", 0), reverse=True)
 
-    # Attach current anomalies
-    current_anomalies = anomaly_data.get("anomalies", [])
-
-    return {
+    result = {
         "trends": trends[:50],
-        "trend_count": len(trends),
+        "trend_count": trend_count,
         "current_anomalies": current_anomalies,
-        "current_anomaly_count": len(current_anomalies),
+        "current_anomaly_count": current_anomaly_count,
+        "data_gaps": data_gaps,
         "analysis_period": "weekly (by weekday+month seasonality)",
         "source": "temporal-weekly-trends",
         "timestamp": _utc_now_iso(),
     }
+    if baseline_problem is not None:
+        result["error"] = f"Temporal baselines unavailable: {baseline_problem}"
+    return result
