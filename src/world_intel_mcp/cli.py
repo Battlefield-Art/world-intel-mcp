@@ -1194,11 +1194,13 @@ def prediction_compare(
         return
 
     _print_data_gaps(data)
+    comparable = data.get("comparable_count")
     console.print(
         f"Compared {data.get('kalshi_markets_compared', 0)} Kalshi / "
         f"{data.get('polymarket_markets_compared', 0)} Polymarket markets: "
         f"{data.get('matched_count', 0)} matched, unmatched Kalshi "
         f"{data.get('unmatched_kalshi')}, unmatched Polymarket {data.get('unmatched_polymarket')}"
+        + ("" if comparable is None else f"; {comparable} comparable (both prices live two-sided quotes)")
     )
     pairs = data.get("matched", [])
     if not pairs:
@@ -1210,12 +1212,19 @@ def prediction_compare(
     table = Table(title="Cross-venue Matches", box=box.SIMPLE_HEAVY)
     table.add_column("Kalshi", max_width=40)
     table.add_column("Polymarket", max_width=40)
-    table.add_column("Conf", justify="right")
+    table.add_column("Score", justify="right")
     table.add_column("Kalshi YES", justify="right")
     table.add_column("Poly YES", justify="right")
     table.add_column("Gap", justify="right")
+    table.add_column("Flags", max_width=40)
+    flagged = False
     for p in pairs:
         gap = p.get("price_gap")
+        flags = list(p.get("flags") or [])
+        flagged = flagged or bool(flags)
+        traded = (p.get("kalshi") or {}).get("last_trade_time")
+        if traded:
+            flags.append(f"kalshi last trade {traded}")
         table.add_row(  # wrapped, not sliced (see the kalshi table)
             _cell(p.get("kalshi", {}).get("question") or ""),
             _cell(p.get("polymarket", {}).get("question") or ""),
@@ -1223,8 +1232,15 @@ def prediction_compare(
             _pct(p.get("kalshi_yes_probability")),
             _pct(p.get("polymarket_yes_probability")),
             "-" if gap is None else f"{gap * 100:+.1f}pp",
+            _cell("; ".join(flags) or "-"),
         )
     console.print(table)
+    console.print("Score: ordinal match score for ranking pairs, not a probability.")
+    if flagged:
+        console.print(
+            "Flagged pairs are listed after comparable ones: a flagged gap is not a like-for-like "
+            "difference of two live quotes on the same terms."
+        )
 
 
 @main.command("prediction-settled")
@@ -1262,24 +1278,24 @@ def prediction_settled(
         return
 
     _print_data_gaps(data)
-    table = Table(title="Settled-market Brier Scores", box=box.SIMPLE_HEAVY)
-    table.add_column("Venue")
-    table.add_column("Offset")
-    table.add_column("n", justify="right")
-    table.add_column("Events", justify="right")
-    table.add_column("Brier", justify="right")
-    table.add_column("YES rate", justify="right")
-    table.add_column("Excluded", no_wrap=True)
+    # One table per venue: the samples are different markets with
+    # different reference times, so their rows must not read as comparable.
     for venue, entry in (data.get("venues") or {}).items():
         if not entry.get("scores"):
-            reason = entry.get("error") or entry.get("not_scored_reason") or "not scored"
-            table.add_row(_cell(venue), "-", "-", "-", "not scored", "-", _cell(reason))
+            reason = entry.get("error") or entry.get("not_scored_reason") or "no scores returned"
+            console.print(f"{escape(venue)}: not scored ({escape(reason)})")
             continue
+        table = Table(title=f"Brier scores, {escape(venue)} sample only", box=box.SIMPLE_HEAVY)
+        table.add_column("Offset")
+        table.add_column("n", justify="right")
+        table.add_column("Events", justify="right")
+        table.add_column("Brier", justify="right")
+        table.add_column("YES rate", justify="right")
+        table.add_column("Excluded", no_wrap=True)
         for label, sc in entry["scores"].items():
             brier = sc.get("brier")
             excluded = ", ".join(f"{k}: {v}" for k, v in (sc.get("excluded") or {}).items())
             table.add_row(
-                _cell(venue),
                 _cell(label),
                 str(sc.get("n", 0)),
                 str(sc.get("distinct_events", 0)),
@@ -1287,8 +1303,10 @@ def prediction_settled(
                 _pct(sc.get("yes_rate")),
                 _cell(excluded or "-"),
             )
-    console.print(table)
-    console.print(f"[dim]{escape(data.get('comparability', ''))}[/dim]")
+        console.print(table)
+        if entry.get("reference_time"):
+            console.print(f"{escape(venue)} reference time: {escape(entry['reference_time'])}")
+    console.print(escape(data.get("comparability", "")))
 
 
 # ---------------------------------------------------------------------------
