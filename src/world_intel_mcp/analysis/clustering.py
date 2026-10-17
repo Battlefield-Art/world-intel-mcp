@@ -123,13 +123,18 @@ async def fetch_news_clusters(
         see ``news.FEED_OUTLETS``). An RSS outage is passed through as
         ``degraded``/``reason``/``error``, never a quiet cluster-free day.
     """
+    import asyncio
     from datetime import datetime, timezone
     from ..sources import news
 
     feed_data = await news.fetch_news_feed(fetcher, category=category, limit=limit)
     items = feed_data.get("items", [])
 
-    raw_clusters = cluster_articles(items, similarity_threshold=threshold)
+    # Pairwise Jaccard is quadratic in titles: off the event loop the
+    # collector and the MCP server share.
+    raw_clusters = await asyncio.to_thread(
+        cluster_articles, items, similarity_threshold=threshold
+    )
 
     out_clusters = []
     for c in raw_clusters:
@@ -186,7 +191,10 @@ async def fetch_news_clusters(
         "source": "jaccard-clustering",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    for key in ("feeds_ok", "feeds_failed", "feeds_stale", "error", "degraded", "reason"):
+    for key in (
+        "feeds_attempted", "feeds_ok", "feeds_failed", "feeds_stale",
+        "error", "degraded", "reason",
+    ):
         if key in feed_data:
             result[key] = feed_data[key]
     return result

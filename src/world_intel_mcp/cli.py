@@ -775,6 +775,7 @@ def news_cmd(ctx: click.Context, category: str | None, limit: int) -> None:
     if _bail_on_error(ctx, data):
         return
 
+    _print_partial_feed_outage(data)
     items = data.get("items", [])
     if not items:
         console.print("[yellow]No news items available[/yellow]")
@@ -812,6 +813,7 @@ def trending(ctx: click.Context, min_count: int) -> None:
     console.print(
         f"[bold]Trending keywords[/bold] (from {data.get('total_items_analyzed', 0)} items)\n"
     )
+    _print_partial_feed_outage(data)
 
     table = Table(box=box.SIMPLE_HEAVY)
     table.add_column("#", justify="right")
@@ -855,6 +857,20 @@ def _na(value: Any) -> str:
     return "n/a" if value is None else str(value)
 
 
+def _print_partial_feed_outage(data: dict) -> None:
+    """Say when a result rests on a minority of the RSS feeds.
+
+    fetch_news_feed marks that read degraded with no error (reason
+    partial_feeds_failed); a total outage carries an error and never
+    reaches here (``_bail_on_error``).
+    """
+    if data.get("degraded") and "error" not in data and data.get("feeds_attempted"):
+        console.print(
+            f"[yellow]Partial outage:[/yellow] only {data.get('feeds_ok')} of "
+            f"{data.get('feeds_attempted')} RSS feeds answered live"
+        )
+
+
 @main.command(name="hostility")
 @click.argument("country")
 @click.argument("other", required=False)
@@ -880,21 +896,34 @@ def hostility_cmd(ctx: click.Context, country: str, other: str | None, days: int
         table.add_column(col, justify="left" if col == "Date" else "right")
     for d in data.get("days", []):
         h = d.get("hostile", {})
+        partial_cols = set(d.get("partial_columns") or [])
+
+        def _count(col: str, value: Any) -> str:
+            # A count from a column whose buckets miss an elapsed hour.
+            return _na(value) + ("*" if value is not None and col in partial_cols else "")
+
         date = d["date"] + (" *" if d.get("partial") else "") + (" ~" if d.get("in_progress") else "")
         table.add_row(
             date,
-            _na(d.get("articles")),
-            _na(h.get("threat")),
-            _na(h.get("sanction")),
-            _na(h.get("force")),
-            _na(h.get("criticism")),
+            _count("articles", d.get("articles")),
+            _count("threat", h.get("threat")),
+            _count("sanction", h.get("sanction")),
+            _count("force", h.get("force")),
+            _count("criticism", h.get("criticism")),
             _na(d.get("tone")),
         )
     console.print(table)
     console.print(
-        "[dim]* partial day (GDELT returned fewer hours than elapsed); ~ day in progress; "
-        "n/a = not measured (fetch failed or day not returned)[/dim]"
+        "[dim]* after a date: partial day; after a count: that column's buckets miss an "
+        "elapsed hour; ~ day in progress; n/a = not measured (fetch failed, expired "
+        "copy, or day not returned)[/dim]"
     )
+    for col, age in (data.get("stale_age_seconds") or {}).items():
+        age_text = f"{age / 3600:.1f} h old" if isinstance(age, (int, float)) else "age unknown"
+        console.print(
+            f"[yellow]Stale:[/yellow] {escape(str(col))} is an expired cached copy "
+            f"({age_text}); shown as n/a"
+        )
     _print_data_gaps(data)
 
 
@@ -920,9 +949,16 @@ def situations_cmd(ctx: click.Context, hours: float, sort: str, kind: str, limit
 
     win = data.get("window", {})
     console.print(
-        f"[bold]Situations[/bold] by {sort}, window {win.get('current', {}).get('start', '?')} "
-        f".. {win.get('current', {}).get('end', '?')}\n"
+        f"[bold]Situations[/bold] by {data.get('sort_applied', sort)}, window "
+        f"{win.get('current', {}).get('start', '?')} .. {win.get('current', {}).get('end', '?')}\n"
     )
+    _print_partial_feed_outage(data)
+    if data.get("change_measured") is False:
+        # n/a in the Change column, never +0.
+        console.print(
+            "[yellow]Change not measured[/yellow] (no feed covers both windows); "
+            "the Change column shows n/a"
+        )
     table = Table(box=box.SIMPLE_HEAVY)
     table.add_column("#", justify="right")
     table.add_column("Kind")
@@ -966,6 +1002,7 @@ def top_stories_cmd(ctx: click.Context, hours: float, min_outlets: int, limit: i
         return
 
     console.print(f"[bold]Top stories[/bold] (>= {min_outlets} outlets)\n")
+    _print_partial_feed_outage(data)
     table = Table(box=box.SIMPLE_HEAVY)
     table.add_column("#", justify="right")
     table.add_column("Outlets", justify="right")
@@ -992,6 +1029,11 @@ def top_stories_cmd(ctx: click.Context, hours: float, min_outlets: int, limit: i
                 _signed(a["change"]),
             )
         console.print(att)
+    elif data.get("attention_change_measured") is False:
+        # An empty list here is not "nothing grew".
+        console.print(
+            "[yellow]Attention:[/yellow] not measured (no feed covers both windows)"
+        )
     _print_data_gaps(data)
 
 
@@ -1521,6 +1563,12 @@ def dossier(ctx: click.Context, country: str) -> None:
     if "mention_count" in news and news["mention_count"] is None:
         # A failed feed (or a country without keywords) is not zero mentions.
         console.print("[blue]News:[/blue] not measured")
+    elif news.get("mention_count_capped"):
+        # The listed mentions are capped; the match count is not.
+        console.print(
+            f"[blue]News:[/blue] {news.get('matching_items')} matching headlines in the "
+            f"{news.get('items_searched')} newest items ({news.get('mention_count')} listed)"
+        )
     else:
         console.print(f"[blue]News:[/blue] {news.get('mention_count', 0)} recent mentions")
     for art in news.get("mentions", [])[:3]:

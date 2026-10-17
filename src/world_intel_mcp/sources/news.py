@@ -549,6 +549,26 @@ def _truncate(text: str | None, max_len: int = 200) -> str:
     return text[:max_len] + "..."
 
 
+# Feed titles are upstream text: capped like summaries, at a length no real
+# headline reaches.
+_MAX_TITLE_CHARS = 500
+
+# A partial RSS outage is marked degraded when fewer than this share of the
+# attempted feeds answered live. Measured 2026-10-17: 95 of 119 feeds (80 %)
+# answered, and the 24 that did not were permanent (16 x 404, 6 x 403, one
+# 410) plus one timeout, so the normal state stays unflagged with margin;
+# below half, a result rests on a minority of its feeds.
+_MIN_LIVE_FEED_SHARE = 0.5
+
+
+def _web_link(value: object) -> str:
+    """The link if it is an http(s) URL, else "" (javascript:, data:, relative)."""
+    if not isinstance(value, str):
+        return ""
+    link = value.strip()
+    return link if link.lower().startswith(("http://", "https://")) else ""
+
+
 # ---------------------------------------------------------------------------
 # Function 1: RSS News Feed Aggregation
 # ---------------------------------------------------------------------------
@@ -595,7 +615,11 @@ async def fetch_news_feed(
         limit: Maximum number of items to return.
 
     Returns:
-        Dict with items list, count, categories fetched, source, and timestamp.
+        Dict with items list, count, categories fetched, source, and timestamp,
+        plus feeds_attempted/feeds_ok/feeds_failed/feeds_stale. ``degraded``
+        and ``reason`` mark an outage: ``all_feeds_failed`` (with ``error``)
+        when no feed answered live, ``partial_feeds_failed`` (no error) when
+        fewer than half did. Links are kept only when they are http(s).
     """
     if feedparser is None:
         return {
@@ -663,8 +687,8 @@ async def fetch_news_feed(
             summary_raw = entry.get("summary") or entry.get("description") or ""
             items.append(
                 {
-                    "title": entry.get("title", ""),
-                    "link": entry.get("link", ""),
+                    "title": _truncate(entry.get("title", ""), _MAX_TITLE_CHARS),
+                    "link": _web_link(entry.get("link", "")),
                     "published": published,
                     "summary": _truncate(summary_raw, 200),
                     "feed_name": feed_name,
@@ -755,6 +779,11 @@ async def fetch_news_feed(
         result["error"] = error
         result["degraded"] = True
         result["reason"] = "all_feeds_failed"
+    elif feeds_attempted and result["feeds_ok"] / feeds_attempted < _MIN_LIVE_FEED_SHARE:
+        # Most feeds failed: items still flow (no error), but the result
+        # rests on a minority of the feeds and says so.
+        result["degraded"] = True
+        result["reason"] = "partial_feeds_failed"
     return result
 
 
@@ -782,7 +811,8 @@ async def fetch_trending_keywords(
 
     Returns:
         Dict with keywords list (word + count), total items analyzed,
-        source, and timestamp.
+        source, and timestamp, plus the feed counts and any outage marker
+        (error/degraded/reason) of the underlying ``fetch_news_feed`` read.
     """
     now = datetime.now(timezone.utc)
 
@@ -822,8 +852,12 @@ async def fetch_trending_keywords(
         "source": "keyword-analysis",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    # An RSS outage is not "nothing trending".
-    for key in ("error", "degraded", "reason"):
+    # An RSS outage is not "nothing trending", and a partial one says how
+    # many feeds the counts rest on.
+    for key in (
+        "feeds_attempted", "feeds_ok", "feeds_failed", "feeds_stale",
+        "error", "degraded", "reason",
+    ):
         if key in feed_data:
             result[key] = feed_data[key]
     return result

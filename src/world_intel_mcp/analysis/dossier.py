@@ -10,10 +10,62 @@ All sub-queries are run in parallel for speed.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger("world-intel-mcp.analysis.dossier")
+
+# Mentions listed in the news section; the match count is not capped.
+_MAX_MENTIONS = 15
+
+# Compound names that contain a tier-1 keyword but name somewhere else.
+# They are removed before the whole-word keyword test (checked 2026-10-17
+# against headlines the plain keyword test counted for the wrong country).
+_COMPOUND_EXCLUSIONS: dict[str, re.Pattern[str]] = {
+    "SDN": re.compile(r"\bsouth sudan\w*"),
+    "IND": re.compile(r"\bindian oceans?\b"),
+    "USA": re.compile(r"\b(?:latin|south|central|north) americans?\b"),
+    "MEX": re.compile(r"\bnew mexic\w*"),
+}
+
+_MATCH_METHOD = (
+    "whole-word match of each headline against the country's tier-1 keywords "
+    "(name, demonym, capital; plurals of words of five letters or more), so "
+    "'Tirana' is not Iran and 'Indiana' is not India; South Sudan, the Indian "
+    "Ocean, Latin/South/Central/North American and New Mexico are removed "
+    "first. Other compound names still count (Lagos in Portugal, the Republic "
+    "of the Congo). Searched: the newest items across every RSS feed."
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _keyword_pattern(iso3: str) -> re.Pattern[str] | None:
+    from ..config.countries import TIER1_COUNTRIES
+
+    keywords = (TIER1_COUNTRIES.get(iso3) or {}).get("keywords") or []
+    if not keywords:
+        return None
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):
+        body = re.escape(kw.lower())
+        if kw.isalpha() and len(kw) >= 5:
+            body += "s?"
+        parts.append(body)
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\b")
+
+
+def _names_country(title: str, iso3: str) -> bool:
+    """Whether a headline names the tier-1 country ``iso3`` (whole words)."""
+    pattern = _keyword_pattern(iso3)
+    if pattern is None:
+        return False
+    text = (title or "").lower()
+    exclusion = _COMPOUND_EXCLUSIONS.get(iso3)
+    if exclusion is not None:
+        text = exclusion.sub(" ", text)
+    return pattern.search(text) is not None
 
 # Minimal ISO-2 <-> ISO-3 mapping for the 22 tier-1 countries + major extras.
 _ISO2_TO_ISO3: dict[str, str] = {
@@ -181,9 +233,13 @@ async def fetch_country_dossier(
     # and "source" (the producer emits "items" and "feed_name") and checked
     # only "_error": the section was always empty, with no marker. A failed
     # feed is now a gap with mention_count None, never zero mentions.
+    # Headlines are matched on whole words (a substring test counted
+    # "Tirana" as Iran); mention_count stays the listed (capped) count and
+    # matching_items counts every match among the items searched.
     news_mentions = []
     news_gaps: list[str] = []
     news_marker: dict = {}
+    news_reach: dict = {}
     country_keywords = country_config.get("keywords")
     if "_error" in news_data:
         news_gaps.append(f"news feed failed: {news_data['_error']}; mentions not measured")
@@ -201,9 +257,13 @@ async def fetch_country_dossier(
             "countries have them); mentions not searched"
         )
     else:
-        for article in news_data.get("items", []):
-            title = (article.get("title") or "").lower()
-            if any(kw in title for kw in country_keywords):
+        items = news_data.get("items", [])
+        matching = 0
+        for article in items:
+            if not _names_country(article.get("title") or "", iso3):
+                continue
+            matching += 1
+            if len(news_mentions) < _MAX_MENTIONS:
                 news_mentions.append({
                     "title": article.get("title"),
                     "source": article.get("feed_name"),
@@ -211,8 +271,24 @@ async def fetch_country_dossier(
                     "link": article.get("link"),
                     "category": article.get("category"),
                 })
-                if len(news_mentions) >= 15:
-                    break
+        stamps = sorted(
+            a["published"] for a in items if isinstance(a.get("published"), str) and a["published"]
+        )
+        news_reach = {
+            "matching_items": matching,
+            "mention_count_capped": matching > len(news_mentions),
+            "items_searched": len(items),
+            "searched_span": {"oldest": stamps[0], "newest": stamps[-1]} if stamps else None,
+            "match_method": _MATCH_METHOD,
+        }
+        if news_data.get("degraded"):
+            # Fewer than half of the feeds answered live (fetch_news_feed's
+            # partial_feeds_failed): counted, but over a minority.
+            news_marker = {k: news_data[k] for k in ("degraded", "reason") if k in news_data}
+            news_gaps.append(
+                f"only {news_data.get('feeds_ok')} of {news_data.get('feeds_attempted')} RSS "
+                "feeds answered live; mention counts rest on a minority of the feeds"
+            )
         failed_feeds = news_data.get("feeds_failed") or []
         if failed_feeds:
             news_gaps.append(
@@ -225,7 +301,7 @@ async def fetch_country_dossier(
                 f"{len(stale_feeds)} RSS feeds were served from an expired cache copy: "
                 f"{', '.join(stale_feeds)}"
             )
-    news_measured = not news_marker and bool(country_keywords)
+    news_measured = "error" not in news_marker and bool(country_keywords)
 
     # --- Section 7: Security (hotspots + conflict zones) ---
     associated_hotspots = []
@@ -260,6 +336,7 @@ async def fetch_country_dossier(
         "news": {
             "mentions": news_mentions,
             "mention_count": len(news_mentions) if news_measured else None,
+            **news_reach,
             **news_marker,
             "data_gaps": news_gaps,
         },

@@ -7,12 +7,15 @@ response is returned (marked with _stale=True) so dashboards never go blank.
 
 import asyncio
 import logging
+import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from . import shared_floor
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 
@@ -201,6 +204,13 @@ class Fetcher:
                 last_error = exc
                 if attempt < self.max_retries:
                     wait = min(2**attempt, 30)
+                    if (
+                        isinstance(exc, httpx.HTTPStatusError)
+                        and exc.response.status_code == 429
+                    ):
+                        # A 429 asks for slower requests: never retry sooner
+                        # than the source's own floor (GDELT: 5 s).
+                        wait = max(wait, _SOURCE_RATE_LIMITS.get(source, 0.0))
                     logger.debug(
                         "Retry %d/%d for %s (%s), waiting %.1fs",
                         attempt + 1,
@@ -367,7 +377,29 @@ class Fetcher:
             elapsed = now - last
             if elapsed < min_interval:
                 await asyncio.sleep(min_interval - elapsed)
+            if source in shared_floor.SHARED_SOURCES:
+                await self._shared_floor_wait(source, min_interval)
             _source_last_call[source] = time.time()
+
+    async def _shared_floor_wait(self, source: str, min_interval: float) -> None:
+        """Wait out another process's reserved slot (see ``shared_floor``)."""
+        db_path = getattr(self.cache, "db_path", None)
+        if not isinstance(db_path, (str, os.PathLike)):
+            return
+        try:
+            slot = await asyncio.to_thread(
+                shared_floor.reserve, db_path, source, min_interval
+            )
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning(
+                "Cross-process %s floor unavailable (%s); spacing this process only",
+                source,
+                exc,
+            )
+            return
+        wait = slot - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
 
     async def _yahoo_throttle(self) -> None:
         """Enforce Yahoo Finance rate limit (600ms between calls)."""

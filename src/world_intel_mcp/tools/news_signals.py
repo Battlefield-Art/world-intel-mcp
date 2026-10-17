@@ -16,19 +16,26 @@ TOOLS: list[Tool] = [
             "Per-day news coverage of a country, or of a pair of countries, from GDELT: "
             "article count, articles using threat / sanction / force / criticism terms "
             "(GDELT keyword match, listed in the response), and GDELT average tone. "
-            "A failed call or a day GDELT did not return is null and listed in "
-            "data_gaps, never zero."
+            "A failed call, an expired cached copy, or a day GDELT did not return is "
+            "null and listed in data_gaps (column_status per call), never zero; "
+            "partial days are flagged per column."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "country": {
                     "type": "string",
-                    "description": "Country name or ISO3 code (e.g. 'Iran' or 'IRN').",
+                    "description": (
+                        "Country name, or an ISO3 or ISO2 code from the 22-country table "
+                        "(e.g. 'Iran', 'IRN' or 'IR'). Other names are searched verbatim; "
+                        "other 2- and 3-letter codes are refused."
+                    ),
                 },
                 "other": {
                     "type": "string",
-                    "description": "Optional second country: coverage naming both.",
+                    "description": (
+                        "Optional second country, same forms as country: coverage naming both."
+                    ),
                 },
                 "days": {
                     "type": "integer",
@@ -46,7 +53,9 @@ TOOLS: list[Tool] = [
             "inside a country (headlines naming one) over a recent window of the RSS "
             "feeds. Sort by most covered, most hostile (headline keyword heuristic), "
             "or biggest change against the preceding window; the response defines "
-            "each measure and names excluded feeds."
+            "each measure and names excluded feeds. When no feed covers both windows, "
+            "change is null with change_measured false and a change sort ranks by "
+            "coverage (sort_applied)."
         ),
         inputSchema={
             "type": "object",
@@ -87,7 +96,8 @@ TOOLS: list[Tool] = [
             "Stories carried by at least min_outlets distinct outlets in a recent RSS "
             "window (sister feeds of one publisher count once), ranked by outlet count, "
             "plus attention: the countries and organizations whose headline mentions "
-            "grew most against the preceding window."
+            "grew most against the preceding window (empty, with "
+            "attention_change_measured false, when no feed covers both windows)."
         ),
         inputSchema={
             "type": "object",
