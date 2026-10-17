@@ -15,15 +15,16 @@ from typing import Any
 
 logger = logging.getLogger("world-intel-mcp.cache")
 
-_DEFAULT_DB = Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
-
 
 def _default_db_path() -> Path:
+    # Resolved per Cache, not at import, so HOME and XDG_CACHE_HOME are read
+    # when the cache opens, the same way the temporal and spike baselines
+    # resolve theirs.
     if env_path := os.environ.get("WORLD_INTEL_CACHE_DB"):
         return Path(env_path).expanduser()
     if xdg_cache := os.environ.get("XDG_CACHE_HOME"):
         return Path(xdg_cache).expanduser() / "world-intel-mcp" / "cache.db"
-    return _DEFAULT_DB
+    return Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
 
 
 class Cache:
