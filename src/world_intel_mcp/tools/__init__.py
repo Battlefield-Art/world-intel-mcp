@@ -25,6 +25,7 @@ Handler = Callable[[dict[str, Any]], Awaitable[Any]]
 from . import (  # noqa: E402
     aoi,
     conflict,
+    day_timeline,
     finance,
     geospatial,
     hazards,
@@ -63,6 +64,7 @@ _MODULES = [
     aoi,
     history,
     lagged_connections,
+    day_timeline,
     system,
 ]
 
