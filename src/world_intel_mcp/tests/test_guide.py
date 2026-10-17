@@ -35,7 +35,9 @@ from world_intel_mcp import guide, guide_prompts
 from world_intel_mcp.cache import Cache
 from world_intel_mcp.circuit_breaker import CircuitBreaker
 
-from .test_server_registry import _TMP_CACHE
+# The registry file's own server fixture: it holds the temp cache override
+# while the tests that use it run, whenever the runtime binds its cache.
+from .test_server_registry import _TMP_CACHE, server  # noqa: F401
 
 _SOURCES_DIR = Path(guide.__file__).resolve().parent / "sources"
 _PACKAGE_DIR = Path(guide.__file__).resolve().parent
@@ -57,11 +59,6 @@ def _import_under_temp_cache(name: str):
 @pytest.fixture(scope="module")
 def tools_pkg():
     return _import_under_temp_cache("world_intel_mcp.tools")
-
-
-@pytest.fixture(scope="module")
-def server():
-    return _import_under_temp_cache("world_intel_mcp.server")
 
 
 @pytest.fixture(scope="module")
