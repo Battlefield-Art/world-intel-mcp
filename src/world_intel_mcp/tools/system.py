@@ -57,7 +57,7 @@ async def _status(arguments: dict[str, Any]) -> Any:
             "climate": ["open-meteo"],
             "news": ["rss-aggregator", "gdelt"],
             "intelligence": ["ollama", "acled", "world-bank", "hdx", "usgs"],
-            "prediction": ["polymarket"],
+            "prediction": ["polymarket", "kalshi"],
             "displacement": ["unhcr"],
             "aviation": ["faa"],
             "cyber": ["feodo-tracker", "cisa-kev", "sans-dshield", "urlhaus"],

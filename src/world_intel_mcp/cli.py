@@ -69,6 +69,8 @@ from .sources.arxiv_papers import fetch_arxiv_papers
 from .sources.usa_spending import fetch_usa_spending
 from .sources import geospatial
 from .sources import liquidity
+from .sources import kalshi as kalshi_src
+from .sources import prediction_cross
 
 console = Console()
 
@@ -1037,6 +1039,195 @@ def predictions(ctx: click.Context, limit: int) -> None:
             f"${vol:,.0f}",
         )
     console.print(table)
+
+
+def _pct(value: Any) -> str:
+    return "-" if value is None else f"{value * 100:.1f}%"
+
+
+# Data gaps print through the shared _print_data_gaps defined with the
+# AOI commands below (module-level, resolved at call time).
+
+
+@main.command()
+@click.option("--category", "-c", default=None, help="Kalshi category, e.g. Economics")
+@click.option("--series", "-s", default=None, help="Kalshi series ticker, e.g. KXFED")
+@click.option("--limit", "-n", default=20, help=f"Number of markets (max {kalshi_src.MAX_RESULTS})")
+@click.option(
+    "--pages", default=3, help=f"Unfiltered scan: pages of 200 open events (max {kalshi_src.MAX_PAGES})"
+)
+@click.pass_context
+def kalshi(ctx: click.Context, category: str | None, series: str | None, limit: int, pages: int) -> None:
+    """Kalshi open markets by volume (public market data)."""
+    f = _get_fetcher()
+    data = _run(
+        kalshi_src.fetch_kalshi_markets(f, category=category, series=series, limit=limit, pages=pages)
+    )
+
+    if _bail_on_error(ctx, data):
+        return
+
+    _print_data_gaps(data)
+    mkts = data.get("markets", [])
+    if not mkts:
+        console.print(
+            f"[yellow]No traded Kalshi markets in the scanned set "
+            f"({data.get('scan', {}).get('events_scanned', 0)} events)[/yellow]"
+        )
+        return
+
+    table = Table(title="Kalshi Markets", box=box.SIMPLE_HEAVY)
+    table.add_column("Market", max_width=55)
+    table.add_column("YES side", max_width=25)
+    table.add_column("YES", justify="right")
+    table.add_column("Basis")
+    table.add_column("24h Vol", justify="right")
+    table.add_column("Volume", justify="right")
+    for m in mkts:
+        # Wrapped, not sliced: a ladder's rows differ only at the end
+        # ("... at their October 2026 meeting?" vs "... December ...").
+        table.add_row(
+            _cell(m.get("question") or ""),
+            _cell(m.get("yes_side") or ""),
+            _pct(m.get("probability")),
+            _cell(m.get("price_basis", "")),
+            f"{m.get('volume_24h', 0):,.0f}",
+            f"{m.get('volume', 0):,.0f}",
+        )
+    console.print(table)
+    console.print(f"[dim]{escape(data.get('units', {}).get('price', ''))}[/dim]")
+
+
+@main.command("prediction-compare")
+@click.option("--category", "-c", default=None, help="Kalshi category, e.g. Economics")
+@click.option("--series", "-s", default=None, help="Kalshi series ticker")
+@click.option(
+    "--polymarket-limit", default=300,
+    help=f"Polymarket open markets to compare (max {prediction.MAX_OPEN_MARKETS})",
+)
+@click.option("--min-confidence", default=0.6, help="Match threshold 0..1")
+@click.option("--limit", "-n", default=25, help=f"Matched pairs to show (max {prediction_cross.MAX_PAIRS})")
+@click.pass_context
+def prediction_compare(
+    ctx: click.Context,
+    category: str | None,
+    series: str | None,
+    polymarket_limit: int,
+    min_confidence: float,
+    limit: int,
+) -> None:
+    """Same event on Kalshi and Polymarket, side by side."""
+    f = _get_fetcher()
+    data = _run(
+        prediction_cross.fetch_prediction_compare(
+            f,
+            category=category,
+            series=series,
+            polymarket_limit=polymarket_limit,
+            min_confidence=min_confidence,
+            limit=limit,
+        )
+    )
+
+    if _bail_on_error(ctx, data):
+        return
+
+    _print_data_gaps(data)
+    console.print(
+        f"Compared {data.get('kalshi_markets_compared', 0)} Kalshi / "
+        f"{data.get('polymarket_markets_compared', 0)} Polymarket markets: "
+        f"{data.get('matched_count', 0)} matched, unmatched Kalshi "
+        f"{data.get('unmatched_kalshi')}, unmatched Polymarket {data.get('unmatched_polymarket')}"
+    )
+    pairs = data.get("matched", [])
+    if not pairs:
+        console.print(
+            f"[yellow]No pair reached match confidence {data.get('min_confidence')}[/yellow]"
+        )
+        return
+
+    table = Table(title="Cross-venue Matches", box=box.SIMPLE_HEAVY)
+    table.add_column("Kalshi", max_width=40)
+    table.add_column("Polymarket", max_width=40)
+    table.add_column("Conf", justify="right")
+    table.add_column("Kalshi YES", justify="right")
+    table.add_column("Poly YES", justify="right")
+    table.add_column("Gap", justify="right")
+    for p in pairs:
+        gap = p.get("price_gap")
+        table.add_row(  # wrapped, not sliced (see the kalshi table)
+            _cell(p.get("kalshi", {}).get("question") or ""),
+            _cell(p.get("polymarket", {}).get("question") or ""),
+            f"{p.get('match_confidence', 0):.2f}",
+            _pct(p.get("kalshi_yes_probability")),
+            _pct(p.get("polymarket_yes_probability")),
+            "-" if gap is None else f"{gap * 100:+.1f}pp",
+        )
+    console.print(table)
+
+
+@main.command("prediction-settled")
+@click.option("--limit", "-n", default=25, help=f"Settled markets per venue (max {kalshi_src.MAX_SETTLED})")
+@click.option(
+    "--offset", "offsets", multiple=True, type=float,
+    help=(
+        f"Hours before close (repeatable, up to {prediction_cross.MAX_OFFSETS} values of at most "
+        f"{prediction_cross.MAX_OFFSET_HOURS}; default 24 and 168)"
+    ),
+)
+@click.option("--kalshi-category", default="Economics", help="Kalshi sample category")
+@click.option("--kalshi-series", default=None, help="Kalshi sample series ticker")
+@click.pass_context
+def prediction_settled(
+    ctx: click.Context,
+    limit: int,
+    offsets: tuple[float, ...],
+    kalshi_category: str,
+    kalshi_series: str | None,
+) -> None:
+    """Settled markets scored against pre-close prices (Brier)."""
+    f = _get_fetcher()
+    data = _run(
+        prediction_cross.fetch_prediction_settled(
+            f,
+            limit=limit,
+            offsets_hours=list(offsets) or None,
+            kalshi_category=kalshi_category,
+            kalshi_series=kalshi_series,
+        )
+    )
+
+    if _bail_on_error(ctx, data):
+        return
+
+    _print_data_gaps(data)
+    table = Table(title="Settled-market Brier Scores", box=box.SIMPLE_HEAVY)
+    table.add_column("Venue")
+    table.add_column("Offset")
+    table.add_column("n", justify="right")
+    table.add_column("Events", justify="right")
+    table.add_column("Brier", justify="right")
+    table.add_column("YES rate", justify="right")
+    table.add_column("Excluded", no_wrap=True)
+    for venue, entry in (data.get("venues") or {}).items():
+        if not entry.get("scores"):
+            reason = entry.get("error") or entry.get("not_scored_reason") or "not scored"
+            table.add_row(_cell(venue), "-", "-", "-", "not scored", "-", _cell(reason))
+            continue
+        for label, sc in entry["scores"].items():
+            brier = sc.get("brier")
+            excluded = ", ".join(f"{k}: {v}" for k, v in (sc.get("excluded") or {}).items())
+            table.add_row(
+                _cell(venue),
+                _cell(label),
+                str(sc.get("n", 0)),
+                str(sc.get("distinct_events", 0)),
+                "-" if brier is None else f"{brier:.4f}",
+                _pct(sc.get("yes_rate")),
+                _cell(excluded or "-"),
+            )
+    console.print(table)
+    console.print(f"[dim]{escape(data.get('comparability', ''))}[/dim]")
 
 
 # ---------------------------------------------------------------------------

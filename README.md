@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **154 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **157 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -48,7 +48,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Space Weather** | 1 | NOAA SWPC (Kp index, solar flares, alerts) |
 | **Social & Sanctions** | 3 | Reddit velocity, OFAC SDN list, nuclear test site monitoring |
 | **Country Intelligence** | 3 | Country brief, country stocks, financial centers |
-| **Prediction Markets** | 1 | Polymarket event contracts |
+| **Prediction Markets** | 4 | Polymarket and Kalshi event contracts, the same event on both venues side by side with a stated match confidence, and settled markets scored against their earlier prices (Brier) |
 | **Elections** | 1 | Global election calendar with risk scoring |
 | **Displacement and Migration** | 7 | UNHCR refugee/IDP data, origin -> destination corridors since 1951, year-over-year surge detection; World Bank net migration and migrant stock; border crossings as flows (CBP monthly encounters, UK small-boat arrivals), never mixed with the year-end stocks |
 | **Shipping** | 1 | Dry bulk shipping stress index |
@@ -68,7 +68,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 | **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
 
-**Total: 154 tools** across 30+ intelligence domains.
+**Total: 157 tools** across 30+ intelligence domains.
 
 ---
 
@@ -139,6 +139,9 @@ intel news-reaction -c finance  # same-session moves of companies in the news
 intel hostility Iran Israel --days 7   # daily hostile coverage (GDELT)
 intel situations --sort change         # ranked situations (RSS)
 intel top-stories -m 4                 # stories carried by 4+ outlets
+intel kalshi -c Economics  # Kalshi open markets by volume
+intel prediction-compare -c Economics   # same event on Kalshi and Polymarket
+intel prediction-settled   # Brier scores on settled markets
 intel status               # cache + circuit breaker health
 intel guide                # the research guide (also served as intel://guide)
 intel history health       # per-source collection health from the collector's run log
@@ -408,10 +411,13 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 |------|-------------|
 | `intel_climate_anomalies` | Open-Meteo temperature/precipitation anomalies |
 
-### Prediction Markets (1)
+### Prediction Markets (4)
 | Tool | Description |
 |------|-------------|
 | `intel_prediction_markets` | Polymarket prediction contracts |
+| `intel_kalshi_markets` | Kalshi open markets from its public market data (no account), ranked by volume; YES implied probabilities with the venue's units stated; filter by category or series. Says which events it scanned and whether the scan was complete |
+| `intel_prediction_compare` | The same event on Kalshi and Polymarket: deterministic matching (quantities, years, end dates, negation and outcome side must agree), a `match_confidence` with reasons per pair, the price gap, the closest rejected pairs and why, and unmatched counts per venue |
+| `intel_prediction_settled` | Settled markets on both venues with the outcome, the YES price at fixed offsets before close, and a Brier score per venue and offset with sample size, distinct events, selection and exclusions. A venue without price history is not scored |
 
 ### Elections (1)
 | Tool | Description |

@@ -471,6 +471,46 @@ source here, and no proxy is substituted for any of these measures.
   which its robots.txt disallows (measured 2026-10-17, see ROADMAP Phase 28).
 - Tools 139 -> 141.
 
+### Added: Kalshi and cross-venue prediction markets
+- `intel_kalshi_markets`: Kalshi open markets from its public market-data
+  API (no account, no key), ranked by 24h then lifetime volume. Prices are
+  YES implied probabilities (bid/ask midpoint when the book is two-sided,
+  else the last trade, with the basis named); Kalshi's raw dollar quotes
+  are kept. Filter by category (the category's highest-volume series) or
+  series ticker. The response names the events it scanned and whether the
+  scan was complete: Kalshi lists more than 8,000 open events, furthest
+  close date first.
+- `intel_prediction_compare`: the same event on Kalshi and Polymarket side
+  by side. Matching is deterministic: quantities (with their direction,
+  so "more than 25 bps" is not "25 bps"), years, end dates, negation and
+  the outcome side must all agree, and each pair carries a
+  `match_confidence` and its reasons. Below the threshold (default 0.6) a
+  pair is not a match. Returns the price gap per pair, the closest
+  rejected pairs with the reason, and unmatched counts per venue.
+- `intel_prediction_settled`: recently settled markets on both venues with
+  the outcome and the YES price at fixed offsets before close (default 24h
+  and 168h) from each venue's price-history endpoint, and a Brier score per
+  venue and offset with sample size, distinct events, selection and
+  exclusions stated. A venue whose price history cannot be read is not
+  scored. The two samples are different markets, and the response says so.
+- Every number these three tools take has a stated range in its input
+  schema: at most 25 Kalshi series or pages per scan, 2,000 Polymarket
+  markets, 500 results, 100 settled markets per venue, and 10 offsets of
+  at most 8,760 hours, so one call cannot fan out into an unbounded number
+  of upstream requests. The MCP server refuses a value outside its range;
+  the source functions clamp counts again for the CLI and other callers,
+  and refuse a value that is not a number before any request.
+- CLI: `intel kalshi`, `intel prediction-compare`, `intel prediction-settled`.
+- Collector: `kalshi_markets` and `prediction_compare` (Economics
+  category) join the `prediction` domain. Sources 55 -> 57. Tools 139 -> 142.
+
+### Fixed: prediction markets outage read as "no markets"
+- `intel_prediction_markets` returned `{"markets": [], "count": 0}` with no
+  marker when Polymarket was down, the same shape as a quiet market. It now
+  adds `error` and `degraded: true` on an outage or an unexpected response,
+  and `stale: true` when the list came from an expired cache entry. Keys,
+  parameters and the tool name are unchanged.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard
