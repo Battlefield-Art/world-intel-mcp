@@ -161,16 +161,14 @@ class Fetcher:
             logger.debug("Circuit open for %s, trying stale cache", source)
             return self._stale_fallback(effective_key, source)
 
-        # Per-source rate limiting
-        if yahoo_rate_limit:
-            await self._yahoo_throttle()
-        await self._source_throttle(source)
-
         # Fetch with retries
         client = await self._get_client()
         last_error: Exception | None = None
 
         for attempt in range(self.max_retries + 1):
+            if yahoo_rate_limit:
+                await self._yahoo_throttle()
+            await self._source_throttle(source)
             try:
                 resp = await client.get(
                     url,
@@ -232,12 +230,11 @@ class Fetcher:
         if not self.breaker.is_available(source):
             return self._stale_fallback(effective_key, source)
 
-        await self._source_throttle(source)
-
         client = await self._get_client()
         last_error: Exception | None = None
 
         for attempt in range(self.max_retries + 1):
+            await self._source_throttle(source)
             try:
                 resp = await client.get(
                     url,
@@ -288,12 +285,12 @@ class Fetcher:
         if not self.breaker.is_available(source):
             return BinaryResult(None, None, f"circuit open for {source}")
 
-        await self._source_throttle(source)
         client = await self._get_client()
         last_error = "unknown error"
         last_status: int | None = None
 
         for attempt in range(self.max_retries + 1):
+            await self._source_throttle(source)
             try:
                 resp = await client.get(
                     url, headers=headers, timeout=timeout or self.default_timeout

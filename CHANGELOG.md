@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
+  the cache: `$XDG_CACHE_HOME/world-intel-mcp/temporal.db` and
+  `$XDG_CACHE_HOME/world-intel-mcp/keyword_spikes.db`. With it unset, they
+  remain in `~/.cache/world-intel-mcp/`. Users who set `XDG_CACHE_HOME`
+  can keep existing baselines by moving these two files from
+  `~/.cache/world-intel-mcp/` to `$XDG_CACHE_HOME/world-intel-mcp/`.
+  Importing the package no longer opens databases; they open on first use.
+- Apply per-source request spacing to every HTTP retry, including JSON,
+  text, XML and binary fetches.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

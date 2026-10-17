@@ -247,7 +247,7 @@ async def fetch_weekly_trends(fetcher) -> dict:
     Returns:
         Dict with trends, trend_count, analysis_period, source.
     """
-    from ..analysis.temporal import TemporalBaseline, _DB_PATH
+    from ..analysis.temporal import _default_db_path
     from ..sources import intelligence
 
     now = datetime.now(timezone.utc)
@@ -261,7 +261,7 @@ async def fetch_weekly_trends(fetcher) -> dict:
     trends: list[dict] = []
 
     try:
-        conn = sqlite3.connect(_DB_PATH)
+        conn = sqlite3.connect(_default_db_path())
         rows = conn.execute(
             "SELECT key, count, mean, m2, updated_at FROM baselines WHERE count >= 5"
         ).fetchall()

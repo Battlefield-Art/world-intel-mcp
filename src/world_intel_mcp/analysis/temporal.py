@@ -15,18 +15,30 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("world-intel-mcp.analysis.temporal")
 
-_DB_PATH = os.path.join(
-    os.path.expanduser("~"), ".cache", "world-intel-mcp", "temporal.db"
-)
+_DB_PATH: str | None = None
+
+
+def _default_db_path() -> str:
+    if _DB_PATH is not None:
+        return _DB_PATH
+    cache_home = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return os.path.join(os.path.expanduser(cache_home), "world-intel-mcp", "temporal.db")
 
 
 class TemporalBaseline:
     """Streaming anomaly detector with Welford's algorithm + SQLite persistence."""
 
-    def __init__(self, db_path: str = _DB_PATH):
+    def __init__(self, db_path: str | None = None):
         self._db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._conn: sqlite3.Connection | None = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
+        if self._db_path is None:
+            self._db_path = _default_db_path()
+        os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
+        self._conn = sqlite3.connect(self._db_path)
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS baselines (
                 key TEXT PRIMARY KEY,
@@ -37,6 +49,7 @@ class TemporalBaseline:
             )"""
         )
         self._conn.commit()
+        return self._conn
 
     def _key(self, event_type: str, region: str) -> str:
         """Build a composite key including weekday and month for seasonality."""
@@ -49,8 +62,9 @@ class TemporalBaseline:
         """Record an observation using Welford's online update."""
         key = self._key(event_type, region)
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn = self._get_conn()
 
-        row = self._conn.execute(
+        row = conn.execute(
             "SELECT count, mean, m2 FROM baselines WHERE key = ?", (key,)
         ).fetchone()
 
@@ -66,7 +80,7 @@ class TemporalBaseline:
         delta2 = count - mean
         m2 += delta * delta2
 
-        self._conn.execute(
+        conn.execute(
             """INSERT INTO baselines (key, count, mean, m2, updated_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(key) DO UPDATE SET
@@ -76,7 +90,7 @@ class TemporalBaseline:
                    updated_at = excluded.updated_at""",
             (key, n, mean, m2, now_iso),
         )
-        self._conn.commit()
+        conn.commit()
 
     def check(self, event_type: str, region: str, count: int) -> dict | None:
         """Check a value against the baseline.
@@ -86,7 +100,7 @@ class TemporalBaseline:
         """
         key = self._key(event_type, region)
 
-        row = self._conn.execute(
+        row = self._get_conn().execute(
             "SELECT count, mean, m2 FROM baselines WHERE key = ?", (key,)
         ).fetchone()
 

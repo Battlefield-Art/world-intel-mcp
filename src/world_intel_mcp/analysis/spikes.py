@@ -14,9 +14,15 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("world-intel-mcp.analysis.spikes")
 
-_DB_PATH = os.path.join(
-    os.path.expanduser("~"), ".cache", "world-intel-mcp", "keyword_spikes.db"
-)
+_DB_PATH: str | None = None
+
+
+def _default_db_path() -> str:
+    if _DB_PATH is not None:
+        return _DB_PATH
+    cache_home = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return os.path.join(os.path.expanduser(cache_home), "world-intel-mcp", "keyword_spikes.db")
+
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 _APT_RE = re.compile(
@@ -30,9 +36,17 @@ _APT_RE = re.compile(
 class KeywordSpikeDetector:
     """Detects keyword frequency spikes against rolling baselines."""
 
-    def __init__(self, db_path: str = _DB_PATH):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: str | None = None):
+        self._db_path = db_path
+        self._conn: sqlite3.Connection | None = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
+        if self._db_path is None:
+            self._db_path = _default_db_path()
+        os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
+        self._conn = sqlite3.connect(self._db_path)
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS kw_baselines (
                 keyword TEXT PRIMARY KEY,
@@ -43,10 +57,11 @@ class KeywordSpikeDetector:
             )"""
         )
         self._conn.commit()
+        return self._conn
 
     def _get_baseline(self, keyword: str) -> tuple[int, float, float]:
         """Get (count, mean, m2) for a keyword."""
-        row = self._conn.execute(
+        row = self._get_conn().execute(
             "SELECT count, mean, m2 FROM kw_baselines WHERE keyword = ?",
             (keyword,),
         ).fetchone()
@@ -61,14 +76,15 @@ class KeywordSpikeDetector:
         delta2 = value - mean
         m2 += delta * delta2
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             """INSERT INTO kw_baselines (keyword, count, mean, m2, updated_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(keyword) DO UPDATE SET
                  count=?, mean=?, m2=?, updated_at=?""",
             (keyword, n, mean, m2, now, n, mean, m2, now),
         )
-        self._conn.commit()
+        conn.commit()
 
     def detect_spikes(
         self,
