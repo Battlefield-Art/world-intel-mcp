@@ -1,13 +1,15 @@
 """Import-based tests for server.py's tool registry and dispatcher.
 
-Every other test file reads server.py as *text* because its shared
-``Cache()``/``AOIStore()`` open at the default on-disk path. Here we
-import it for real, under a temp cache path (``WORLD_INTEL_CACHE_DB`` is
-honored by ``Cache``; the fixture binds the shared infrastructure while
-the override is in force), which is what lets these tests verify the
-registry structurally instead of by regex: the TOOLS/_dispatch parity
-invariant, schema well-formedness, and the actual dispatch path for the
-pure (no-network) tools.
+Importing server.py opens no database: the shared ``Cache``/``AOIStore``
+in runtime.py are built on first access, not at import. The fixture
+imports the module for real with ``WORLD_INTEL_CACHE_DB`` pointed at a
+temp file and then rebuilds the shared runtime under that override
+(``runtime._initialize()``), because an earlier test module may already
+have built it at another path; the first test guards that premise.
+Importing it is what lets these tests verify the registry structurally
+instead of by regex: the TOOLS/_dispatch parity invariant, schema
+well-formedness, and the actual dispatch path for the pure (no-network)
+tools.
 """
 
 import importlib
