@@ -634,20 +634,32 @@ source here, and no proxy is substituted for any of these measures.
   Hormuz critical alike. On the live feed of 2026-10-17 the old code marked
   all nine `critical` from 8 such warnings, none within 300 km of any of
   them. A warning now counts only at waterways within 300 km of a position
-  it states (degrees-minutes or degrees-minutes-seconds). A warning that
-  states no position counts by NAVAREA only when its area code names a
-  single NAVAREA (4 is NAVAREA IV, 12 is NAVAREA XII, which of the nine
-  contain only the Panama Canal). HYDROLANT, HYDROPAC and HYDROARC each
-  span several NAVAREAs, so a positionless naval warning in those series,
-  or one whose only stated position is malformed, is listed in
-  `unplaced_naval_warnings` and named in `data_gaps`. The response states
-  the rule in `matching_rule`.
+  its text states, read from the full text (positions past the
+  500-character cut used to be lost). A warning that states no readable
+  position counts nowhere: its area code names at least a whole NAVAREA.
+  Crediting such warnings to the Panama Canal by NAVAREA IV or XII was
+  measured and rejected: on the same capture all 5 of those credits were
+  wrong (Hawaii, California, "warnings in force" lists), and on the 3,480
+  warnings of 2024 they were 200 of Panama's 203, none naming Panama.
+  Naval warnings with no readable position are listed in
+  `unplaced_naval_warnings` with a reason (`multi_navarea_series`,
+  `navarea_too_broad`, `position_unreadable`, `unknown_area_code`) and
+  named in `data_gaps` as `<area code>:<id>`, since one id can name
+  warnings in two series. The rule is in `matching_rule`.
 - Each waterway emits `total_nearby` (warnings of any topic credited to
-  it, which the old code computed and dropped), split by how they matched
-  in `nearby_by_match` and `naval_by_match`; `warning_details` entries
-  carry `match`, `distance_km` and `issue_date`.
+  it, which the old code computed and dropped) and `status_as_of`;
+  `warning_details` entries carry `match`, `distance_km` and `issue_date`.
 - With NGA down every waterway read `clear`. It now reads `unknown`, and
-  the response carries `error`, `degraded` and `reason`.
+  the response carries `error`, `degraded` and `reason`. With the feed past
+  its staleness threshold every waterway reads `stale` (its counts kept,
+  dated by `status_as_of`) instead of a current threat level.
+- Positions are read in degrees-minutes, degrees-minutes-seconds and the
+  two mixed, with whitespace, a comma or a slash between latitude and
+  longitude; a lone latitude or longitude (a band or a meridian) counts as
+  a stated but unreadable position. On the 3,866 warnings captured
+  2026-10-17 (386 active, 3,480 from 2024) this loses none of the previous
+  parser's 21,780 positions and reads 34 more, in HYDROLANT 2024-473, 479
+  and 488.
 
 ### Fixed: navigational warnings
 - An NGA outage returned `warnings: []` with no marker, the same shape as a
@@ -660,25 +672,78 @@ source here, and no proxy is substituted for any of these measures.
   none, `msgYear=2024` with `status=all` ends on 10 May, and
   `/current-warnings` and `/inforce` list the same 2024 state), yet
   responses read as current. `intel_nav_warnings` now reports
-  `newest_issue_date` and `newest_issue_age_days`; past `stale_after_days`
-  (14, twice the slowest series' longest gap between issues in 2024) the
-  response is degraded with the age in `data_gaps`. The vessel snapshot and
-  fleet report pass this on.
+  `newest_issue_date`, `newest_issue_age_days` and `feed_stale`; past
+  `stale_after_days` (14, twice the slowest series' longest gap between
+  issues in 2024) the response is degraded with the age in `data_gaps`. An
+  issue date more than a day ahead is left out of the check and named in
+  `data_gaps`: one "MAY 2042" among frozen 2024 warnings used to make the
+  feed read current. The vessel snapshot and fleet report pass this on,
+  and `intel warnings` prints a STALE line and the data gaps.
+- The `navarea` filter compared the value with the API's `navArea` field,
+  which only ever holds the codes 4, 12, A, P and C, so the documented
+  Roman numerals matched nothing: `navarea="IV"` returned 0 of the 71
+  code-4 warnings on the live feed, with no marker. It now takes the codes,
+  their series names (`HYDROPAC`) and IV or XII for 4 or 12; a value no
+  carried area matches (most NAVAREAs arrive inside the A, P and C series)
+  returns `error` and `reason` `navarea_not_carried` with a `data_gaps`
+  line naming the series that carry it, never a bare 0. The tool schema
+  and the CLI `--navarea` help say the same. The freshness fields describe
+  the whole active feed, before the filter, so an area with nothing in
+  force on a frozen feed reads stale instead of an undated 0.
 - `area_codes` maps the codes the API sends in `navArea` (4, 12, A, P, C;
   never the Roman numerals) to the NAVAREAs, with each code's source in
-  `sources/maritime.py`.
+  `sources/maritime.py`. Code 4 also carries Canadian Arctic (NAVAREA
+  XVIII) warnings, so it is not a single NAVAREA.
 
-### Fixed: fleet report
+### Fixed: fleet report and theater posture
 - `intel_fleet_report` turned a failed component into `{}`, so with all
   three down it read `LOW_ACTIVITY` with no marker. A component that raises
   or reports an error is now named in `unavailable_components` and
-  `data_gaps` and the report is degraded; with all three down it also
-  carries `error` and `reason` (`fleet_components_unavailable`). Component
-  `data_gaps` are passed on.
+  `data_gaps` and the report is degraded; so is a vessel snapshot whose NGA
+  feed is stale, which is no longer scored. With all three unavailable the
+  report carries `error` and `reason` (`fleet_components_unavailable`),
+  `readiness_level` `UNKNOWN` and `readiness_score` null. With some
+  missing, `readiness_lower_bound` is true and `data_gaps` says what the
+  score leaves out and how high it can still reach (each component adds at
+  most 30 of 90). Component `data_gaps` are passed on.
+- `intel_military_flights` with adsb.lol and OpenSky both down returned
+  zero aircraft, told apart from an empty sky only by `source: "none"`.
+  Those keys stay, and the response now also carries `error`, `degraded`
+  and `reason` (`military_flights_unavailable`).
+- `intel_theater_posture` turned a theater that no flight source answered
+  for (adsb.lol and OpenSky both failed) into zero aircraft, so a full
+  outage read as an empty sky, and as `LOW_ACTIVITY` with no error in the
+  fleet report. Each theater now names its `source`; unanswered ones are
+  listed in `unavailable_theaters` and `data_gaps` and the response is
+  degraded, with `error` and `reason` (`military_flights_unavailable`)
+  when none answered. Only a complete posture is cached.
+  `intel_military_surge` turns a posture error into its own error and
+  skips regions whose theater had no source (`unchecked_regions`) instead
+  of recording zeros in their baselines.
+
+### Fixed: report maritime section
+- The PDF/HTML report read `vessels` and `snapshot` for its maritime
+  section, keys the vessel snapshot never emits, so every report said "No
+  maritime data". It now shows the nine waterways' statuses, a STALE note
+  for a frozen feed, the outage error, and the first data gaps.
 
 ### Tests
-- Failing-first regression tests for all three, built on live NGA records
-  captured 2026-10-17.
+- Failing-first regression tests built on live NGA records captured
+  2026-10-17, and `test_maritime_honesty.py` and `test_fleet_honesty.py`
+  for the second review round: each finding test fails on the previous
+  branch head and passes now, and five tests kill the mutants that survived
+  the first round (radius boundary, malformed DMS, notation order,
+  staleness boundary, two components down).
+
+### Still open
+- The dashboard's nav-warnings table and fleet panel do not yet read
+  `feed_stale`, `stale`, `unknown`, `readiness_lower_bound` or `UNKNOWN`,
+  and the collector counts error results as successful collections.
+- Strategic posture and temporal anomalies still read a posture outage as
+  zero activity; posture now marks it, but they do not check.
+- A naval warning that cannot be placed leaves every waterway's status
+  unchanged; it is named only in `unplaced_naval_warnings` and
+  `data_gaps`.
 
 ### Added: AOI escalation news and convergence components
 - `intel_aoi_escalation` now scores the news and convergence components it

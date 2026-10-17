@@ -401,8 +401,61 @@ def _render_health(data: dict) -> str:
     </table>"""
 
 
+_WATERWAY_STATUS_CLASS = {
+    "critical": "red",
+    "elevated": "red",
+    "advisory": "amber",
+    "clear": "green",
+}
+
+
 def _render_maritime(data: dict) -> str:
-    """Render maritime overview."""
+    """Render maritime overview: the vessel snapshot's waterway statuses.
+
+    The maritime section is fetch_vessel_snapshot, which emits waterways.
+    This used to read only vessels / snapshot, keys the snapshot never
+    emits, so every report said "No maritime data". Those keys still
+    render when present.
+    """
+    if data.get("error"):
+        return (
+            '<p class="no-data">Maritime data unavailable: '
+            f"{_esc(str(data['error'])[:200])}</p>"
+        )
+    waterways = data.get("waterways")
+    if isinstance(waterways, list) and waterways:
+        html = ""
+        if data.get("feed_stale"):
+            html += (
+                '<p><span class="metric amber">STALE</span> The NGA warning feed was '
+                f"last updated {_esc(data.get('newest_issue_date'))}: these statuses "
+                "describe that date, not today.</p>"
+            )
+        ww_rows = []
+        for ww in waterways:
+            if not isinstance(ww, dict):
+                continue
+            status = str(ww.get("status") or "unknown")
+            cls = _WATERWAY_STATUS_CLASS.get(status, "")
+            ww_rows.append(
+                f"<tr><td>{_esc(ww.get('name', ''))}</td>"
+                f'<td><span class="metric {cls}">{_esc(status)}</span></td>'
+                f"<td>{_esc(ww.get('naval_warnings', 0))}</td>"
+                f"<td>{_esc(ww.get('total_nearby', 0))}</td></tr>"
+            )
+        html += f"""
+    <table>
+        <tr><th>Waterway</th><th>Status</th><th>Naval warnings</th><th>All warnings nearby</th></tr>
+        {"".join(ww_rows)}
+    </table>"""
+        gaps = data.get("data_gaps") or []
+        if gaps:
+            html += "<ul>" + "".join(f"<li>{_esc(str(g)[:300])}</li>" for g in gaps[:5])
+            if len(gaps) > 5:
+                html += f"<li>{len(gaps) - 5} more data gap(s) not shown</li>"
+            html += "</ul>"
+        return html
+
     vessels = data.get("vessels") or data.get("snapshot", [])
     if not vessels:
         return '<p class="no-data">No maritime data</p>'

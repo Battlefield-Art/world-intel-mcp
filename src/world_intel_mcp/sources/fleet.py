@@ -89,10 +89,16 @@ async def fetch_fleet_report(fetcher) -> dict:
     - Naval bases (filtered from static dataset)
 
     A component that raised or reported an error is named in
-    unavailable_components and data_gaps, and the report is degraded; the
-    readiness score is then computed without it. With all three down the
-    report carries error / reason, so an outage never reads as
-    LOW_ACTIVITY. data_gaps also carries each component's own gaps.
+    unavailable_components and data_gaps, and the report is degraded; so is
+    a vessel snapshot whose NGA feed is stale (feed_stale), since its
+    warnings describe the feed's last update, not today. The readiness
+    score leaves unavailable inputs out, which makes it a lower bound
+    (readiness_lower_bound True, with the reason in data_gaps); so does a
+    theater with no flight source (posture's unavailable_theaters) or a
+    surge region left unchecked. With all three components unavailable the
+    report carries error / reason, readiness_level "UNKNOWN" and
+    readiness_score None, so an outage never reads as LOW_ACTIVITY.
+    data_gaps also carries each available component's own gaps.
     """
     from . import intelligence, military, geospatial
 
@@ -115,29 +121,72 @@ async def fetch_fleet_report(fetcher) -> dict:
         "theater_posture": posture_data,
         "vessel_snapshot": vessel_data,
     }
-    unavailable = [name for name, data in components.items() if data.get("error")]
     data_gaps: list[str] = []
+    unavailable: list[str] = []
     for name, data in components.items():
         if data.get("error"):
+            unavailable.append(name)
+            data_gaps.append(f"{name}: unavailable ({data['error']})")
+            continue
+        if data.get("feed_stale") is True:
+            # Three 2024 warnings near Hormuz used to score as a critical
+            # waterway today.
+            unavailable.append(name)
             data_gaps.append(
-                f"{name}: unavailable ({data['error']}); readiness_score is "
-                "computed without it"
+                f"{name}: stale (its newest NGA warning was issued "
+                f"{data.get('newest_issue_date')}, past the "
+                f"{data.get('stale_after_days')}-day threshold)"
             )
             continue
         gaps = data.get("data_gaps") or []
         data_gaps.extend(f"{name}: {gap}" for gap in gaps)
         if data.get("degraded") and not gaps:
             data_gaps.append(f"{name}: degraded")
+    scored = [name for name in components if name not in unavailable]
 
-    # Extract key data
-    theaters = posture_data.get("theaters", {})
+    # Extract key data. An unavailable component contributes nothing, and
+    # neither does a theater no flight source answered for: its count of 0
+    # means unknown.
+    theaters = posture_data.get("theaters", {}) if "theater_posture" in scored else {}
     if not isinstance(theaters, dict):
         theaters = {}
+    no_source = [t for t in posture_data.get("unavailable_theaters") or [] if t in theaters]
+    theaters = {name: t for name, t in theaters.items() if name not in no_source}
     waterways = vessel_data.get("waterways", [])
-    surges = surge_data.get("surges", [])
+    scored_waterways = waterways if "vessel_snapshot" in scored else []
+    surges = surge_data.get("surges", []) if "military_surge" in scored else []
+    unchecked = (
+        (surge_data.get("unchecked_regions") or []) if "military_surge" in scored else []
+    )
 
     # Compute fleet readiness
-    readiness_level, readiness_score = _fleet_readiness(theaters, waterways, surges)
+    readiness_lower_bound: bool | None
+    if not scored:
+        readiness_level, readiness_score = "UNKNOWN", None
+        readiness_lower_bound = None
+        data_gaps.append(
+            "readiness_level is UNKNOWN and readiness_score is null: no component "
+            "was available to score"
+        )
+    else:
+        readiness_level, readiness_score = _fleet_readiness(
+            theaters, scored_waterways, surges
+        )
+        left_out = list(unavailable)
+        if no_source:
+            left_out.append(f"the aircraft of {', '.join(no_source)}")
+        if unchecked:
+            left_out.append(f"surges in {', '.join(unchecked)}")
+        readiness_lower_bound = bool(left_out)
+        if left_out:
+            gap = (
+                "readiness_level and readiness_score are lower bounds: they "
+                f"leave out {'; '.join(left_out)}"
+            )
+            if unavailable:
+                # Each component adds at most 30 (see _fleet_readiness).
+                gap += f", so the score can reach at most {30 * len(scored)} of 90"
+            data_gaps.append(gap)
 
     # Theater summary — theaters is {name: {count, countries, top_types, ...}}
     theater_summary = []
@@ -182,6 +231,7 @@ async def fetch_fleet_report(fetcher) -> dict:
     response = {
         "readiness_level": readiness_level,
         "readiness_score": readiness_score,
+        "readiness_lower_bound": readiness_lower_bound,
         "theater_summary": theater_summary,
         "theater_count": len(theater_summary),
         "waterway_summary": waterway_summary,
@@ -196,16 +246,18 @@ async def fetch_fleet_report(fetcher) -> dict:
         "source": "fleet-activity-report",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if no_source:
+        response["unavailable_theaters"] = no_source
     if unavailable:
         # The zeroed fields above stay for consumers that read them;
         # these say which inputs they lack.
         response["unavailable_components"] = unavailable
         response["degraded"] = True
-        if len(unavailable) == len(components):
+        if not scored:
             response["error"] = "All fleet report components unavailable: " + ", ".join(
                 unavailable
             )
             response["reason"] = "fleet_components_unavailable"
-    elif any(data.get("degraded") for data in components.values()):
+    elif readiness_lower_bound or any(data.get("degraded") for data in components.values()):
         response["degraded"] = True
     return response

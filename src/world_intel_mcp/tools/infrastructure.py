@@ -37,13 +37,13 @@ TOOLS: list[Tool] = [
     # --- Maritime (1 tool) ---
     Tool(
         name="intel_nav_warnings",
-        description="Get active navigational warnings from NGA Maritime Safety. Optional: navarea (I-XVI).",
+        description="Get active navigational warnings from NGA Maritime Safety, each with every position its text states. feed_stale is true when the feed's newest active warning (before any navarea filter) is past the staleness threshold, and data_gaps then says so. Optional: navarea, an NGA area code (4, 12, A, P, C; IV and XII are accepted for 4 and 12).",
         inputSchema={
             "type": "object",
             "properties": {
                 "navarea": {
                     "type": "string",
-                    "description": "NAVAREA number (e.g., IV, XII)",
+                    "description": "NGA area code: 4 (NAVAREA IV), 12 (NAVAREA XII), A (HYDROLANT), P (HYDROPAC) or C (HYDROARC); IV and XII are accepted for 4 and 12. Other NAVAREAs arrive inside the A, P and C series, so a value that matches no carried area returns an error and a data_gaps line, never a count of 0.",
                 },
             },
         },

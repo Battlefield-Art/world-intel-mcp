@@ -659,7 +659,12 @@ def cables(ctx: click.Context) -> None:
 
 
 @main.command()
-@click.option("--navarea", "-n", default=None, help="NAVAREA number (e.g., IV)")
+@click.option(
+    "--navarea",
+    "-n",
+    default=None,
+    help="NGA area code: 4, 12, A, P or C (IV and XII are accepted for 4 and 12)",
+)
 @click.pass_context
 def warnings(ctx: click.Context, navarea: str | None) -> None:
     """Navigational warnings (NGA Maritime Safety)."""
@@ -667,9 +672,21 @@ def warnings(ctx: click.Context, navarea: str | None) -> None:
     data = _run(maritime.fetch_nav_warnings(f, navarea=navarea))
 
     if _bail_on_error(ctx, data):
+        if not ctx.obj.get("json"):
+            _print_data_gaps(data)
         return
 
+    if data.get("feed_stale"):
+        # The live feed's newest warning dates from May 2024; without this
+        # line the list read as current conditions.
+        console.print(
+            "[yellow bold]STALE:[/yellow bold] newest warning issued "
+            f"{escape(str(data.get('newest_issue_date')))} "
+            f"({data.get('newest_issue_age_days')} days ago; threshold "
+            f"{data.get('stale_after_days')} days)"
+        )
     console.print(f"[bold]{data.get('count', 0)} active warnings[/bold]\n")
+    _print_data_gaps(data)
 
     by_area = data.get("by_navarea", {})
     if by_area:

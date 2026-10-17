@@ -234,9 +234,12 @@ async def fetch_military_flights(
 
     Returns:
         Dict with aircraft list, count, filter description, source, and timestamp.
+        When neither source answers, source is "none" and the dict also carries
+        error, degraded and reason: the count is unknown, not zero.
     """
     # Primary: adsb.lol (free, dedicated military endpoint, no filtering needed)
     aircraft = await _fetch_adsblol_military(fetcher)
+    adsblol_failed = aircraft is None
     if aircraft is not None and len(aircraft) > 0:
         # Apply bbox filter client-side if requested
         if bbox is not None:
@@ -269,12 +272,22 @@ async def fetch_military_flights(
             "timestamp": _utc_now_iso(),
         }
 
+    # Neither source answered. This used to read as an empty sky (count 0,
+    # told apart only by source "none"); the keys stay for the consumers
+    # that read them, and error / degraded / reason mark the outage.
+    if adsblol_failed:
+        detail = "adsb.lol and OpenSky both failed"
+    else:
+        detail = "adsb.lol returned no positioned aircraft and OpenSky failed"
     return {
         "aircraft": [],
         "count": 0,
         "military_filter": "icao_prefix+callsign",
         "source": "none",
         "timestamp": _utc_now_iso(),
+        "error": f"No military flight source available ({detail})",
+        "degraded": True,
+        "reason": "military_flights_unavailable",
     }
 
 
@@ -284,11 +297,19 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
     Calls fetch_military_flights for each theater in parallel and aggregates
     the results into a per-theater summary.
 
+    A theater that no flight source answered for (fetch_military_flights
+    source "none") has an unknown count, not zero: it is named in
+    unavailable_theaters and data_gaps and the response is degraded; with
+    every theater unavailable it carries error / reason. Its count stays 0
+    for consumers that read the field directly. Only a complete posture is
+    cached, so an outage is not replayed after the sources recover.
+
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
 
     Returns:
-        Dict with per-theater summaries, total count, source, and timestamp.
+        Dict with per-theater summaries (each with the source that answered),
+        total count, data_gaps, source, and timestamp.
     """
     # Check cache first to avoid redundant parallel fetches.
     cached = fetcher.cache.get("military:posture")
@@ -313,6 +334,7 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
             "sample_callsigns": callsigns[:5],
             "bbox": info["bbox"],
             "description": info["desc"],
+            "source": result.get("source"),
         })
 
     tasks = [
@@ -329,9 +351,29 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
     response = {
         "theaters": theaters,
         "total_military_aircraft": total,
+        "data_gaps": [],
         "source": "opensky",
         "timestamp": _utc_now_iso(),
     }
+
+    # An outage used to come back as zero aircraft in every theater, the
+    # reading of an empty sky, and fleet readiness scored it LOW_ACTIVITY.
+    unavailable = [name for name, summary in theaters.items() if summary["source"] == "none"]
+    if unavailable:
+        response["unavailable_theaters"] = unavailable
+        response["degraded"] = True
+        response["data_gaps"].append(
+            "neither adsb.lol nor OpenSky returned military flights for "
+            f"{', '.join(unavailable)}: their counts are unknown, not zero, and "
+            "total_military_aircraft counts only the other theaters"
+        )
+        if len(unavailable) == len(theaters):
+            response["error"] = (
+                "No military flight source available for any theater "
+                "(neither adsb.lol nor OpenSky returned military flights)"
+            )
+            response["reason"] = "military_flights_unavailable"
+        return response
 
     fetcher.cache.set("military:posture", response, 300)
     return response
