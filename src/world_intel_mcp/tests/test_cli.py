@@ -134,6 +134,7 @@ def test_command_registry() -> None:
         "report",
         "aoi",
         "news-reaction",
+        "history",
     } <= names
     # webcams_cmd has no explicit name=, but click >= 8.1 strips the
     # `_cmd` suffix when deriving default command names, so the

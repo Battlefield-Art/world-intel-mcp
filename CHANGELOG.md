@@ -186,6 +186,49 @@ source here, and no proxy is substituted for any of these measures.
   terms could not be read; its RSS and warning texts served 200 to the
   same client. Wind radii and seas are not parsed.
 
+### Added: observation history and collection health
+- A history store in the cache SQLite file. Every collector source run is a
+  capture: source, collected_at, status (ok, degraded or error), duration,
+  record count, reason and payload hash. A failed fetch is an error capture
+  with its reason and no record count, never an ok capture with zero
+  records. An empty payload is degraded, because a quiet period and a
+  silent upstream failure look the same.
+- Payload bodies are kept once per distinct payload as compressed JSON
+  (top-level fetch-time stamps are ignored when hashing). Retention, each
+  0 = keep forever: `WORLD_INTEL_HISTORY_PAYLOAD_DAYS` (default 7) for
+  bodies, `WORLD_INTEL_HISTORY_CAPTURE_DAYS` (default 30) for the run log,
+  `WORLD_INTEL_HISTORY_DAYS` (default 365) for observations. Measured over
+  three full 55-source cycles: 90 KB and 193 KB of new compressed bodies in
+  the two follow-up cycles (about 70 KB from sources that change every
+  cycle, plus the military flight snapshot when it succeeds) and about
+  14 KB of capture rows per cycle. At `--interval 300` that is about
+  130-340 MB of bodies at the 7-day default and about 100 MB of run log at
+  30 days. Quote observations on a trading day were not measured.
+- Observations with three dates: `observed_at` (from the payload, or null
+  when it has none; never the collection time), `published_at` (when the
+  payload names a release time) and `collected_at`. Built-in extractors:
+  NOAA Kp, USGS per-event magnitude, FRED-sourced central bank rates
+  (curated rows are skipped), Yahoo index and commodity quotes (null
+  `observed_at`: the payload carries no quote time).
+  `history.register_extractor()` is the public API for new sources.
+- MCP tools `intel_collection_health`, `intel_capture_history`,
+  `intel_series_history` and `intel_revisions`, and the CLI group
+  `intel history health|captures|series|revisions`. History accrues only
+  while the collector runs.
+- The collector records every source outcome of a cycle in one
+  transaction. Its summary gains a `history` key (and the CLI summary a
+  History line); a history write failure is reported there and in the
+  log, and never fails the cycle.
+- Expected cadence for health is 300 s (the shipped plist interval);
+  `WORLD_INTEL_HISTORY_CADENCE_S` and
+  `WORLD_INTEL_HISTORY_CADENCES=source=seconds,...` override it.
+
+### Notes
+- The cycle summary's `successes` still counts a source that returned
+  `{"error": ...}` (unchanged, pinned by an existing test); that run's
+  history capture is an error.
+- Tools 139 -> 143.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

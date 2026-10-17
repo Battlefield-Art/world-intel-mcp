@@ -2932,5 +2932,241 @@ def aoi_changes(ctx: click.Context, name: str) -> None:
     _print_data_gaps(data)
 
 
+# ---------------------------------------------------------------------------
+# History (collector run log, captures, series, revisions)
+# ---------------------------------------------------------------------------
+
+
+def _with_history_store(fn: Any) -> dict:
+    from .history import HistoryStore
+
+    store = HistoryStore(_get_fetcher().cache.db_path)
+    try:
+        return fn(store)
+    finally:
+        store.close()
+
+
+@main.group(name="history")
+def history_group() -> None:
+    """Saved collector history: health, captures, series, revisions.
+
+    History accrues only while the collector (intel-collector) runs.
+    """
+
+
+@history_group.command(name="health")
+@click.option("--source", default=None, help="One collector source name")
+@click.pass_context
+def history_health(ctx: click.Context, source: str | None) -> None:
+    """Per-source collection health from the collector's run log."""
+    from .collector import SOURCES
+
+    roster = [name for name, _, _, _ in SOURCES]
+    data = _with_history_store(
+        lambda s: s.collection_health(roster, source=source)
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    table = Table(
+        title=f"Collection health (cadence {data['default_cadence_s']:g} s, "
+        f"overdue past {data['overdue_multiple']:g}x)",
+        box=box.SIMPLE_HEAVY,
+    )
+    table.add_column("Source", style="bold")
+    table.add_column("State")
+    table.add_column("Last attempt")
+    table.add_column("Last success")
+    table.add_column("Fails", justify="right")
+    table.add_column("Latest observed")
+    table.add_column("Reason")
+    styles = {"ok": "green", "degraded": "yellow", "never_run": "dim"}
+    for row in data["sources"]:
+        state = row["state"]
+        label = f"{state}, overdue" if state == "failing" and row.get("overdue") else state
+        table.add_row(
+            _cell(row["source"]),
+            Text(label, style=styles.get(state, "red")),
+            _cell(row.get("last_attempt_at") or "-"),
+            _cell(row.get("last_success_at") or "-"),
+            str(row.get("consecutive_failures", "-")),
+            _cell(row.get("latest_observed_at") or "-"),
+            _cell(row.get("last_reason") or ""),
+        )
+    console.print(table)
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(data["state_counts"].items()))
+    storage = data["storage"]
+    console.print(
+        f"States: {counts}. Stored: {storage['captures']} captures, "
+        f"{storage['payload_bodies']} payload bodies "
+        f"({storage['payload_bytes_compressed']:,} bytes compressed), "
+        f"{storage['observations']} observations in {storage['series']} series."
+    )
+    for line in data["cannot_prove"]:
+        console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
+
+
+@history_group.command(name="captures")
+@click.argument("source")
+@click.option("--limit", default=20, type=int, help="Captures to show")
+@click.option(
+    "--capture-id", default=None, type=int, help="Show one capture with its payload"
+)
+@click.pass_context
+def history_captures(
+    ctx: click.Context, source: str, limit: int, capture_id: int | None
+) -> None:
+    """A source's earlier captures, newest first."""
+    data = _with_history_store(
+        lambda s: s.capture_history(source, limit=limit, capture_id=capture_id)
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    if "capture" in data:
+        cap = data["capture"]
+        console.print(
+            f"Capture {cap['capture_id']} of [bold]{escape(source)}[/bold] at "
+            f"{cap['collected_at']}: {cap['status']} ({cap['change'] or 'no payload'})"
+        )
+        if cap.get("reason"):
+            console.print(f"[yellow]Reason:[/yellow] {escape(str(cap['reason']))}")
+        if cap.get("payload_note"):
+            console.print(f"[yellow]Gap:[/yellow] {escape(cap['payload_note'])}")
+        if cap.get("payload") is not None:
+            _print_json(cap["payload"])
+        return
+
+    captures = data["captures"]
+    if not captures:
+        _print_data_gaps(data)
+        return
+    table = Table(
+        title=f"Captures of {escape(source)} ({data['total_captures']} total, "
+        f"{data['changed_captures']} changed, {data['distinct_payloads']} distinct)",
+        box=box.SIMPLE_HEAVY,
+    )
+    table.add_column("ID", justify="right")
+    table.add_column("Collected")
+    table.add_column("Status")
+    table.add_column("Duration s", justify="right")
+    table.add_column("Records", justify="right")
+    table.add_column("Change")
+    table.add_column("Reason")
+    for cap in captures:
+        table.add_row(
+            str(cap["capture_id"]),
+            cap["collected_at"],
+            cap["status"],
+            "-" if cap["duration_s"] is None else f"{cap['duration_s']:.2f}",
+            "-" if cap["record_count"] is None else str(cap["record_count"]),
+            cap["change"] or "-",
+            _cell(cap.get("reason") or ""),
+        )
+    console.print(table)
+    console.print(f"[dim]{escape(data['note'])}[/dim]")
+
+
+@history_group.command(name="series")
+@click.argument("series_key", required=False)
+@click.option("--source", default=None, help="Filter the listing to one source")
+@click.option("--limit", default=None, type=int, help="Rows to show")
+@click.pass_context
+def history_series(
+    ctx: click.Context, series_key: str | None, source: str | None, limit: int | None
+) -> None:
+    """One series' observations (three dates), or the list of series."""
+    default_limit = 100 if series_key else 200
+    data = _with_history_store(
+        lambda s: s.series_history(
+            series_key, source=source, limit=limit or default_limit
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    if series_key is None:
+        if not data["series"]:
+            _print_data_gaps(data)
+            return
+        table = Table(
+            title=f"Series ({data['total_series']})", box=box.SIMPLE_HEAVY
+        )
+        table.add_column("Series", style="bold")
+        table.add_column("Label")
+        table.add_column("Points", justify="right")
+        table.add_column("Observed from")
+        table.add_column("Observed to")
+        table.add_column("Last collected")
+        for row in data["series"]:
+            table.add_row(
+                _cell(row["series_key"]),
+                _cell(row.get("label") or ""),
+                str(row["points"]),
+                _cell(row.get("first_observed_at") or "unknown"),
+                _cell(row.get("last_observed_at") or "unknown"),
+                row["last_collected_at"],
+            )
+        console.print(table)
+        return
+
+    table = Table(title=escape(series_key), box=box.SIMPLE_HEAVY)
+    table.add_column("Observed")
+    table.add_column("Published")
+    table.add_column("Collected")
+    table.add_column("Value", justify="right")
+    table.add_column("Unit")
+    for obs in data["observations"]:
+        table.add_row(
+            _cell(obs["observed_at"] or "unknown"),
+            _cell(obs["published_at"] or "unknown"),
+            obs["collected_at"],
+            f"{obs['value']:g}",
+            _cell(obs.get("unit") or ""),
+        )
+    console.print(table)
+    _print_data_gaps(data)
+
+
+@history_group.command(name="revisions")
+@click.option("--source", default=None, help="Filter to one source")
+@click.option("--series", "series_key", default=None, help="Filter to one series")
+@click.option("--limit", default=100, type=int, help="Revisions to show")
+@click.pass_context
+def history_revisions(
+    ctx: click.Context, source: str | None, series_key: str | None, limit: int
+) -> None:
+    """Values a later capture changed for the same observed_at."""
+    data = _with_history_store(
+        lambda s: s.revisions(source=source, series_key=series_key, limit=limit)
+    )
+    if _bail_on_error(ctx, data):
+        return
+
+    if not data["revisions"]:
+        console.print("[yellow]No revisions seen between saved captures[/yellow]")
+    else:
+        table = Table(title=f"Revisions ({data['count']})", box=box.SIMPLE_HEAVY)
+        table.add_column("Series", style="bold")
+        table.add_column("Observed")
+        table.add_column("Was", justify="right")
+        table.add_column("Now", justify="right")
+        table.add_column("Delta", justify="right")
+        table.add_column("Revised at")
+        for rev in data["revisions"]:
+            table.add_row(
+                _cell(rev["series_key"]),
+                _cell(rev["observed_at"]),
+                f"{rev['previous_value']:g}",
+                f"{rev['revised_value']:g}",
+                f"{rev['delta']:+g}",
+                rev["revised_collected_at"],
+            )
+        console.print(table)
+    for line in data["cannot_prove"]:
+        console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
+
+
 if __name__ == "__main__":
     main()
