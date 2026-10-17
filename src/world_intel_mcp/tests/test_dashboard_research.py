@@ -482,14 +482,26 @@ def _expected(db_path: Path, source: str | None = None) -> dict:
         store.close()
 
 
+_HISTORY_ENV = (
+    "WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES",
+    "WORLD_INTEL_HISTORY_PAYLOAD_DAYS", "WORLD_INTEL_HISTORY_CAPTURE_DAYS",
+    "WORLD_INTEL_HISTORY_DAYS",
+)
+
+
 @pytest.fixture
-def pinned_history(monkeypatch: pytest.MonkeyPatch) -> None:
+def history_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default cadence and retention, whatever the environment running the
+    tests sets: a short capture retention would otherwise prune the rows
+    _populate writes before the report reads them."""
+    for var in _HISTORY_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture
+def pinned_history(monkeypatch: pytest.MonkeyPatch, history_defaults) -> None:
     """Default cadence and retention, and the clock collection_health reads
     (time.time() when the route calls it) pinned to _CHECK."""
-    for var in ("WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES",
-                "WORLD_INTEL_HISTORY_PAYLOAD_DAYS", "WORLD_INTEL_HISTORY_CAPTURE_DAYS",
-                "WORLD_INTEL_HISTORY_DAYS"):
-        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(history, "time", types.SimpleNamespace(time=lambda: _CHECK))
     monkeypatch.setattr(dashboard_app, "_collector_roster", lambda: list(_ROSTER))
 
@@ -921,7 +933,7 @@ def test_headline_markup_renders_as_text_not_markup(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("panel", ["liquidity", "situations", "stories", "health"])
-def test_every_payload_string_is_escaped(tmp_path, panel) -> None:
+def test_every_payload_string_is_escaped(tmp_path, panel, history_defaults) -> None:
     payload = {
         "liquidity": {**_BOARD, "net_liquidity_method": _METHOD},
         "situations": _SITUATIONS,
@@ -940,6 +952,42 @@ def test_every_payload_string_is_escaped(tmp_path, panel) -> None:
     for html in (html_ok, html_failed):
         m = _assert_inert(html)
         assert mark in m.text  # shown, as text
+
+
+def test_branch_picking_fields_left_clean_still_escape_their_text(tmp_path, history_defaults) -> None:
+    """The poisoned payloads above spoil the fields that pick a branch (a
+    link, a state, a key), so three paths need their own case: text inside
+    a kept https link, a never_run source's tag, and a method component key."""
+    link = "https://news.example/1"
+    top = copy.deepcopy(_TOP)
+    top["stories"][0]["items"][0].update(title=_HOSTILE, link=link)
+    sit = copy.deepcopy(_SITUATIONS)
+    sit["situations"][0]["sample_headlines"][0].update(title=_HOSTILE, link=link)
+    db = tmp_path / "fresh.db"
+    health = _expected(db)
+    for s in health["sources"]:
+        s["source"] = _SCRIPT + s["source"]
+    method = copy.deepcopy(_METHOD)
+    method["components"] = {_HOSTILE: next(iter(_METHOD["components"].values()))}
+    html_top, html_sit, html_health, html_liq = _js(tmp_path, [
+        ["renderResearch", "stories", _loaded(top)],
+        ["renderResearch", "situations", _loaded(sit)],
+        ["renderResearch", "health", _loaded(health)],
+        ["renderResearch", "liquidity", _loaded({**_BOARD, "net_liquidity_method": method})],
+    ])
+    for html in (html_top, html_sit):
+        m = _assert_inert(html)
+        assert m.hrefs == [link]  # the link was kept
+        assert f'data-external="1">&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</a>' in html
+    m = _assert_inert(html_health)
+    assert {s["state"] for s in health["sources"]} == {"never_run"}
+    assert "&lt;script&gt;alert(2)&lt;/script&gt;tides" in html_health and _SCRIPT + "tides" in m.text
+    m = _assert_inert(html_liq)
+    assert "<td>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</td>" in html_liq and _HOSTILE in m.text
+
+
+def test_route_budget_is_90_s() -> None:
+    assert dashboard_app._RESEARCH_TIMEOUT_S == 90.0
 
 
 def test_panel_that_never_loaded_says_so(tmp_path) -> None:
@@ -1208,9 +1256,7 @@ def test_liquidity_total_outage_shows_reasons_and_no_board(tmp_path) -> None:
     assert "Amounts outstanding" not in m.text and "no indicator rows" not in m.text
 
 
-def test_collection_health_lists_problems_and_cannot_prove(tmp_path, monkeypatch) -> None:
-    for var in ("WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES"):
-        monkeypatch.delenv(var, raising=False)
+def test_collection_health_lists_problems_and_cannot_prove(tmp_path, history_defaults) -> None:
     db = tmp_path / "h.db"
     _populate(db)
     report = _expected(db)
@@ -1232,6 +1278,7 @@ def test_collection_health_lists_problems_and_cannot_prove(tmp_path, monkeypatch
     assert text.index("failing (1)") < text.index("HTTP 503 from FIRMS") < text.index("ok (2)")
     assert "OVERDUE" in text and "not attempted recently (1)" in text
     assert "never run (1)" in text and "tides" in text
+    assert text.index("never run (1)") < text.index("ok (2)")  # never_run is a problem, listed before ok
     assert "not in roster" in text  # legacy_feed: logged, but no longer collected
     assert "No collector capture is recorded" not in text
     never_text = _Markup(html_never).text
