@@ -28,6 +28,7 @@ from . import (  # noqa: E402
     finance,
     geospatial,
     hazards,
+    history,
     infrastructure,
     intelligence,
     markets,
@@ -51,6 +52,7 @@ _MODULES = [
     finance,
     vector,
     aoi,
+    history,
     system,
 ]
 

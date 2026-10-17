@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **143 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -63,8 +63,9 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Volcanoes** | 1 | Smithsonian GVP weekly activity report |
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
+| **Collection History** | 4 | Collector run log (per-source health, overdue and failing sources), saved captures with change detection and replay, dated observation series, revisions |
 
-**Total: 139 tools** across 30+ intelligence domains.
+**Total: 143 tools** across 30+ intelligence domains.
 
 ---
 
@@ -130,6 +131,7 @@ intel earthquakes --min-mag 5.0
 intel migration-surges     # year-over-year displacement jumps (UNHCR)
 intel migration-flows -o Sudan
 intel status               # cache + circuit breaker health
+intel history health       # per-source collection health from the collector's run log
 ```
 
 ---
@@ -509,6 +511,16 @@ different, openly licensed data source; no ews code is used.
 | Tool | Description |
 |------|-------------|
 | `intel_situation_brief` | Cited situational awareness brief, generated on demand over MCP: a bounded server-side overview (earthquakes, military flights, ACLED conflict events, wildfires, cyber threats, disease outbreaks, news, space weather, strategic posture, alert digest), synthesized via local Ollama or a mechanically-cited fallback when Ollama is unreachable |
+
+### Collection History (4)
+History accrues only while the collector (`intel-collector`) runs; nothing before its first recorded cycle exists. Every observation keeps three dates: `observed_at` (the period the value describes, from the payload, or null when the payload has none), `published_at` (publisher release, when known) and `collected_at` (when this server saved it).
+
+| Tool | Description |
+|------|-------------|
+| `intel_collection_health` | Per-source health from the collector's run log: last attempt, last success, consecutive failures, overdue against the expected cadence, never-run sources, history storage size; states what it cannot prove (a fresh capture does not mean upstream observations are current) |
+| `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload |
+| `intel_series_history` | One series' observations with all three dates, or the list of available series |
+| `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates) |
 
 ---
 

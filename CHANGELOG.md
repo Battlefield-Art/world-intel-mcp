@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Added: observation history and collection health
+- A history store in the cache SQLite file. Every collector source run is a
+  capture: source, collected_at, status (ok, degraded or error), duration,
+  record count, reason and payload hash. A failed fetch is an error capture
+  with its reason and no record count, never an ok capture with zero
+  records. An empty payload is degraded, because a quiet period and a
+  silent upstream failure look the same.
+- Payload bodies are kept once per distinct payload as compressed JSON
+  (top-level fetch-time stamps are ignored when hashing). Retention, each
+  0 = keep forever: `WORLD_INTEL_HISTORY_PAYLOAD_DAYS` (default 7) for
+  bodies, `WORLD_INTEL_HISTORY_CAPTURE_DAYS` (default 30) for the run log,
+  `WORLD_INTEL_HISTORY_DAYS` (default 365) for observations. Measured on a
+  full 55-source cycle: about 65-80 KB of new compressed bodies and about
+  14 KB of capture rows per 5-minute cycle.
+- Observations with three dates: `observed_at` (from the payload, or null
+  when it has none; never the collection time), `published_at` (when the
+  payload names a release time) and `collected_at`. Built-in extractors:
+  NOAA Kp, USGS per-event magnitude, FRED-sourced central bank rates
+  (curated rows are skipped), Yahoo index and commodity quotes (null
+  `observed_at`: the payload carries no quote time).
+  `history.register_extractor()` is the public API for new sources.
+- MCP tools `intel_collection_health`, `intel_capture_history`,
+  `intel_series_history` and `intel_revisions`, and the CLI group
+  `intel history health|captures|series|revisions`. History accrues only
+  while the collector runs.
+- The collector records every source outcome of a cycle in one
+  transaction. Its summary gains a `history` key (and the CLI summary a
+  History line); a history write failure is reported there and in the
+  log, and never fails the cycle.
+- Expected cadence for health is 300 s (the shipped plist interval);
+  `WORLD_INTEL_HISTORY_CADENCE_S` and
+  `WORLD_INTEL_HISTORY_CADENCES=source=seconds,...` override it.
+
+### Notes
+- The cycle summary's `successes` still counts a source that returned
+  `{"error": ...}` (unchanged, pinned by an existing test); that run's
+  history capture is an error.
+- Tools 139 -> 143.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard

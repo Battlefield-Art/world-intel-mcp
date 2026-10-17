@@ -4,6 +4,11 @@ Fetches all intelligence sources in parallel and stores results in the
 Qdrant vector store. Runs independently of the MCP server and dashboard,
 ensuring data accumulates 24/7 for semantic search and historical analysis.
 
+Every source outcome of a cycle (ok, degraded or error, with duration and
+payload hash) is also written to the history store (``history.py``) in the
+cache DB, in one transaction per cycle. That run log is what
+``intel_collection_health`` and the other history tools read.
+
 Usage:
     intel-collector                    # Single collection cycle
     intel-collector --daemon           # Run every 5 minutes
@@ -15,6 +20,7 @@ import asyncio
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -32,6 +38,7 @@ logger = logging.getLogger("world-intel-collector")
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 from .fetcher import Fetcher
+from .history import HistoryStore, SourceOutcome
 from .vector_store import VectorStore
 
 # All fetchable sources grouped by domain.
@@ -209,6 +216,34 @@ def _import_fetch_fn(module_path: str, fn_name: str):
     return getattr(mod, fn_name)
 
 
+def _record_history(fetcher: Fetcher, outcomes: list) -> dict:
+    """Write one cycle's outcomes to the history store in the fetcher's
+    cache DB. A history failure is reported in the cycle summary and the
+    log; it never fails the cycle itself."""
+    db_path = getattr(getattr(fetcher, "cache", None), "db_path", None)
+    if db_path is None:
+        logger.warning("History not recorded: fetcher has no cache db_path")
+        return {
+            "recorded": 0,
+            "error": "fetcher has no cache db_path; history not recorded",
+        }
+    try:
+        store = HistoryStore(db_path)
+        try:
+            return store.record_cycle(outcomes)
+        finally:
+            store.close()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("History write failed: %s", exc)
+        return {"recorded": 0, "error": f"history write failed: {exc}"}
+    except Exception as exc:  # a history bug must not cost the cycle
+        logger.exception("History write failed unexpectedly")
+        return {
+            "recorded": 0,
+            "error": f"history write failed: {type(exc).__name__}: {exc}",
+        }
+
+
 async def collect_once(
     fetcher: Fetcher,
     vector_store: VectorStore,
@@ -224,8 +259,12 @@ async def collect_once(
         s for s in SOURCES if source_filter is None or s[0] in source_filter
     ]
 
+    # Per-source wall time and finish time, for the history run log.
+    timings: dict[str, tuple[float, float]] = {}
+
     async def _fetch_one(name: str, module_path: str, fn_name: str, kwargs: dict):
         budget = SOURCE_TIMEOUTS.get(name, timeout)
+        t0 = time.monotonic()
         try:
             fn = _import_fetch_fn(module_path, fn_name)
             result = await asyncio.wait_for(fn(fetcher, **kwargs), timeout=budget)
@@ -234,6 +273,8 @@ async def collect_once(
             return name, None, f"timeout ({budget}s)"
         except Exception as exc:
             return name, None, str(exc)[:120]
+        finally:
+            timings[name] = (time.monotonic() - t0, time.time())
 
     tasks = [_fetch_one(name, mod, fn, kw) for name, mod, fn, kw in sources_to_run]
 
@@ -242,6 +283,21 @@ async def collect_once(
     successes = 0
     failures = 0
     errors = []
+    outcomes = []
+
+    for (source_name, _, _, _), item in zip(sources_to_run, results):
+        duration, finished = timings.get(source_name, (None, time.time()))
+        if isinstance(item, BaseException):
+            reason = str(item)[:500] or repr(item)
+            outcomes.append(
+                SourceOutcome(source_name, finished, duration, error=reason)
+            )
+        else:
+            outcomes.append(
+                SourceOutcome(
+                    source_name, finished, duration, payload=item[1], error=item[2]
+                )
+            )
 
     for item in results:
         if isinstance(item, Exception):
@@ -263,6 +319,8 @@ async def collect_once(
         else:
             failures += 1
 
+    history = _record_history(fetcher, outcomes)
+
     elapsed = time.time() - start
     stats = await vector_store.collection_stats()
 
@@ -273,6 +331,7 @@ async def collect_once(
         "failures": failures,
         "errors": errors[:10],
         "vector_store_points": stats.get("points_count", 0),
+        "history": history,
     }
 
     logger.info(
@@ -399,6 +458,17 @@ def main():
         )
         print(f"  Time: {summary['cycle_time_s']}s")
         print(f"  Vector store: {summary['vector_store_points']} points")
+        history = summary.get("history") or {}
+        if history.get("error"):
+            print(f"  History: NOT recorded ({history['error']})")
+        elif history:
+            counts = history.get("status_counts", {})
+            print(
+                f"  History: {history.get('recorded', 0)} captures "
+                f"(ok {counts.get('ok', 0)}, degraded {counts.get('degraded', 0)}, "
+                f"error {counts.get('error', 0)}), "
+                f"{history.get('observations_stored', 0)} new observations"
+            )
         if summary["errors"]:
             print(f"  Errors ({len(summary['errors'])}):")
             for e in summary["errors"]:
