@@ -11,6 +11,7 @@ history path.
 
 import asyncio
 import json
+import time
 import types
 
 import pytest
@@ -700,6 +701,27 @@ def test_cli_history_health_table_and_json(cli_db) -> None:
     assert data["sources"][0]["consecutive_failures"] == 1
     bad = _invoke("history", "health", "--source", "nope").output
     assert bad.startswith("Error:") and "unknown source" in bad
+
+
+def test_cli_history_health_marks_failing_sources_overdue(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "overdue.db"
+    monkeypatch.setenv("WORLD_INTEL_CACHE_DB", str(db))
+    monkeypatch.setenv("COLUMNS", "220")
+    monkeypatch.setattr(cli, "_fetcher", None)
+    now = time.time()
+    s = HistoryStore(db)
+    _record(s, "wildfires", now - 1000, {"fires": [1]})  # last payload past 900 s
+    _record(s, "wildfires", now - 60, None, "boom")
+    _record(s, "earthquakes", now - 400, {"earthquakes": [{"id": "a", "magnitude": 5.0, "time": "2026-10-16T22:10:00Z"}]})
+    _record(s, "earthquakes", now - 30, None, "timeout (45.0s)")
+    s.close()
+    out = _invoke("history", "health").output
+    rows = {line.split()[0]: line for line in out.splitlines() if line.strip()}
+    assert "failing, overdue" in rows["wildfires"]
+    assert "failing" in rows["earthquakes"] and "overdue" not in rows["earthquakes"]
+    data = json.loads(_invoke("--json-output", "history", "health").output)
+    assert "overdue" not in data["states_explained"]
+    assert {r["state"] for r in data["sources"]} <= set(data["states_explained"])
 
 
 def test_cli_history_captures(cli_db) -> None:

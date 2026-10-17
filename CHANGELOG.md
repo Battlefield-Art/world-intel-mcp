@@ -13,9 +13,13 @@
   (top-level fetch-time stamps are ignored when hashing). Retention, each
   0 = keep forever: `WORLD_INTEL_HISTORY_PAYLOAD_DAYS` (default 7) for
   bodies, `WORLD_INTEL_HISTORY_CAPTURE_DAYS` (default 30) for the run log,
-  `WORLD_INTEL_HISTORY_DAYS` (default 365) for observations. Measured on a
-  full 55-source cycle: about 65-80 KB of new compressed bodies and about
-  14 KB of capture rows per 5-minute cycle.
+  `WORLD_INTEL_HISTORY_DAYS` (default 365) for observations. Measured over
+  three full 55-source cycles: 90 KB and 193 KB of new compressed bodies in
+  the two follow-up cycles (about 70 KB from sources that change every
+  cycle, plus the military flight snapshot when it succeeds) and about
+  14 KB of capture rows per cycle. At `--interval 300` that is about
+  130-340 MB of bodies at the 7-day default and about 100 MB of run log at
+  30 days. Quote observations on a trading day were not measured.
 - Observations with three dates: `observed_at` (from the payload, or null
   when it has none; never the collection time), `published_at` (when the
   payload names a release time) and `collected_at`. Built-in extractors:

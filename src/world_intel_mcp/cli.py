@@ -2680,9 +2680,10 @@ def history_health(ctx: click.Context, source: str | None) -> None:
     styles = {"ok": "green", "degraded": "yellow", "never_run": "dim"}
     for row in data["sources"]:
         state = row["state"]
+        label = f"{state}, overdue" if state == "failing" and row.get("overdue") else state
         table.add_row(
             _cell(row["source"]),
-            Text(state, style=styles.get(state, "red")),
+            Text(label, style=styles.get(state, "red")),
             _cell(row.get("last_attempt_at") or "-"),
             _cell(row.get("last_success_at") or "-"),
             str(row.get("consecutive_failures", "-")),

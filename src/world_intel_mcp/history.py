@@ -52,18 +52,24 @@ Retention, each ``0`` = keep forever, pruned at the end of every recorded
 cycle in the same transaction:
 
 - ``WORLD_INTEL_HISTORY_PAYLOAD_DAYS`` (default 7) bounds payload bodies by
-  last sighting. Measured 2026-10-17 on a full 55-source cycle: about
-  65-80 KB of new compressed bodies per 5-minute cycle (crypto quotes with
-  sparklines, the domestic flight snapshot and the news feed change every
-  cycle), so about 20 MB a day.
+  last sighting. Measured 2026-10-17 over three full 55-source cycles (45 s
+  each, so about 250 cycles a day at ``--interval 300``): about 70 KB of
+  new compressed bodies every cycle from the sources whose data changes
+  each time (crypto quotes 30 KB, domestic flights 19 KB, news 9 KB, disease
+  outbreaks 6 KB, weather alerts 4.5 KB), plus 5-121 KB when the military
+  flight snapshot succeeds; 90 KB and 193 KB in the two measured follow-up
+  cycles. About 19-48 MB a day, so about 130-340 MB at the default.
 - ``WORLD_INTEL_HISTORY_CAPTURE_DAYS`` (default 30) bounds the run log:
   55 capture rows per cycle at about 250 bytes each with indexes, about
-  4 MB a day.
+  3.4 MB a day, so about 100 MB at the default.
 - ``WORLD_INTEL_HISTORY_DAYS`` (default 365) bounds observations, which are
   stored only when new or changed. An observation can outlive the capture
   that produced it; its ``capture_id`` then names a pruned capture.
 
 Gaps / not covered:
+- Growth was measured on a Saturday with markets closed: the 15 Yahoo quote
+  series, which have no observation date, gain a row per price change while
+  markets trade, and that rate is not measured.
 - No backfill: sources that serve history (FRED CSV) are not replayed into
   the store; only what the collector sees from the first recorded cycle on.
 - ``published_at`` is NULL for every built-in extractor: none of their
@@ -746,12 +752,13 @@ class HistoryStore:
             age_success = None if last_success is None else now - last_success
             overdue = age_success is None or age_success > overdue_after
             attempt_overdue = age_attempt > overdue_after
+            # A non-error last capture is itself the last success, so overdue
+            # can differ from attempt_overdue only for a failing source; it is
+            # reported there as the overdue flag, not as a state of its own.
             if attempt_overdue:
                 state = "not_attempted_recently"
             elif last_status == "error":
                 state = "failing"
-            elif overdue:
-                state = "overdue"
             else:
                 state = last_status
             entry.update(
@@ -793,7 +800,8 @@ class HistoryStore:
                 "Check latest_observed_at here or observed_at in intel_series_history.",
                 "Cadence is the stated expectation (default and overrides above), not "
                 "the live daemon's --interval; a collector deliberately run less often "
-                "reads overdue.",
+                "reads overdue. The daemon sleeps --interval after each cycle, so its "
+                "real period is longer by the cycle's own duration.",
                 "A degraded capture with no records cannot tell a quiet period from a "
                 "silent upstream failure.",
                 HISTORY_ACCRUAL_NOTE + " A source the collector never ran reads never_run, "
@@ -803,10 +811,11 @@ class HistoryStore:
                 "ok": "last capture delivered records with no degradation marker",
                 "degraded": "last capture delivered a payload marked stale/degraded, empty, "
                 "or without the measures its extractor expects",
-                "failing": "last capture was an error (consecutive_failures counts the run)",
-                "overdue": f"no payload delivered within {OVERDUE_MULTIPLE:g} cadences",
+                "failing": "last capture was an error (consecutive_failures counts the run; "
+                f"overdue is true when no payload arrived within {OVERDUE_MULTIPLE:g} "
+                "cadences)",
                 "not_attempted_recently": f"the collector has not attempted it within "
-                f"{OVERDUE_MULTIPLE:g} cadences",
+                f"{OVERDUE_MULTIPLE:g} cadences (overdue is then always true)",
                 "never_run": "no capture recorded",
             },
         }
