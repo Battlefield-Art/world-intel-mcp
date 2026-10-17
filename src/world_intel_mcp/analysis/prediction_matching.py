@@ -1,14 +1,20 @@
 """Cross-venue prediction-market matching and forecast scoring.
 
-Pure functions, no I/O. Used by ``tools/prediction_markets.py`` to put
+Pure functions, no I/O. Used by ``sources/prediction_cross.py`` to put
 the same event on Kalshi and Polymarket side by side and to score
 settled markets against their pre-settlement prices.
 
 Matching is deterministic: normalized title tokens, quantities, years,
-end dates, negation and the outcome side must all agree before a pair
-is scored, and a pair below ``DEFAULT_MIN_CONFIDENCE`` is not a match.
-A wrong match is worse than no match, so every gate is a hard reject
-and every reject carries its reason.
+negation, rate actions (cut / raise / hold), directions (above /
+below), end dates and the outcome side must all agree before a pair is
+scored, and a pair below ``DEFAULT_MIN_CONFIDENCE`` is not a match. A
+wrong match is worse than no match, so every gate is a hard reject and
+every reject carries its reason.
+
+``match_confidence`` (``confidence`` in ``score_pair``) is an ordinal
+similarity score for ranking candidate pairs: title-word Dice overlap
+times a date factor. It is not a calibrated probability that two
+markets are the same event.
 
 Normalized market shape (both venues) consumed here::
 
@@ -17,7 +23,8 @@ Normalized market shape (both venues) consumed here::
      "yes_side": str,           # what YES pays out on ("" = the question itself)
      "outcomes": [str, str],    # Polymarket labels; Kalshi ["Yes", "No"]
      "end_time": iso8601 | None,
-     "probability": float | None}   # YES implied probability, 0..1
+     "probability": float | None,   # YES implied probability, 0..1
+     "price_basis": str, "spread": float | None}   # quote fields (optional)
 
 Gaps / not covered:
 - No synonym coverage beyond the small table below (month names, rate
@@ -29,15 +36,32 @@ Gaps / not covered:
 - Resolution-rule equivalence is not checked: two markets can share a
   title and still settle on different sources or times. The reasons
   list says what was compared; it does not claim more.
+- Ordinals written as words ("first", "second") are plain words, not
+  quantities, and a number glued to a unit ("100mm") loses the unit.
+- A fractional threshold worded strict on one venue and inclusive on
+  the other ("above 4.5%" vs "4.5% or higher") is matched with a
+  boundary flag; an integer one is not, because "more than 50" means
+  "51 or more".
 """
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from datetime import datetime, timezone
 
 DEFAULT_MIN_CONFIDENCE = 0.6
+# Pairs whose title overlap could reach the lower of min_confidence and
+# this floor are scored, so near misses include pairs just under a high
+# threshold.
+NEAR_MISS_FLOOR = 0.5
+# A pair is ranked by its price gap only when both prices are two-sided
+# quote midpoints whose spread is at most this wide (price units, 0..1).
+MAX_COMPARABLE_SPREAD = 0.10
+# Upstream titles longer than this are cut (the longest seen live on
+# 2026-10-17 was a 313-character Kalshi market title).
+MAX_TEXT_CHARS = 500
 
 # Date tolerance: the larger of a floor and a fraction of the horizon,
 # so a 2028 election may differ by weeks but a weekly market by days.
@@ -61,10 +85,13 @@ _SYNONYMS = {
     "sept": "september", "oct": "october", "nov": "november", "dec": "december",
     "cuts": "cut", "decrease": "cut", "decreases": "cut", "lower": "cut",
     "lowers": "cut", "hike": "raise", "hikes": "raise", "increase": "raise",
-    "increases": "raise", "raises": "raise", "over": "above", "more": "above",
-    "exceed": "above", "exceeds": "above", "under": "below", "fewer": "below",
+    "increases": "raise", "raises": "raise", "holds": "hold", "maintain": "hold",
+    "maintains": "hold", "unchanged": "hold", "pause": "hold", "pauses": "hold",
+    "over": "above", "more": "above", "exceed": "above", "exceeds": "above",
+    "higher": "above", "greater": "above", "under": "below", "fewer": "below",
     "less": "below", "wins": "win", "won": "win", "winner": "win",
-    "usa": "us", "u.s.": "us", "bp": "bps", "basis": "bps",
+    # "U.S." tokenizes to "u.s" (edge dots are stripped).
+    "usa": "us", "u.s": "us", "u.s.a": "us", "bp": "bps", "basis": "bps",
 }
 
 _MONTHS = frozenset(
@@ -73,30 +100,48 @@ _MONTHS = frozenset(
 )
 _NEGATIONS = frozenset({"not", "no", "never", "without"})
 _YES_NO = frozenset({"yes", "no"})
+# Hard gates: two titles must name the same rate action and the same
+# direction (after synonym folding), or the pair is rejected.
+_ACTIONS = frozenset({"cut", "raise", "hold"})
+_DIRECTIONS = {"above": "above", "below": "below", "atleast": "above", "atmost": "below", "ormore": "above"}
+_SCALE_WORDS = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "trillion": 1e12}
+_MULTIPLIERS = {"": 1.0, "k": 1e3, "m": 1e6, "mn": 1e6, "b": 1e9, "bn": 1e9, "t": 1e12, "tn": 1e12}
 
-_NUM_RE = re.compile(r"^\$?(\d+(?:\.\d+)?)([kmb]?)$")
-_TOKEN_RE = re.compile(r"\$?\d[\d,]*(?:\.\d+)?[kmb]?(?![a-z])|[a-z][a-z.&']*")
+_NUM_RE = re.compile(r"^(-?)\$?(\d+(?:\.\d+)?)(k|mn|m|bn|b|tn|t)?$")
+_ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)$")
+# Ordinal | number (a leading minus only when it is not a hyphen inside
+# a word or range; never starting inside a digit run, so "100mm" cannot
+# leave a partial "10") | word.
+_TOKEN_RE = re.compile(
+    r"(?<![\d.,])\d+(?:st|nd|rd|th)(?![a-z0-9])"
+    r"|(?:(?<![a-z0-9.,])-)?\$?(?<![\d.,])\d(?:[\d,]*\d)?(?:\.\d+)?(?:(?:k|mn|m|bn|b|tn|t)(?![a-z]))?"
+    r"|[a-z][a-z.&']*"
+)
+_QUANTITY_RE = re.compile(r"^(>=|<=|>|<)?(.+)$")
+
+
+def clip_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
+    """Upstream text as a string of at most ``limit`` characters."""
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 # ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
 
-def _canonical_number(raw: str) -> str | None:
+def _canonical_number(raw: str, scale: float = 1.0) -> str | None:
     m = _NUM_RE.match(raw.replace(",", ""))
     if not m:
         return None
-    value = float(m.group(1)) * {"": 1, "k": 1e3, "m": 1e6, "b": 1e9}[m.group(2)]
-    return f"{value:g}" if value != int(value) else str(int(value))
+    value = float(m.group(2)) * _MULTIPLIERS[m.group(3) or ""] * scale
+    if m.group(1):
+        value = -value
+    return f"{value:.12g}" if value != int(value) else str(int(value))
 
 
-def tokenize(text: str) -> list[str]:
-    """Lowercase, fold synonyms, canonicalize numbers; stopwords kept.
-
-    ``"25bps"`` -> ``["25", "bps"]``; ``"$100k"`` -> ``["100000"]``;
-    ``"2.75%"`` -> ``["2.75"]``; ``"Fed's"`` -> ``["fed"]``.
-    """
-    text = (text or "").replace("’", "'").replace("≥", ">=").replace("≤", "<=")
+def _prepare(text: str) -> str:
+    text = (text or "").replace("’", "'").replace("≥", ">=").replace("≤", "<=").replace("−", "-")
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
     # Comparators become words so a quantity keeps its direction:
     # ">25bps" and "25 bps" are different contracts.
@@ -105,22 +150,64 @@ def tokenize(text: str) -> list[str]:
     text = re.sub(r"(\d)\s*\+", r"\1 ormore ", text)
     text = re.sub(r"\bat least\b", " atleast ", text)
     text = re.sub(r"\bat most\b", " atmost ", text)
-    text = re.sub(r"(\d)(bps|bp)\b", r"\1 \2", text)
-    out: list[str] = []
-    for raw in _TOKEN_RE.findall(text):
-        if raw[0].isdigit() or raw[0] == "$":
-            num = _canonical_number(raw)
-            if num is not None:
-                out.append(num)
+    # "lower" alone is the rate verb (folded to "cut"); before "than" or
+    # after "or" it is a comparator.
+    text = re.sub(r"\blower\s+than\b", " below ", text)
+    text = re.sub(r"\bor\s+lower\b", " or below ", text)
+    # "No change" names the hold outcome; it is not a negation.
+    text = re.sub(r"\bno\s+changes?\b", " hold ", text)
+    return re.sub(r"(\d)(bps|bp)\b", r"\1 \2", text)
+
+
+def _scan(text: str) -> list[tuple[str, str]]:
+    """``(token, kind)`` pairs; kind is word, number, money, year or ordinal.
+
+    ``year`` is only the shape (four plain digits, 1900-2100); whether it
+    is a year or an amount depends on what precedes it (text_features).
+    """
+    raws = _TOKEN_RE.findall(_prepare(text))
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(raws):
+        raw = raws[i]
+        i += 1
+        ordinal = _ORDINAL_RE.match(raw)
+        if ordinal:
+            out.append((f"{int(ordinal.group(1))}{ordinal.group(2)}", "ordinal"))
+            continue
+        if raw[0].isdigit() or raw[0] in "$-":
+            scale = 1.0
+            if i < len(raws) and raws[i] in _SCALE_WORDS and raw[-1].isdigit():
+                scale = _SCALE_WORDS[raws[i]]  # "$100 million" is "$100m"
+                i += 1
+            num = _canonical_number(raw, scale)
+            if num is None:
+                continue
+            if "$" in raw:
+                kind = "money"
+            elif scale == 1.0 and raw.isdigit() and len(raw) == 4 and 1900 <= int(raw) <= 2100:
+                kind = "year"
+            else:
+                kind = "number"
+            out.append((num, kind))
             continue
         word = raw.strip(".'&")
         if word.endswith("'s"):
             word = word[:-2]
         word = word.replace("'", "")
-        if not word:
-            continue
-        out.append(_SYNONYMS.get(word, word))
+        if word:
+            out.append((_SYNONYMS.get(word, word), "word"))
     return out
+
+
+def tokenize(text: str) -> list[str]:
+    """Lowercase, fold synonyms, canonicalize numbers; stopwords kept.
+
+    ``"25bps"`` -> ``["25", "bps"]``; ``"$100k"`` and ``"$100 thousand"``
+    -> ``["100000"]``; ``"2.75%"`` -> ``["2.75"]``; ``"-0.5%"`` ->
+    ``["-0.5"]``; ``"1st"`` -> ``["1st"]``; ``"Fed's"`` -> ``["fed"]``.
+    """
+    return [tok for tok, _ in _scan(text)]
 
 
 _COMPARATOR_WORDS = frozenset({"above", "below", "atleast", "atmost", "ormore"})
@@ -143,49 +230,64 @@ def _comparator(toks: list[str], i: int) -> str:
     return {"above": ">", "below": "<", "atleast": ">=", "atmost": "<="}.get(before, "")
 
 
-def _is_year(tok: str) -> bool:
-    return tok.isdigit() and len(tok) == 4 and 1900 <= int(tok) <= 2100
-
-
-def _is_number(tok: str) -> bool:
-    return bool(tok) and (tok[0].isdigit())
+def _day_of_month(tok: str, kind: str) -> str | None:
+    digits = tok[:-2] if kind == "ordinal" else tok
+    if kind in ("number", "ordinal") and digits.isdigit() and 1 <= int(digits) <= 31:
+        return str(int(digits))
+    return None
 
 
 def text_features(text: str) -> dict:
     """Split a title into content words, quantities, years and flags.
 
-    A 1-31 number right after a month name is a day of month and goes to
-    ``days``, not ``quantities``: "Oct 28, 2026" must not block a pair
-    with "October 2026" on the number gate (the end-date gate covers it).
+    A 1-31 number (or ordinal) right after a month name is a day of
+    month and goes to ``days``, not ``quantities``: "Oct 28, 2026" must
+    not block a pair with "October 2026" on the number gate (the
+    end-date gate covers it). A four-digit 1900-2100 number is a year
+    unless a dollar sign, a thousands comma or a comparator makes it an
+    amount: "above $2,000" is the quantity ``>2000``. ``actions`` and
+    ``directions`` are the rate verbs and above/below words the title
+    uses, after synonym folding.
     """
-    toks = tokenize(text)
+    scanned = _scan(text)
+    toks = [tok for tok, _ in scanned]
     words: set[str] = set()
     quantities: set[str] = set()
     years: set[str] = set()
     days: set[str] = set()
+    actions: set[str] = set()
+    directions: set[str] = set()
     negated = False
-    for i, tok in enumerate(toks):
-        prev = toks[i - 1] if i > 0 else ""
-        if _is_number(tok):
-            if _is_year(tok):
-                years.add(tok)
-            elif prev in _MONTHS and tok.isdigit() and 1 <= int(tok) <= 31:
-                days.add(tok)
-            else:
-                quantities.add(_comparator(toks, i) + tok)
-        elif tok in _NEGATIONS:
-            negated = True
-        elif tok in _COMPARATOR_WORDS:
-            if tok in ("above", "below"):
+    for i, (tok, kind) in enumerate(scanned):
+        if kind == "word":
+            if tok in _ACTIONS:
+                actions.add(tok)
+            if tok in _DIRECTIONS:
+                directions.add(_DIRECTIONS[tok])
+            if tok in _NEGATIONS:
+                negated = True
+            elif tok in _COMPARATOR_WORDS:
+                if tok in ("above", "below"):
+                    words.add(tok)
+            elif tok not in _STOPWORDS:
                 words.add(tok)
-        elif tok not in _STOPWORDS:
-            words.add(tok)
+            continue
+        comparator = _comparator(toks, i)
+        day = _day_of_month(tok, kind)
+        if kind == "year" and not comparator:
+            years.add(tok)
+        elif i > 0 and toks[i - 1] in _MONTHS and day is not None:
+            days.add(day)
+        else:
+            quantities.add(comparator + tok)
     return {
         "words": words,
         "quantities": quantities,
         "years": years,
         "days": days,
         "negated": negated,
+        "actions": actions,
+        "directions": directions,
     }
 
 
@@ -205,16 +307,46 @@ def _parse_time(value: str | None) -> datetime | None:
     return dt
 
 
-def _side_alignment(kalshi: dict, k_side: set[str], poly: dict) -> tuple[str | None, str]:
+def _text(m: dict, *keys: str) -> str:
+    return " ".join(s for s in (m.get(k) for k in keys) if isinstance(s, str) and s)
+
+
+def _market_features(m: dict, venue: str) -> dict:
+    """Everything the gates read from one market, computed once.
+
+    ``bag`` (question, event title and, on Kalshi, the YES side) feeds
+    the overlap score, quantities, years and negation. Actions and
+    directions come from the contract's own wording (question plus YES
+    side), not the event title, which can list every alternative.
+    """
+    if venue == "kalshi":
+        bag = text_features(_text(m, "question", "context", "yes_side"))
+        gate = text_features(_text(m, "question", "yes_side"))
+    else:
+        bag = text_features(_text(m, "question", "context"))
+        gate = text_features(_text(m, "question"))
+    outcomes = [str(o) for o in (m.get("outcomes") or [])]
+    return {
+        "bag": bag,
+        "actions": gate["actions"],
+        "directions": gate["directions"],
+        "question_words": text_features(_text(m, "question"))["words"],
+        "side_words": text_features(_text(m, "yes_side"))["words"],
+        "outcomes": outcomes,
+        "labels": [set(tokenize(o)) for o in outcomes],
+        "end": _parse_time(m.get("end_time")),
+    }
+
+
+def _side_alignment(kf: dict, pf: dict) -> tuple[str | None, str]:
     """Which Polymarket outcome the Kalshi YES side corresponds to.
 
     Returns ``("aligned" | "inverted" | None, reason)``. ``inverted``
     means the Kalshi YES pays out on Polymarket's second outcome, so the
     Polymarket probability is flipped before the gap is taken.
     """
-    outcomes = [str(o) for o in (poly.get("outcomes") or [])]
-    labels = [set(tokenize(o)) for o in outcomes]
-    poly_question = text_features(poly.get("question", ""))["words"]
+    k_side = kf["side_words"]
+    outcomes, labels, poly_question = pf["outcomes"], pf["labels"], pf["question_words"]
     if len(outcomes) == 2 and {o.lower() for o in outcomes} == _YES_NO:
         if k_side and not k_side <= poly_question:
             missing = sorted(k_side - poly_question)
@@ -224,7 +356,7 @@ def _side_alignment(kalshi: dict, k_side: set[str], poly: dict) -> tuple[str | N
         return "aligned", "both venues price YES on the question as worded"
     if len(outcomes) != 2:
         return None, f"Polymarket market has {len(outcomes)} outcomes, not a binary pair"
-    side = k_side or text_features(kalshi.get("question", ""))["words"]
+    side = k_side or kf["question_words"]
     hits = [bool(side & (lab - _STOPWORDS)) for lab in labels]
     if hits == [True, False]:
         return "aligned", f"Kalshi YES side matches Polymarket outcome {outcomes[0]!r}"
@@ -235,49 +367,72 @@ def _side_alignment(kalshi: dict, k_side: set[str], poly: dict) -> tuple[str | N
     return None, f"Kalshi YES side {sorted(side)} matches neither Polymarket outcome {outcomes}"
 
 
-def score_pair(kalshi: dict, poly: dict, now: datetime | None = None) -> dict:
-    """Score one Kalshi/Polymarket pair.
+def _threshold_class(quantity: str) -> str:
+    """A fractional threshold's direction and value, strictness dropped.
 
-    Returns ``{"confidence": float, "rejected": bool, "reasons": [...],
-    "side": "aligned" | "inverted" | None}``. A rejected pair has
-    confidence 0.0 and its first failing gate as the last reason.
+    ">4.5" and ">=4.5" differ only when the outcome lands exactly on
+    4.5; ">50" and ">=50" differ by a whole unit, so integers keep it.
     """
-    now = now or datetime.now(timezone.utc)
-    k_text = " ".join(
-        s for s in (kalshi.get("question", ""), kalshi.get("context", ""), kalshi.get("yes_side", "")) if s
+    comparator, number = _QUANTITY_RE.match(quantity).groups()
+    if comparator and "." in number:
+        return ("above" if comparator[0] == ">" else "below") + number
+    return quantity
+
+
+def _boundary_only(k_quantities: set[str], p_quantities: set[str]) -> bool:
+    return len(k_quantities) == len(p_quantities) and (
+        {_threshold_class(q) for q in k_quantities} == {_threshold_class(q) for q in p_quantities}
     )
-    kf = text_features(k_text)
-    pf = text_features(" ".join(s for s in (poly.get("question", ""), poly.get("context", "")) if s))
-    k_side_words = text_features(kalshi.get("yes_side", ""))["words"]
+
+
+def _score(kf: dict, pf: dict, now: datetime) -> dict:
+    kb, pb = kf["bag"], pf["bag"]
     reasons: list[str] = []
 
     def reject(reason: str) -> dict:
         reasons.append(reason)
-        return {"confidence": 0.0, "rejected": True, "reasons": reasons, "side": None}
+        return {"confidence": 0.0, "rejected": True, "reasons": reasons, "side": None, "boundary_differs": False}
 
-    shared = kf["words"] & pf["words"]
-    union = len(kf["words"]) + len(pf["words"])
+    shared = kb["words"] & pb["words"]
+    union = len(kb["words"]) + len(pb["words"])
     dice = (2 * len(shared) / union) if union else 0.0
     reasons.append(
         f"title word overlap {dice:.2f} (dice; {len(shared)} shared of "
-        f"{len(kf['words'])} Kalshi / {len(pf['words'])} Polymarket words)"
+        f"{len(kb['words'])} Kalshi / {len(pb['words'])} Polymarket words)"
     )
 
-    if kf["quantities"] != pf["quantities"]:
-        return reject(
-            f"quantities differ: Kalshi {sorted(kf['quantities'])} vs Polymarket {sorted(pf['quantities'])}"
+    boundary = False
+    if kb["quantities"] != pb["quantities"]:
+        if not _boundary_only(kb["quantities"], pb["quantities"]):
+            return reject(
+                f"quantities differ: Kalshi {sorted(kb['quantities'])} vs Polymarket {sorted(pb['quantities'])}"
+            )
+        boundary = True
+        reasons.append(
+            f"quantities agree except at the boundary: Kalshi {sorted(kb['quantities'])} vs Polymarket "
+            f"{sorted(pb['quantities'])} (the same unless the outcome lands exactly on the threshold)"
         )
-    if kf["quantities"]:
-        reasons.append(f"quantities agree {sorted(kf['quantities'])}")
+    elif kb["quantities"]:
+        reasons.append(f"quantities agree {sorted(kb['quantities'])}")
 
-    if kf["years"] and pf["years"] and not (kf["years"] & pf["years"]):
-        return reject(f"years differ: Kalshi {sorted(kf['years'])} vs Polymarket {sorted(pf['years'])}")
+    if kb["years"] and pb["years"] and not (kb["years"] & pb["years"]):
+        return reject(f"years differ: Kalshi {sorted(kb['years'])} vs Polymarket {sorted(pb['years'])}")
 
-    if kf["negated"] != pf["negated"]:
+    if kb["negated"] != pb["negated"]:
         return reject("negation differs (one title says not/no/never/without, the other does not)")
 
-    k_end, p_end = _parse_time(kalshi.get("end_time")), _parse_time(poly.get("end_time"))
-    date_factor = 1.0
+    if kf["actions"] != pf["actions"]:
+        return reject(f"actions differ: Kalshi {sorted(kf['actions'])} vs Polymarket {sorted(pf['actions'])}")
+    if kf["actions"]:
+        reasons.append(f"actions agree {sorted(kf['actions'])}")
+    if kf["directions"] != pf["directions"]:
+        return reject(
+            f"directions differ: Kalshi {sorted(kf['directions'])} vs Polymarket {sorted(pf['directions'])}"
+        )
+    if kf["directions"]:
+        reasons.append(f"directions agree {sorted(kf['directions'])}")
+
+    k_end, p_end = kf["end"], pf["end"]
     if k_end is None or p_end is None:
         return reject("end date missing on one venue; cannot confirm the same event window")
     gap_days = abs((k_end - p_end).total_seconds()) / 86400
@@ -288,26 +443,65 @@ def score_pair(kalshi: dict, poly: dict, now: datetime | None = None) -> dict:
     date_factor = 1.0 - 0.5 * (gap_days / tolerance)
     reasons.append(f"end dates {gap_days:.1f} days apart (tolerance {tolerance:.1f} days)")
 
-    side, side_reason = _side_alignment(kalshi, k_side_words, poly)
+    side, side_reason = _side_alignment(kf, pf)
     if side is None:
         return reject(side_reason)
     reasons.append(side_reason)
 
     confidence = round(dice * date_factor, 3)
-    return {"confidence": confidence, "rejected": False, "reasons": reasons, "side": side}
+    return {"confidence": confidence, "rejected": False, "reasons": reasons, "side": side, "boundary_differs": boundary}
+
+
+def score_pair(kalshi: dict, poly: dict, now: datetime | None = None) -> dict:
+    """Score one Kalshi/Polymarket pair.
+
+    Returns ``{"confidence": float, "rejected": bool, "reasons": [...],
+    "side": "aligned" | "inverted" | None, "boundary_differs": bool}``.
+    A rejected pair has confidence 0.0 and its first failing gate as the
+    last reason. ``confidence`` is an ordinal score, not a probability.
+    """
+    now = now or datetime.now(timezone.utc)
+    return _score(_market_features(kalshi, "kalshi"), _market_features(poly, "polymarket"), now)
 
 
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------
 
-def _blocking_index(markets: list[dict]) -> tuple[dict[str, list[int]], int]:
+def _candidate_pairs(k_feats: list[dict], p_feats: list[dict], min_dice: float) -> list[tuple[int, int]]:
+    """Every pair whose title-word Dice can reach ``min_dice``.
+
+    Prefix filtering: with both venues' words in one rarest-first order,
+    each market keeps its first ``n - need + 1`` words, where ``need =
+    ceil(min_dice * n / (2 - min_dice))``. Dice >= t means the overlap
+    o satisfies o >= t * n / (2 - t) for either market's word count n
+    (from 2o >= t * (n + m) and m >= o), and the first shared word sits
+    within the first n - o + 1 words of each market, so both prefixes
+    hold it. Pairs sharing no word are never candidates. (The bound and
+    the prefix step were checked with z3 on 2026-10-17, the prefix step
+    for up to 16 words; a test compares this with a brute-force scan.)
+    """
+    t = min(max(float(min_dice), 0.0), 1.0)
+    df: dict[str, int] = {}
+    for f in k_feats + p_feats:
+        for w in f["bag"]["words"]:
+            df[w] = df.get(w, 0) + 1
+
+    def prefix(words: set[str]) -> list[str]:
+        ordered = sorted(words, key=lambda w: (df[w], w))
+        need = math.ceil(t * len(ordered) / (2 - t) - 1e-9)  # rounding can only lengthen the prefix
+        return ordered[: len(ordered) - max(need, 1) + 1]
+
     index: dict[str, list[int]] = {}
-    for i, m in enumerate(markets):
-        words = text_features(" ".join((m.get("question", ""), m.get("context", ""))))["words"]
-        for w in words:
-            index.setdefault(w, []).append(i)
-    return index, len(markets)
+    for pi, f in enumerate(p_feats):
+        for w in prefix(f["bag"]["words"]):
+            index.setdefault(w, []).append(pi)
+    pairs: set[tuple[int, int]] = set()
+    for ki, f in enumerate(k_feats):
+        for w in prefix(f["bag"]["words"]):
+            for pi in index.get(w, ()):
+                pairs.add((ki, pi))
+    return sorted(pairs)
 
 
 def match_markets(
@@ -319,43 +513,33 @@ def match_markets(
 ) -> dict:
     """One-to-one deterministic matching, greedy by confidence.
 
-    Candidate pairs share at least two title words that appear in fewer
-    than 20% of the Polymarket set (blocking keeps the pair count
-    tractable; a pair with fewer shared words could not reach the
-    threshold anyway). Returns matched pairs, near misses (the highest
-    similarity pairs that a gate or the threshold rejected) and counts.
+    Every pair whose title-word overlap could reach the lower of
+    ``min_confidence`` and ``NEAR_MISS_FLOOR`` is scored
+    (``_candidate_pairs``), so no pair that would pass the threshold is
+    skipped: the date factor only lowers a score. A pair sharing no
+    title word is never scored. Returns matched pairs, near misses (the
+    highest similarity pairs that a gate or the threshold rejected) and
+    counts.
     """
     now = now or datetime.now(timezone.utc)
-    index, n_poly = _blocking_index(polymarket)
-    common_cut = max(5, int(0.2 * n_poly))
+    k_feats = [_market_features(m, "kalshi") for m in kalshi]
+    p_feats = [_market_features(m, "polymarket") for m in polymarket]
+    # 0.001 under the floor: scores are rounded to 3 places, so a pair can
+    # pass the threshold with an overlap up to 0.0005 below it.
+    candidates = _candidate_pairs(k_feats, p_feats, min(min_confidence, NEAR_MISS_FLOOR) - 0.001)
     scored: list[tuple[float, int, int, dict]] = []
     near: list[tuple[float, int, int, dict]] = []
-    pairs_scored = 0
-    for ki, km in enumerate(kalshi):
-        words = text_features(
-            " ".join((km.get("question", ""), km.get("context", ""), km.get("yes_side", "")))
-        )["words"]
-        counts: dict[int, int] = {}
-        for w in words:
-            posting = index.get(w)
-            if not posting or len(posting) > common_cut:
-                continue
-            for pi in posting:
-                counts[pi] = counts.get(pi, 0) + 1
-        for pi, c in counts.items():
-            if c < 2:
-                continue
-            pairs_scored += 1
-            result = score_pair(km, polymarket[pi], now=now)
-            if not result["rejected"] and result["confidence"] >= min_confidence:
-                scored.append((result["confidence"], ki, pi, result))
-            else:
-                overlap = _overlap_of(result)
-                if not result["rejected"]:
-                    result["reasons"].append(
-                        f"confidence {result['confidence']:.3f} below threshold {min_confidence}"
-                    )
-                near.append((overlap, ki, pi, result))
+    for ki, pi in candidates:
+        result = _score(k_feats[ki], p_feats[pi], now)
+        if not result["rejected"] and result["confidence"] >= min_confidence:
+            scored.append((result["confidence"], ki, pi, result))
+        else:
+            overlap = _overlap_of(result)
+            if not result["rejected"]:
+                result["reasons"].append(
+                    f"confidence {result['confidence']:.3f} below threshold {min_confidence}"
+                )
+            near.append((overlap, ki, pi, result))
 
     scored.sort(key=lambda t: (-t[0], t[1], t[2]))
     used_k: set[int] = set()
@@ -381,7 +565,7 @@ def match_markets(
     return {
         "matched": matched,
         "near_misses": near_misses,
-        "pairs_scored": pairs_scored,
+        "pairs_scored": len(candidates),
         "unmatched_kalshi": len(kalshi) - len(used_k),
         "unmatched_polymarket": len(polymarket) - len(used_p),
         "min_confidence": min_confidence,
@@ -401,8 +585,28 @@ def _brief(m: dict) -> dict:
         "outcomes": m.get("outcomes"),
         "end_time": m.get("end_time"),
         "probability": m.get("probability"),
+        "price_basis": m.get("price_basis"),
+        "yes_bid": m.get("yes_bid"),
+        "yes_ask": m.get("yes_ask"),
+        "spread": m.get("spread"),
+        "last_price": m.get("last_price"),
+        "last_trade_time": m.get("last_trade_time"),
         "url": m.get("url"),
     }
+
+
+def _quote_flags(venue: str, m: dict) -> list[str]:
+    """Why one side's price is not a live two-sided quote ([] when it is)."""
+    if m.get("probability") is None:
+        return []  # no price: the gap is None and the pair sorts last anyway
+    flags = []
+    basis = m.get("price_basis")
+    if basis != "bid_ask_midpoint":
+        flags.append(f"{venue} price is not a two-sided quote midpoint (basis: {basis or 'not stated'})")
+    spread = m.get("spread")
+    if isinstance(spread, (int, float)) and spread > MAX_COMPARABLE_SPREAD:
+        flags.append(f"{venue} bid/ask spread {spread:.2f} is wider than {MAX_COMPARABLE_SPREAD:.2f}")
+    return flags
 
 
 def _pair_record(km: dict, pm: dict, result: dict) -> dict:
@@ -412,6 +616,9 @@ def _pair_record(km: dict, pm: dict, result: dict) -> dict:
     if p_raw is not None:
         p_aligned = round(1.0 - p_raw, 4) if result["side"] == "inverted" else p_raw
     gap = round(k_prob - p_aligned, 4) if k_prob is not None and p_aligned is not None else None
+    flags = _quote_flags("kalshi", km) + _quote_flags("polymarket", pm)
+    if result.get("boundary_differs"):
+        flags.append("thresholds differ at the boundary (strict on one venue, inclusive on the other)")
     return {
         "match_confidence": result["confidence"],
         "reasons": result["reasons"],
@@ -421,6 +628,8 @@ def _pair_record(km: dict, pm: dict, result: dict) -> dict:
         "kalshi_yes_probability": k_prob,
         "polymarket_yes_probability": p_aligned,
         "price_gap": gap,
+        "flags": flags,
+        "comparable": gap is not None and not flags,
     }
 
 

@@ -42,6 +42,40 @@
   and `stale: true` when the list came from an expired cache entry. Keys,
   parameters and the tool name are unchanged.
 
+### Fixed: prediction-market review findings
+- Expired-cache serves after a failed fetch are marked on every Kalshi read
+  (open markets, settled listing, candlesticks) and on Polymarket's settled
+  listing and price histories: `stale` and `degraded` are set and
+  `data_gaps` names the count and the oldest age. A price history served
+  from expired cache is excluded from Brier scoring, not scored as current.
+- Matching: rate actions (cut, raise or hike, hold or no change) and
+  directions (above, below) must agree; a four-digit number after `$` or a
+  comparator is an amount, not a year; minus signs and ordinals are kept.
+  "U.S." matches "US", "$100m" matches "$100 million", and "4.5% or higher"
+  matches "above 4.5%" with a flag that the boundary differs. Candidate
+  blocking no longer drops a same-event pair whose words many other titles
+  share. `match_confidence` (key unchanged) is documented as an ordinal
+  score for ranking pairs, not a probability.
+- `intel_prediction_compare`: each side carries its price basis, bid, ask,
+  spread and last-trade time (Kalshi's public trades endpoint, for pairs
+  priced from a last trade; Gamma publishes none). A pair is flagged,
+  ranked after comparable pairs and left out of `comparable_count` when
+  either side is not a two-sided quote midpoint (a last trade or Gamma's
+  listed outcome price), its spread is wider than 0.10, or the thresholds
+  differ at the boundary.
+- `intel_prediction_settled`: Polymarket markets are scored against the
+  earlier of `endDate` and `closedTime` (`closedTime` comes after
+  resolution), and each sample entry names which. The comparability text
+  states that reference times differ by venue and that samples differ by
+  offset; the CLI prints one Brier table per venue. An offset of 0 or below
+  is refused, even next to a valid one, instead of being dropped.
+- Kalshi requests wait for the pacing interval only on a cache miss.
+  Non-finite or out-of-range prices and non-finite volumes are treated as
+  unreadable and counted; identifiers must match each venue's measured
+  format before they build a URL or a request; titles are capped at 500
+  characters. `intel_prediction_markets` names how many markets it left
+  out for an unusable price.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard
