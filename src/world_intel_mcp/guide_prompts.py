@@ -1,28 +1,46 @@
 """Worked research questions served as MCP prompts.
 
 Each prompt is a research question a model can run against this server:
-the tools to call (named exactly as registered), what each call is for,
-and the limits an honest answer has to respect. ``guide.py`` turns these
-into MCP ``Prompt`` / ``GetPromptResult`` objects; this module holds the
-data and the text rendering only.
+the tools to call (named exactly as registered), the arguments to pass
+them, what each call is for, and the limits an honest answer has to
+respect. ``guide.py`` turns these into MCP ``Prompt`` / ``GetPromptResult``
+objects; this module holds the data and the text rendering only.
 
-Every tool named here must exist in the live registry, and every
-``intel_*`` name that appears anywhere in a rendered prompt must be one
-of that prompt's listed tools. ``tests/test_guide.py`` pins both, so a
-renamed or removed tool fails the suite instead of leaving a prompt that
-sends a model to a tool that is not there.
+Step arguments are data (``Step.args``), not prose, so the tests can hold
+every argument a prompt tells a model to pass against that tool's
+``inputSchema``: the name exists, a required parameter is supplied, an
+enum value is allowed and a number is a number. Every tool named here
+must exist in the live registry, and every ``intel_*`` name that appears
+anywhere in a rendered prompt, argument values included, must be one of
+that prompt's own tools. ``tests/test_guide.py`` pins all of this, so a
+renamed tool or parameter fails the suite instead of leaving a prompt
+that sends a model somewhere that is not there.
+
+Gaps / not covered:
+- The tests check argument names, types and enum values against the
+  schemas and output-field names against the package source. They cannot
+  check that a step's purpose text describes what the tool returns; that
+  rests on reading the source modules.
 """
 
+import json
+import math
 import re
 from dataclasses import dataclass
+from typing import Any
 
 # Rendered into every prompt after its own limits.
 COMMON_LIMITS: tuple[str, ...] = (
     "A tool that returns an error, a note or a data_gaps entry has told you "
     "what is missing: report it as missing. Missing data is never zero, calm "
     "or peace.",
+    "Not every tool marks a failure. Some return an empty list, a zero count "
+    "or a neutral score when every upstream request failed. Read an empty "
+    "list or a zero as nothing returned, not nothing happened, and confirm "
+    "with a second tool before calling a place quiet.",
     "Give each figure the date it describes (the observation date) as well "
-    "as when it was fetched; they are often different.",
+    "as when it was fetched; they are often different. If a tool gives no "
+    "observation date, say so.",
     "Describe what the data show. This server does not forecast prices, "
     "give trading advice or prove causation.",
 )
@@ -35,7 +53,19 @@ ANSWER_SHAPE = (
 
 _MAX_ARG_CHARS = 200
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
+_INTEGER = re.compile(r"[+-]?\d+")
+# Values with these characters are quoted so they cannot run into the
+# next argument in "name value, name value".
+_QUOTE_IF = re.compile(r"[,;\"<>]")
 TOOL_NAME = re.compile(r"\bintel_[a-z0-9_]+\b")
+
+ARG_KINDS = ("text", "int", "number")
+
+
+def _number_text(value: float) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return repr(value) if isinstance(value, float) else str(value)
 
 
 @dataclass(frozen=True)
@@ -43,8 +73,44 @@ class PromptArg:
     name: str
     description: str
     required: bool = False
+    # Used when the argument is not given. An optional argument without a
+    # default is left out of every call that would take it, and ``absent``
+    # stands in for it in the prose.
     default: str | None = None
+    absent: str | None = None
     choices: tuple[str, ...] = ()
+    kind: str = "text"
+    minimum: float | None = None
+    maximum: float | None = None
+
+    @property
+    def help(self) -> str:
+        """The description with the accepted range and default appended."""
+        parts = [self.description]
+        if self.minimum is not None and self.maximum is not None:
+            parts.append(f"{_number_text(self.minimum)} to {_number_text(self.maximum)}")
+        if self.default is not None:
+            parts.append(f"default {self.default}")
+        return "; ".join(parts)
+
+
+@dataclass(frozen=True)
+class Fill:
+    """An argument value the model has to work out, usually from an
+    earlier step's output. Rendered as ``<what>``."""
+
+    what: str
+
+
+@dataclass(frozen=True)
+class Step:
+    tool: str
+    purpose: str
+    # (parameter, value) pairs. A value is a literal, "{argument}" for a
+    # prompt argument (or a derived value), or a Fill.
+    args: tuple[tuple[str, Any], ...] = ()
+    # A prompt argument this call needs; without it the step says to skip.
+    only_if: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,24 +119,67 @@ class ResearchPrompt:
     title: str
     domain: str
     question: str
-    steps: tuple[tuple[str, str], ...]
+    steps: tuple[Step, ...]
     limits: tuple[str, ...]
     arguments: tuple[PromptArg, ...] = ()
+    # (name, source argument, factor): a value computed from a numeric
+    # argument, such as twice a comparison window.
+    derived: tuple[tuple[str, str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        # A step that takes no arguments may be written as a
+        # (tool, purpose) pair.
+        object.__setattr__(
+            self,
+            "steps",
+            tuple(s if isinstance(s, Step) else Step(*s) for s in self.steps),
+        )
 
     @property
     def tools(self) -> tuple[str, ...]:
-        return tuple(tool for tool, _ in self.steps)
+        return tuple(step.tool for step in self.steps)
 
     @property
     def description(self) -> str:
-        return f"{self.title}. Uses {', '.join(self.tools)}."
+        return f"{self.title}. Uses {', '.join(dict.fromkeys(self.tools))}."
 
 
 class PromptArgumentError(ValueError):
     """A prompt was requested with missing, unknown or invalid arguments."""
 
 
-def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[str, str]:
+def _parse(prompt: ResearchPrompt, arg: PromptArg, value: str) -> Any:
+    if arg.kind == "text":
+        return value
+    if arg.kind == "int":
+        if not _INTEGER.fullmatch(value):
+            raise PromptArgumentError(
+                f"Prompt '{prompt.name}' argument '{arg.name}' must be a whole "
+                f"number (got '{value}')"
+            )
+        number: float = int(value)
+    else:
+        try:
+            number = float(value)
+        except ValueError:
+            number = math.nan
+        if not math.isfinite(number):
+            raise PromptArgumentError(
+                f"Prompt '{prompt.name}' argument '{arg.name}' must be a number "
+                f"(got '{value}')"
+            )
+    if (arg.minimum is not None and number < arg.minimum) or (
+        arg.maximum is not None and number > arg.maximum
+    ):
+        raise PromptArgumentError(
+            f"Prompt '{prompt.name}' argument '{arg.name}' must be between "
+            f"{_number_text(arg.minimum)} and {_number_text(arg.maximum)} "
+            f"(got '{value}')"
+        )
+    return number
+
+
+def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[str, Any]:
     given = dict(given or {})
     known = {a.name for a in prompt.arguments}
     unknown = sorted(set(given) - known)
@@ -80,36 +189,101 @@ def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[
             f"Prompt '{prompt.name}' does not take {', '.join(unknown)} "
             f"(accepted: {accepted})"
         )
-    values: dict[str, str] = {}
+    values: dict[str, Any] = {}
     for arg in prompt.arguments:
         raw = given.get(arg.name)
-        value = str(raw).strip()[:_MAX_ARG_CHARS] if raw is not None else ""
+        # Whitespace, newlines included, collapses to single spaces, so a
+        # value stays on its line and cannot add steps or limits.
+        value = " ".join(str(raw).split())[:_MAX_ARG_CHARS] if raw is not None else ""
         if not value:
             if arg.required:
                 raise PromptArgumentError(
                     f"Prompt '{prompt.name}' needs argument '{arg.name}': "
                     f"{arg.description}"
                 )
-            value = arg.default or ""
+            if arg.default is None:
+                values[arg.name] = None
+                continue
+            value = arg.default
+        foreign = sorted(set(TOOL_NAME.findall(value)) - set(prompt.tools))
+        if foreign:
+            raise PromptArgumentError(
+                f"Prompt '{prompt.name}' argument '{arg.name}' names "
+                f"{', '.join(foreign)}, which this prompt does not call"
+            )
         if arg.choices and value not in arg.choices:
             raise PromptArgumentError(
                 f"Prompt '{prompt.name}' argument '{arg.name}' must be one of "
                 f"{', '.join(arg.choices)} (got '{value}')"
             )
-        values[arg.name] = value
+        values[arg.name] = _parse(prompt, arg, value)
+    for name, source, factor in prompt.derived:
+        values[name] = values[source] * factor
     return values
+
+
+def _step_args(step: Step, values: dict[str, Any]) -> dict[str, Any] | None:
+    """The arguments for one call, or None when the step is skipped."""
+    if step.only_if is not None and values.get(step.only_if) is None:
+        return None
+    out: dict[str, Any] = {}
+    for param, raw in step.args:
+        value = raw
+        if isinstance(raw, str):
+            whole = _PLACEHOLDER.fullmatch(raw)
+            if whole:
+                value = values.get(whole.group(1))
+        if value is not None:
+            out[param] = value
+    return out
+
+
+def resolved_steps(
+    prompt: ResearchPrompt, arguments: dict[str, str] | None = None
+) -> list[tuple[Step, dict[str, Any] | None]]:
+    """Each step with the arguments it passes (None: the step is skipped).
+
+    Values keep their types (int, float, list, Fill), which is what the
+    schema tests check.
+    """
+    values = _resolve_args(prompt, arguments)
+    return [(step, _step_args(step, values)) for step in prompt.steps]
+
+
+def _show(value: Any) -> str:
+    if isinstance(value, Fill):
+        return f"<{value.what}>"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return _number_text(value)
+    if isinstance(value, (list, tuple)):
+        return json.dumps(list(value), ensure_ascii=False)
+    text = str(value)
+    return json.dumps(text, ensure_ascii=False) if _QUOTE_IF.search(text) else text
 
 
 def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> str:
     """The prompt's user-message text with its arguments filled in."""
     values = _resolve_args(prompt, arguments)
+    absent = {a.name: a.absent or "not given" for a in prompt.arguments}
+    prose = {
+        name: _show(value) if value is not None else absent[name]
+        for name, value in values.items()
+    }
 
     def fill(text: str) -> str:
-        return _PLACEHOLDER.sub(lambda m: values[m.group(1)], text)
+        return _PLACEHOLDER.sub(lambda m: prose.get(m.group(1), m.group(0)), text)
 
     lines = [f"Research question: {fill(prompt.question)}", "", "Tools to call:"]
-    for i, (tool, purpose) in enumerate(prompt.steps, 1):
-        lines.append(f"{i}. {tool}: {fill(purpose)}")
+    for i, step in enumerate(prompt.steps, 1):
+        args = _step_args(step, values)
+        if args is None:
+            lines.append(f"{i}. {step.tool}: skip this call; no {step.only_if} was given.")
+            continue
+        pairs = ", ".join(f"{name} {_show(value)}" for name, value in args.items())
+        call = f"call with {pairs}; " if pairs else ""
+        lines.append(f"{i}. {step.tool}: {call}{fill(step.purpose)}")
     lines += ["", "Limits to respect:"]
     lines += [f"- {fill(limit)}" for limit in prompt.limits]
     lines += [f"- {limit}" for limit in COMMON_LIMITS]
@@ -119,6 +293,19 @@ def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> s
 
 _COUNTRY = PromptArg("country", "Country name, e.g. Sudan", required=True)
 _ISO3 = PromptArg("country", "ISO alpha-3 country code, e.g. UKR", required=True)
+_FIRMS_REGIONS = (
+    "north_america",
+    "south_america",
+    "europe",
+    "africa",
+    "middle_east",
+    "south_asia",
+    "east_asia",
+    "southeast_asia",
+    "oceania",
+)
+# The keys of sources/jet_cohort.REGIONS (a test pins the match).
+_JET_REGIONS = ("global", "conus", "north_america", "europe", "middle_east", "east_asia")
 
 
 PROMPTS: tuple[ResearchPrompt, ...] = (
@@ -133,27 +320,50 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "before that?"
         ),
         arguments=(
-            _COUNTRY,
-            PromptArg("days", "Length of each comparison window in days", default="30"),
+            PromptArg("country", "Country name as the sources spell it, e.g. Sudan", required=True),
+            PromptArg(
+                "days", "Length of each comparison window in days", default="30",
+                kind="int", minimum=1, maximum=365,
+            ),
         ),
+        derived=(("span", "days", 2),),
         steps=(
-            (
+            Step(
                 "intel_ucdp_events",
-                "state-based violence events. It has no country filter, so ask "
-                "for twice the window with a high limit (it caps results), keep "
-                "the events in {country} yourself, split them at the midpoint "
-                "and say that you filtered",
+                "UCDP events of all three types (state-based, non-state and "
+                "one-sided; see type_of_violence_label) for every country. It "
+                "needs UCDP_ACCESS_TOKEN: without it, or when the API refuses "
+                "it, the tool returns an error with reason ucdp_unconfigured or "
+                "ucdp_fetch_failed, which is missing data, not zero events. It "
+                "has no country filter, so keep the events in {country} "
+                "yourself, split them at {days} days ago by date_start, and say "
+                "that you filtered. limit is the page size and every page is "
+                "fetched, so it does not cap the result",
+                args=(("days", "{span}"), ("limit", 1000)),
             ),
-            (
+            Step(
                 "intel_acled_events",
-                "events for {country} over both windows (needs ACLED_EMAIL and "
-                "ACLED_PASSWORD; without them it returns an error)",
+                "ACLED events in {country} over both windows. It needs "
+                "ACLED_EMAIL and ACLED_PASSWORD; without them it returns an "
+                "error naming them. limit caps the result: a count equal to the "
+                "limit means the list was cut off, so say so",
+                args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
             ),
-            ("intel_unrest_events", "protests and riots in {country} (also ACLED), kept apart from armed violence"),
+            Step(
+                "intel_unrest_events",
+                "protests and riots in {country} (also ACLED, same credentials), "
+                "kept apart from armed violence. Nearby duplicates are merged: "
+                "count plus deduplicated is what was fetched, and when that "
+                "equals the limit the list was cut off",
+                args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
+            ),
         ),
         limits=(
             "Event datasets are revised and arrive late, so the most recent "
             "days are the least complete. A quiet final week is not proof of calm.",
+            "UCDP is read from one pinned GED release, and a release only "
+            "holds events up to its own cutoff. Check the latest date_start "
+            "UCDP returned before reading a thin recent window as calm.",
             "Count events and fatalities separately: fewer events with more "
             "deaths is not de-escalation.",
             "ACLED and UCDP define an event differently. Compare each source "
@@ -213,15 +423,20 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         steps=(
             ("intel_yield_curve", "maturities, the 2s10s and 3m10y spreads and the inversion flag"),
-            ("intel_fred_series", "series T10Y2Y for the spread's recent history (needs FRED_API_KEY)"),
+            Step(
+                "intel_fred_series",
+                "the spread's recent daily history (needs FRED_API_KEY)",
+                args=(("series_id", "T10Y2Y"),),
+            ),
             ("intel_central_bank_rates", "the policy rate the short end is anchored to"),
         ),
         limits=(
             "Spreads are in percentage points. A move from 0.10 to 0.30 is "
             "0.20 points, not a 200 percent rise.",
             "Without FRED_API_KEY the curve falls back to four Yahoo "
-            "maturities (3M, 5Y, 10Y, 30Y), so spread_2s10s comes back null. "
-            "Say so; do not swap in another spread without saying which.",
+            "maturities (3M, 5Y, 10Y, 30Y) with no observation dates, so "
+            "spread_2s10s comes back null. Say so; do not swap in another "
+            "spread without saying which.",
             "An inverted curve describes today's yields. It is not a "
             "recession forecast.",
         ),
@@ -231,18 +446,37 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         title="Where major central bank policy rates stand",
         domain="markets",
         question=(
-            "Where do the major central banks' policy rates stand, and which "
-            "of them changed most recently?"
+            "Where do the Federal Reserve, ECB and Bank of England policy "
+            "rates stand now, how has the US federal funds rate moved "
+            "recently, and what did the other major central banks last set, "
+            "as of the dates on record?"
         ),
         steps=(
-            ("intel_central_bank_rates", "policy rates for 15 central banks with their source"),
-            ("intel_fred_series", "series DFF for the US effective federal funds rate history (needs FRED_API_KEY)"),
+            (
+                "intel_central_bank_rates",
+                "rates for 15 central banks; each entry carries its source "
+                "(fred or curated) and as_of date",
+            ),
+            Step(
+                "intel_fred_series",
+                "the daily effective federal funds rate history (needs FRED_API_KEY)",
+                args=(("series_id", "DFF"),),
+            ),
             ("intel_major_crosses", "how the major currencies sit against each other today"),
         ),
         limits=(
-            "Without FRED_API_KEY some rates come from a curated table. Give "
-            "each rate's as-of date and source, and never present a curated "
-            "value as live.",
+            "Only the Fed, ECB and BoE rates can be live, read from FRED when "
+            "FRED_API_KEY is set (source fred). The other twelve come from a "
+            "hand-kept table dated 2024-11 to 2025-02 (source curated): report "
+            "them as stale, with their as_of dates, never as current.",
+            "fred_available only says that FRED_API_KEY is set, not that FRED "
+            "answered. A curated Fed, ECB or BoE entry means the FRED read "
+            "failed or the key is missing.",
+            "The live Fed figure is the effective rate (DFF) and the live BoE "
+            "figure is SONIA, an overnight market rate that tracks Bank Rate; "
+            "the curated Fed entry is the upper bound of the target range. Do "
+            "not read a gap between a live and a curated figure as a policy "
+            "change.",
             "Rate changes are in percentage points or basis points (one point "
             "is 100 basis points), not percent of the rate.",
         ),
@@ -258,16 +492,32 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         arguments=(
             PromptArg("symbol", "Quote currency, ISO code such as EUR", required=True),
             PromptArg("base", "Base currency, ISO code", default="USD"),
-            PromptArg("days", "Days of history", default="30"),
+            PromptArg("days", "Days of history", default="30", kind="int", minimum=1, maximum=365),
         ),
         steps=(
-            ("intel_forex_timeseries", "base {base}, symbol {symbol}, days {days}"),
+            Step(
+                "intel_forex_timeseries",
+                "daily ECB reference rates. Each rate is units of {symbol} per "
+                "1 {base}, and trend.change_pct is the change in that number: "
+                "a positive change means one {base} buys more {symbol}, so "
+                "{symbol} weakened against {base}. Say which way you quote the move",
+                args=(("base", "{base}"), ("symbol", "{symbol}"), ("days", "{days}")),
+            ),
             ("intel_major_crosses", "where the pair sits among the majors today"),
-            ("intel_gdelt_search", "articles about the currency around the dates of the largest moves"),
+            Step(
+                "intel_gdelt_search",
+                "recent articles about the currency. The tool has no date "
+                "parameter and searches GDELT's default window, so keep the "
+                "articles whose seendate falls on or just after the dates of "
+                "the largest moves, and say how many matched",
+                args=(("query", Fill("the currency's name, such as yen or euro")), ("mode", "artlist")),
+            ),
         ),
         limits=(
             "ECB reference rates are published once per business day. A "
             "weekend or holiday has no observation, which is not a zero change.",
+            "An empty rates list with a null trend means the fetch failed, "
+            "not that the currency was flat.",
             "News published alongside a move is context. Timing alone does "
             "not show that the news caused the move.",
         ),
@@ -282,9 +532,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         arguments=(PromptArg("ticker", "Stock ticker, e.g. AAPL", required=True),),
         steps=(
-            ("intel_company_profile", "quote, sector and recent news for {ticker}"),
-            ("intel_company_filings", "recent 10-K, 10-Q and 8-K filings for {ticker}"),
-            ("intel_earnings_surprise", "actual against estimated earnings for {ticker}"),
+            Step("intel_company_profile", "quote, sector and recent news", args=(("query", "{ticker}"),)),
+            Step(
+                "intel_company_filings",
+                "recent 10-K, 10-Q and 8-K filings",
+                args=(("ticker", "{ticker}"),),
+            ),
+            Step(
+                "intel_earnings_surprise",
+                "actual against estimated earnings",
+                args=(("symbol", "{ticker}"),),
+            ),
         ),
         limits=(
             "A filing date is when the company filed, not when the event "
@@ -325,7 +583,9 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_crypto_quotes", "prices and market caps of the largest coins"),
             ("intel_stablecoin_status", "whether the major stablecoins hold their peg"),
             ("intel_etf_flows", "Bitcoin spot ETF prices and trading volume"),
-            ("intel_btc_technicals", "moving averages, Mayer Multiple and distance from the high"),
+            ("intel_btc_technicals", "moving averages, Mayer Multiple and distance from "
+             "the highest daily price of the last 200 days (ath_in_period, not the "
+             "all-time high)"),
         ),
         limits=(
             "intel_etf_flows reports prices and trading volume, not creations "
@@ -345,17 +605,39 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "raise a disaster alert?"
         ),
         arguments=(
-            PromptArg("min_magnitude", "Smallest magnitude to include", default="5.5"),
-            PromptArg("hours", "Lookback in hours", default="48"),
+            PromptArg(
+                "min_magnitude", "Smallest magnitude to include", default="5.5",
+                kind="number", minimum=0, maximum=10,
+            ),
+            PromptArg("hours", "Lookback in hours", default="48", kind="int", minimum=1, maximum=720),
         ),
         steps=(
-            ("intel_earthquakes", "min_magnitude {min_magnitude}, hours {hours}"),
-            ("intel_population_exposure", "event_types earthquake, for people near each event"),
-            ("intel_disaster_alerts", "event_type EQ, for the GDACS alert level of the same events"),
+            Step(
+                "intel_earthquakes",
+                "the events, newest first and at most 50 by default, so a "
+                "count of 50 means older ones were cut off",
+                args=(("min_magnitude", "{min_magnitude}"), ("hours", "{hours}")),
+            ),
+            Step(
+                "intel_population_exposure",
+                "major cities within radius_km (default 200) of recent events. "
+                "It ignores the magnitude and hours above: it fetches its own "
+                "list of M4.5 and larger quakes from the last 48 hours, at most "
+                "50. Keep only the exposed_cities whose event_detail "
+                "(\"M<magnitude> <place>\") matches an event from step 1, and "
+                "check events_analyzed: 0 can mean its fetch failed",
+                args=(("event_types", ["earthquake"]),),
+            ),
+            Step(
+                "intel_disaster_alerts",
+                "the GDACS alert level of the same events",
+                args=(("event_type", "EQ"),),
+            ),
         ),
         limits=(
-            "Exposure adds up the population of major cities inside the "
-            "radius. It is not a casualty estimate and misses rural people.",
+            "Exposure knows only 105 major cities, each with at least 1.4 "
+            "million people. It is not a casualty estimate and misses everyone "
+            "outside those cities.",
             "Magnitudes and locations are revised in the first hours after an "
             "event; say when you read them.",
         ),
@@ -369,12 +651,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "{europe_country}, and are any tropical cyclones active?"
         ),
         arguments=(
-            PromptArg("us_area", "Two-letter US state code, e.g. TX", default="the United States"),
-            PromptArg("europe_country", "Meteoalarm country, e.g. france", default="Europe"),
+            PromptArg("us_area", "Two-letter US state code, e.g. TX", absent="the United States"),
+            PromptArg("europe_country", "Meteoalarm country, e.g. france", absent="Europe"),
         ),
         steps=(
-            ("intel_weather_alerts", "US National Weather Service alerts (pass area when a state was given)"),
-            ("intel_meteoalarm_alerts", "European warnings (one country per call; without country it lists the countries)"),
+            Step("intel_weather_alerts", "US National Weather Service alerts", args=(("area", "{us_area}"),)),
+            Step(
+                "intel_meteoalarm_alerts",
+                "European warnings, one country per call; without country it "
+                "lists the countries it covers",
+                args=(("country", "{europe_country}"),),
+            ),
             ("intel_cyclones", "Atlantic and eastern and central Pacific storms from the National Hurricane Center"),
             ("intel_jtwc_cyclones", "western Pacific, Indian Ocean and Southern Hemisphere storms from JTWC"),
         ),
@@ -396,19 +683,29 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "region",
                 "FIRMS region: north_america, south_america, europe, africa, "
                 "middle_east, south_asia, east_asia, southeast_asia or oceania",
-                default="all FIRMS regions",
+                absent="all FIRMS regions",
+                choices=_FIRMS_REGIONS,
             ),
         ),
         steps=(
-            ("intel_wildfires", "satellite fire detections (needs NASA_FIRMS_API_KEY)"),
-            ("intel_environmental_events", "category wildfires, for named fires NASA EONET tracks"),
+            Step(
+                "intel_wildfires",
+                "satellite fire detections (needs NASA_FIRMS_API_KEY)",
+                args=(("region", "{region}"),),
+            ),
+            Step(
+                "intel_environmental_events",
+                "named fires NASA EONET tracks",
+                args=(("category", "wildfires"),),
+            ),
             ("intel_climate_anomalies", "temperature and precipitation against the prior year"),
         ),
         limits=(
             "FIRMS detections are satellite heat signatures, not mapped fire "
             "perimeters; one large fire produces many detections.",
-            "Without NASA_FIRMS_API_KEY the fire tool returns an error. Report "
-            "that, not zero fires.",
+            "Without NASA_FIRMS_API_KEY the fire tool returns an error. With a "
+            "key set, a failed fetch can still come back as empty regions. "
+            "Report either as missing data, not zero fires.",
             "Climate anomalies are measured against the prior year, not a "
             "long-term normal.",
         ),
@@ -429,6 +726,8 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "An outage at the same time as a storm does not show the storm "
             "caused it; most outages have local causes.",
+            "An empty outage list can mean that both outage sources failed; "
+            "the tool does not always say so.",
             "Kp runs 0 to 9 on a quasi-logarithmic scale: Kp 8 is far more "
             "than twice Kp 4.",
         ),
@@ -452,9 +751,18 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ),
         ),
         steps=(
-            ("intel_migration_history", "country {country}, role {role}"),
-            ("intel_migration_flows", "the latest year's corridors with {country} as origin or destination"),
-            ("intel_displacement_summary", "the global totals for context"),
+            Step(
+                "intel_migration_history",
+                "the yearly record",
+                args=(("country", "{country}"), ("role", "{role}")),
+            ),
+            Step(
+                "intel_migration_flows",
+                "the latest year's largest corridors out of {country}; for the "
+                "host view call it with destination {country} instead",
+                args=(("origin", "{country}"),),
+            ),
+            ("intel_displacement_summary", "UNHCR's global displacement totals, for context"),
         ),
         limits=(
             "UNHCR figures are year-end stocks (people displaced at the end of "
@@ -472,9 +780,18 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "in displacement in {year}, and how does that compare with net "
             "migration from all causes?"
         ),
-        arguments=(PromptArg("year", "Reporting year", default="the latest year with data"),),
+        arguments=(
+            PromptArg(
+                "year", "Reporting year", absent="the latest year with data",
+                kind="int", minimum=1951, maximum=2100,
+            ),
+        ),
         steps=(
-            ("intel_migration_surges", "largest increases and decreases (pass year if one was given)"),
+            Step(
+                "intel_migration_surges",
+                "the largest increases and decreases against the year before",
+                args=(("year", "{year}"),),
+            ),
             ("intel_net_migration", "World Bank net migration for the leading countries"),
             ("intel_humanitarian_summary", "HDX crisis datasets for the leading origins"),
         ),
@@ -501,12 +818,25 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "region",
                 "global, conus, north_america, europe, middle_east or east_asia",
                 default="global",
+                choices=_JET_REGIONS,
             ),
         ),
         steps=(
-            ("intel_jet_cohort_snapshot", "cohort {cohort}, region {region}; also builds the tracked cohort"),
-            ("intel_jet_activity_anomaly", "the latest half-hour against the same slot on earlier weeks"),
-            ("intel_jet_excess_origins", "only if an excess is flagged: where the extra departures came from"),
+            Step(
+                "intel_jet_cohort_snapshot",
+                "the current picture; this call also builds the tracked cohort",
+                args=(("cohort", "{cohort}"), ("region", "{region}")),
+            ),
+            Step(
+                "intel_jet_activity_anomaly",
+                "the latest half-hour against the same slot on earlier weeks",
+                args=(("cohort", "{cohort}"), ("region", "{region}")),
+            ),
+            Step(
+                "intel_jet_excess_origins",
+                "only if step 2 flags an excess: where the extra departures came from",
+                args=(("cohort", "{cohort}"), ("region", "{region}")),
+            ),
             ("intel_military_flights", "for the military cohort, a second source of positions"),
         ),
         limits=(
@@ -570,19 +900,25 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             PromptArg(
                 "resource",
                 "An ASN or prefix to check, e.g. AS3333",
-                default="none given (skip the BGP check)",
+                absent="no ASN or prefix",
             ),
         ),
         steps=(
             ("intel_internet_outages", "outages over the last 7 days; keep those in {country}"),
-            ("intel_bgp_status", "routing visibility for resource {resource}"),
-            ("intel_cable_health", "the condition of the cable corridors"),
+            Step(
+                "intel_bgp_status",
+                "routing visibility for that network",
+                args=(("resource", "{resource}"),),
+                only_if="resource",
+            ),
+            ("intel_cable_health", "the condition of the six cable corridors"),
             ("intel_cascade_analysis", "which countries depend on an at-risk corridor"),
         ),
         limits=(
-            "An empty outage list can mean the sources returned nothing. "
-            "Check for a note field and the source health resource before "
-            "calling {country} connected.",
+            "An empty outage list, an all-clear corridor reading or zero "
+            "cable warnings can each be a failed fetch: when the warning feed "
+            "is down every corridor reads clear. Check "
+            "intel://guide/source-health before calling {country} connected.",
             "Cascade analysis is a simulation over curated cable "
             "dependencies, not a measurement of a real outage.",
             "BGP status checks one ASN or prefix at a time; it is not a "
@@ -612,15 +948,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "and is shipping stress rising in markets?"
         ),
         steps=(
-            ("intel_vessel_snapshot", "warning-based scores for 9 strategic waterways"),
-            ("intel_nav_warnings", "the warning texts behind the scores"),
+            ("intel_vessel_snapshot", "a warning-based status for the nine strategic waterways"),
+            ("intel_nav_warnings", "the warning texts behind the status"),
             ("intel_trade_routes", "what share of oil and trade each chokepoint carries"),
             ("intel_shipping_index", "a stress score from shipping-linked ETF and equity prices"),
         ),
         limits=(
-            "The vessel snapshot scores navigational warnings; it does not "
-            "count ships. Warnings are not yet filtered by distance to each "
-            "waterway, so read the warnings themselves before naming one.",
+            "The vessel snapshot counts navigational warnings, not ships. All "
+            "nine waterways share one score: naval_warnings counts naval "
+            "keywords across the whole warning feed, not near each waterway, "
+            "so read the warnings themselves before naming a waterway.",
+            "When the warning feed fails, every waterway reads clear with zero "
+            "warnings. An all-clear snapshot is unconfirmed until "
+            "intel_nav_warnings returns warnings.",
             "The shipping stress score is a market proxy, not a freight rate.",
         ),
     ),
@@ -635,39 +975,60 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         arguments=(
             PromptArg("name", "A name for the area", required=True),
-            PromptArg("lat", "Centre latitude in degrees", required=True),
-            PromptArg("lon", "Centre longitude in degrees", required=True),
-            PromptArg("radius_km", "Radius in kilometres", required=True),
+            PromptArg("lat", "Centre latitude in degrees", required=True, kind="number", minimum=-90, maximum=90),
+            PromptArg("lon", "Centre longitude in degrees", required=True, kind="number", minimum=-180, maximum=180),
+            PromptArg("radius_km", "Radius in kilometres", required=True, kind="number", minimum=1, maximum=2000),
         ),
         steps=(
-            ("intel_aoi_define", "name {name}, lat {lat}, lon {lon}, radius_km {radius_km}"),
-            ("intel_aoi_brief", "the cited picture inside {name} today"),
-            ("intel_aoi_changes", "the first run records a baseline for {name}"),
+            Step(
+                "intel_aoi_define",
+                "saves the area",
+                args=(("name", "{name}"), ("lat", "{lat}"), ("lon", "{lon}"), ("radius_km", "{radius_km}")),
+            ),
+            Step("intel_aoi_brief", "the cited picture inside {name} today", args=(("name", "{name}"),)),
+            Step(
+                "intel_aoi_changes",
+                "the first call records a baseline for {name}",
+                args=(("name", "{name}"),),
+            ),
         ),
         limits=(
             "The first change check records a baseline and claims nothing "
             "entered or left.",
             "A domain that fails is listed in data_gaps and left out of the "
             "diff. Never read it as everything leaving.",
-            "Change history between your own calls exists only while the "
-            "collector daemon runs its AOI sweeps.",
+            "Each intel_aoi_changes call compares with the snapshot saved by "
+            "the call before it (yours or a collector AOI sweep) and then "
+            "replaces that snapshot.",
         ),
     ),
     ResearchPrompt(
         name="aoi-review",
         title="What changed in a watched area",
         domain="aoi",
-        question="What entered or left {name} since the last sweep, and is the area escalating?",
+        question="What entered or left {name} since the last snapshot, and is the area escalating?",
         arguments=(PromptArg("name", "The AOI name", required=True),),
         steps=(
-            ("intel_aoi_list", "confirm {name} exists and see its shape"),
-            ("intel_aoi_changes", "new, departed and unchanged items since the last sweep"),
-            ("intel_aoi_escalation", "the escalation score and its components for {name}"),
-            ("intel_aoi_brief", "cited detail behind any change worth reporting"),
+            ("intel_aoi_list", "confirm {name} is among the defined areas of interest and see its shape"),
+            Step(
+                "intel_aoi_changes",
+                "new, departed and unchanged items since the previous snapshot, "
+                "and previous_taken_at, when that snapshot was saved",
+                args=(("name", "{name}"),),
+            ),
+            Step(
+                "intel_aoi_escalation",
+                "the escalation score and its components for {name}",
+                args=(("name", "{name}"),),
+            ),
+            Step("intel_aoi_brief", "cited detail behind any change worth reporting", args=(("name", "{name}"),)),
         ),
         limits=(
-            "Changes are relative to the previous sweep, whenever that ran; "
-            "give its time.",
+            "Changes are relative to the previous snapshot, whenever it was "
+            "saved; give previous_taken_at.",
+            "Every intel_aoi_changes call saves a new snapshot. Call it once: a "
+            "retried call compares with the snapshot the first call just saved "
+            "and reports that nothing changed.",
             "News for an AOI is found by place name near its centre, so a "
             "nearby place with the same name can leak in.",
         ),
@@ -683,11 +1044,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         arguments=(PromptArg("topic", "Search terms for the story", required=True),),
         steps=(
-            ("intel_gdelt_search", "query {topic}, mode timelinevol for volume over time, then artlist for articles"),
+            Step(
+                "intel_gdelt_search",
+                "coverage volume over time",
+                args=(("query", "{topic}"), ("mode", "timelinevol")),
+            ),
+            Step("intel_gdelt_search", "the articles themselves", args=(("query", "{topic}"), ("mode", "artlist"))),
             ("intel_news_clusters", "the clusters of related stories in the RSS set"),
             ("intel_news_feed", "the latest items from the RSS feeds"),
         ),
         limits=(
+            "Report the timelinevol series as GDELT returns it and compare it "
+            "with itself over time. Do not state a unit for it or call it an "
+            "article count.",
             "Coverage volume measures attention, not truth or importance.",
             "The RSS set is a fixed list of feeds. A story missing there may "
             "still be covered elsewhere.",
@@ -698,12 +1067,27 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         title="Upcoming elections and the signals around them",
         domain="politics",
         question="Which elections are coming up in {country}, and what do current signals show around them?",
-        arguments=(PromptArg("country", "ISO-3 code or country name", default="all countries"),),
+        arguments=(PromptArg("country", "ISO alpha-3 country code, e.g. FRA", absent="all countries"),),
         steps=(
-            ("intel_election_calendar", "upcoming elections and their proximity risk"),
-            ("intel_country_dossier", "economy, sanctions, news and conflict context for a named country"),
+            Step(
+                "intel_election_calendar",
+                "upcoming elections and their proximity risk",
+                args=(("country", "{country}"),),
+            ),
+            Step(
+                "intel_country_dossier",
+                "economy, sanctions, news and conflict context. It knows only "
+                "the 50 countries in its own table and returns an error for others",
+                args=(("country", "{country}"),),
+                only_if="country",
+            ),
             ("intel_social_signals", "discussion velocity on the tracked subreddits"),
-            ("intel_prediction_markets", "active Polymarket questions; keep the ones about this election"),
+            (
+                "intel_prediction_markets",
+                "the 20 active Polymarket questions with the most 24-hour "
+                "volume. It has no topic filter, so most will be about other "
+                "things: keep any about this election and say so if there are none",
+            ),
         ),
         limits=(
             "Proximity risk rises as an election nears; it is a stated "
@@ -719,12 +1103,23 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="Does {query} appear on the US Treasury OFAC SDN list, and under which programs?",
         arguments=(PromptArg("query", "Name to search for", required=True),),
         steps=(
-            ("intel_sanctions_search", "query {query}"),
-            ("intel_company_profile", "only if the name is a listed company: who it is"),
+            Step("intel_sanctions_search", "name matches on the SDN list", args=(("query", "{query}"),)),
+            Step(
+                "intel_company_profile",
+                "only if a match is a listed company: who it is",
+                args=(("query", Fill("the matched company's name or ticker")),),
+            ),
         ),
         limits=(
+            "If total_entities is 0, the list could not be read. That is a "
+            "failed search, not a clean result.",
+            "Only the primary name of each entry is searched, not its "
+            "aliases, so a listed party under another spelling will not match.",
+            "Results stop at the limit (default 50): a count equal to the "
+            "limit means more names matched.",
             "Matching is by substring on names. A name match is not an "
-            "identity match, and this is not a compliance screening service.",
+            "identity match, and this is not a compliance screening service. "
+            "Never answer that a party is not sanctioned.",
             "The SDN list changes. Say when you searched.",
         ),
     ),
@@ -736,7 +1131,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             ("intel_disease_outbreaks", "WHO, ProMED and CIDRAP outbreak reports"),
             ("intel_humanitarian_summary", "crisis datasets for the affected countries"),
-            ("intel_news_feed", "recent coverage, for context only"),
+            ("intel_news_feed", "recent news coverage, for context only"),
         ),
         limits=(
             "Outbreak reports arrive after cases occur and case counts are "
@@ -756,18 +1151,41 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         arguments=(
             PromptArg("topic", "Natural language topic", required=True),
-            PromptArg("hours", "How far back to search, in hours", default="168"),
+            PromptArg(
+                "hours", "How far back to search, in hours", default="168",
+                kind="int", minimum=1, maximum=87600,
+            ),
         ),
         steps=(
-            ("intel_domain_summary", "hours {hours}: what is stored, per category, with the earliest timestamp"),
-            ("intel_semantic_search", "query {topic}, hours {hours}"),
+            Step(
+                "intel_domain_summary",
+                "what is stored per category in your window, with the earliest "
+                "timestamp inside that window",
+                args=(("hours", "{hours}"),),
+            ),
+            Step(
+                "intel_domain_summary",
+                "the same over ten years: its earliest timestamps show when "
+                "storage began for each category",
+                args=(("hours", 87600),),
+            ),
+            Step(
+                "intel_semantic_search",
+                "the stored entries closest in wording to the topic",
+                args=(("query", "{topic}"), ("hours", "{hours}")),
+            ),
             ("intel_timeline", "the stored entries in time order for the matching domain"),
-            ("intel_similar_events", "earlier stored entries that resemble the strongest match"),
+            Step(
+                "intel_similar_events",
+                "earlier stored entries that resemble the strongest match",
+                args=(("text", Fill("the text of the strongest match from step 3")),),
+            ),
         ),
         limits=(
             "History exists only for what the collector stored while it was "
-            "running. Before calling anything the first or the largest, check "
-            "the earliest stored timestamp.",
+            "running. The earliest timestamp in step 1 is only the earliest "
+            "inside your window; use step 2 before calling anything the first "
+            "or the largest.",
             "Semantic search ranks by similarity of wording. A high score is "
             "not a factual match.",
             "If the vector store is not available these tools return an "
@@ -784,10 +1202,28 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         arguments=(_ISO3,),
         steps=(
-            ("intel_country_dossier", "country {country}"),
-            ("intel_instability_index", "country_code {country}, with its four components"),
-            ("intel_signal_summary", "signals for the country (this tool takes the country name)"),
-            ("intel_country_stocks", "country {country}, its main index"),
+            Step(
+                "intel_country_dossier",
+                "economy, elections, sanctions, news and conflict. It knows only "
+                "the 50 countries in its own table and returns an error for others",
+                args=(("country", "{country}"),),
+            ),
+            Step(
+                "intel_instability_index",
+                "the index with its four components",
+                args=(("country_code", "{country}"),),
+            ),
+            Step(
+                "intel_signal_summary",
+                "active signals; this tool takes the country's name, not its code",
+                args=(("country", Fill("the country's English name")),),
+            ),
+            Step(
+                "intel_country_stocks",
+                "its main stock index; countries without a mapped index return "
+                "an error that lists the ones covered",
+                args=(("country", "{country}"),),
+            ),
         ),
         limits=(
             "The instability index is a weighted composite with country "

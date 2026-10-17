@@ -357,8 +357,7 @@ class Fetcher:
         if isinstance(value, dict):
             value["_stale"] = True
             value["_stale_age_seconds"] = round(age_seconds, 1)
-        else:
-            self.breaker.record_stale_serve(source)
+        self.breaker.record_stale_serve(source)
         return value
 
     async def _source_throttle(self, source: str) -> None:

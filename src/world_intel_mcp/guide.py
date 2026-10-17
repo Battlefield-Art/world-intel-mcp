@@ -3,18 +3,20 @@
 A model connecting to this server sees 139 tools and, before this module,
 nothing else: no map of which tool answers which question, and no
 statement of what the data cannot support. The guide fills that gap with
-three read-only resources and a set of worked research prompts
-(``guide_prompts.py``):
+three read-only resources, a set of worked research prompts
+(``guide_prompts.py``) and the server's ``instructions`` at initialize:
 
 - ``intel://guide``: how to ask a strong question, what an answer
   contains, what this server will not do, the prompts, and every
-  registered tool grouped by its domain module. The tool list is built
-  from the live registry (``tools._MODULES``) on every read, so it cannot
-  drift from what ``tools/list`` serves.
-- ``intel://guide/source-health``: circuit breakers, cache freshness and
-  which keyed sources have their environment variables set. It reads
-  in-process state and the cache database only; reading it never starts
-  a fetch.
+  registered tool grouped by its domain module, with the environment
+  variables a tool cannot work without. The tool list is built from the
+  live registry (``tools._MODULES``) on every read, so it cannot drift
+  from what ``tools/list`` serves.
+- ``intel://guide/source-health``: circuit breakers, stale serves, cache
+  freshness and which keyed sources have their environment variables
+  set, with a one-line verdict that says when there is nothing to go on
+  yet. It reads in-process state and the cache database only; reading it
+  never starts a fetch, and an unreadable cache is reported, not raised.
 - ``intel://guide/measures``: a glossary of the measures the tools
   return and the mistakes they invite.
 
@@ -24,11 +26,16 @@ Gaps / not covered:
   so in its ``scope`` field.
 - ``keyed_sources`` reports whether a variable is set, not whether the
   key is valid or within quota.
+- A cache file moved or deleted while the server holds it open keeps
+  answering from the open handle; source health cannot tell.
+- The guide's count of tools that return no failure marker under a total
+  outage is a measurement of one commit; it is not recomputed at runtime.
 """
 
 import json
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +61,18 @@ GUIDE_URI = "intel://guide"
 HEALTH_URI = "intel://guide/source-health"
 MEASURES_URI = "intel://guide/measures"
 
+# Sent as ``instructions`` at initialize (server.py), so a client that
+# never lists resources still learns the guide exists.
+SERVER_INSTRUCTIONS = (
+    "Read the intel://guide resource before your first tool call: it maps "
+    "research questions to tools, says what the data cannot support, and "
+    "marks the tools that need an API key. prompts/list has worked research "
+    "prompts. intel://guide/source-health shows which sources are failing, "
+    "serving stale copies or missing keys. Not every tool marks a failure: "
+    "an empty list or a zero can mean a source failed, not that nothing "
+    "happened."
+)
+
 # Display names for the domain modules under tools/. A module missing
 # here still appears in the guide, titled from its module name.
 _DOMAIN_TITLES = {
@@ -77,38 +96,47 @@ class KeyedSource:
     source: str
     env: tuple[str, ...]
     without_key: str
+    # Tools that return an error naming these variables when they are not
+    # set. The guide's tool list marks them "[needs ...]".
+    needed_by: tuple[str, ...] = ()
 
 
-# Every credential-like variable the source modules read. A test scans
-# sources/*.py and fails when a variable is read there but missing here,
-# or listed here but no longer read.
+# Every credential-like variable the package reads. A test scans every
+# module outside tests/ and fails when a variable is read there but
+# missing here, or listed here but no longer read.
 KEYED_SOURCES: tuple[KeyedSource, ...] = (
     KeyedSource(
         "ACLED",
         ("ACLED_EMAIL", "ACLED_PASSWORD"),
         "ACLED event, unrest and risk tools return an error naming the missing credentials.",
+        needed_by=("intel_acled_events", "intel_unrest_events", "intel_risk_scores"),
     ),
     KeyedSource(
         "UCDP",
         ("UCDP_ACCESS_TOKEN",),
-        "Requests go out without a token. The UCDP source module notes the API "
-        "has required one since 2026, so expect errors.",
+        "intel_ucdp_events still sends the request; the API refuses it, and the "
+        "tool returns an error with reason ucdp_unconfigured.",
+        needed_by=("intel_ucdp_events",),
     ),
     KeyedSource(
         "NASA FIRMS",
         ("NASA_FIRMS_API_KEY",),
         "intel_wildfires returns an error.",
+        needed_by=("intel_wildfires",),
     ),
     KeyedSource(
         "EIA",
         ("EIA_API_KEY",),
         "Energy prices, residential natural gas and electricity rates return an error.",
+        needed_by=("intel_energy_prices", "intel_residential_natgas", "intel_electricity_rates"),
     ),
     KeyedSource(
         "FRED",
         ("FRED_API_KEY",),
         "intel_fred_series returns an error; the yield curve falls back to four Yahoo "
-        "maturities (no 2s10s spread); central bank rates use a curated table.",
+        "maturities with no 2s10s spread and no observation dates; central bank rates "
+        "come only from a hand-kept table dated 2024-11 to 2025-02.",
+        needed_by=("intel_fred_series",),
     ),
     KeyedSource(
         "Cloudflare Radar",
@@ -124,13 +152,19 @@ KEYED_SOURCES: tuple[KeyedSource, ...] = (
         "TomTom",
         ("TOMTOM_API_KEY",),
         "Traffic flow and incident tools return an error.",
+        needed_by=("intel_traffic_flow", "intel_traffic_incidents"),
     ),
     KeyedSource(
         "Windy Webcams",
         ("WINDY_API_KEY",),
         "intel_webcams returns an error.",
+        needed_by=("intel_webcams",),
     ),
 )
+
+_NEEDS: dict[str, tuple[str, ...]] = {
+    tool: ks.env for ks in KEYED_SOURCES for tool in ks.needed_by
+}
 
 
 @dataclass(frozen=True)
@@ -184,7 +218,12 @@ def _arg_list(tool: Any) -> str:
 def tool_line(tool: Any) -> str:
     args = _arg_list(tool)
     args_part = f" [{args}]" if args else ""
-    return f"- `{tool.name}`{args_part}: {_one_line(tool.description or '')}"
+    # Only the first sentence of a description is shown, which can drop
+    # its "Requires ..." sentence; the key requirement comes from
+    # KEYED_SOURCES instead.
+    needs = _NEEDS.get(tool.name)
+    needs_part = f" [needs {', '.join(needs)}]" if needs else ""
+    return f"- `{tool.name}`{args_part}: {_one_line(tool.description or '')}{needs_part}"
 
 
 _GUIDE_INTRO = """\
@@ -217,16 +256,21 @@ with none of them invites a story.
 
 - Values as the sources published them. Most responses name their source
   and carry a fetch timestamp; the date a value describes is often earlier
-  than the fetch, so give both.
-- Failures as failures. A source that is down or not configured returns
-  an `error` field; composite tools list each domain they could not
-  measure in `data_gaps`. Neither is ever an empty success.
+  than the fetch, so give both. Some tools return no observation date at
+  all; say so rather than using the fetch time.
+- Failures, most of the time. Many tools return `error`, `degraded` or
+  `data_gaps` when a source is down or not configured. Not all do: some
+  return empty lists, zero counts or a neutral score when every upstream
+  request failed (measured 2026-10-17 with every request forced to fail:
+  53 of the 85 tools that call a source). Read an empty list or a zero
+  count as nothing returned, not nothing happened, and confirm with a
+  second tool before calling a place quiet.
 - Citations. Briefs and digests number their sources.
-- Old copies marked as old where the shape allows. When a live fetch fails
-  and an older cached copy exists, dictionary responses carry `_stale` and
-  `_stale_age_seconds`. Tools that reshape a response do not always pass
-  that marker through, so check stale serves in the source-health
-  resource.
+- Old copies, counted. When a live fetch fails and an older cached copy
+  exists, that copy is served. Dictionary responses carry `_stale` and
+  `_stale_age_seconds`, but tools that reshape a response do not always
+  pass the marker through. `stale_serves` in the source-health resource
+  counts every stale copy this process served, per source.
 
 ## What this server will not do
 
@@ -239,8 +283,11 @@ with none of them invites a story.
 - Show history it did not record. Stored history (semantic search,
   timelines, baselines, area change detection) exists only for the time
   the collector or server was running and storing.
-- Use keyed sources without their keys. Those tools return an error
-  naming the variable; `intel://guide/source-health` shows which are set.
+- Use keyed sources without their keys. Tools marked [needs ...] in the
+  list below return an error naming the variable when it is not set; a
+  few others fall back to a keyless source with less detail.
+  `without_key` in the source-health resource says which, and whether
+  each variable is set.
 - See what its sources do not publish. Aircraft without a broadcast
   position, unlisted outlets, and regions outside a feed's coverage are
   absent, which is not the same as quiet.
@@ -255,8 +302,8 @@ def render_guide(modules: list | None = None, prompts: tuple = PROMPTS) -> str:
     parts = [
         _GUIDE_INTRO.format(tools=total, domains=len(groups), prompts=len(prompts)),
         "## Worked research prompts\n",
-        "Each prompt names the tools to call and the limits to respect. "
-        "Fetch one with prompts/get.\n",
+        "Each prompt names the tools to call, the arguments to pass and the "
+        "limits to respect. Fetch one with prompts/get.\n",
     ]
     for p in prompts:
         args = ", ".join(
@@ -324,7 +371,7 @@ which a series is before comparing.
 A value fetched today can describe last month or last year; annual
 datasets such as World Bank indicators often trail by a year or more.
 Report the observation date. The fetch time only tells you how fresh the
-copy is.
+copy is. Some tools return no observation date; say so.
 
 ## Revisions
 
@@ -350,10 +397,14 @@ information their inputs do not. Report the components with the score.
 
 ## Missing data is not zero
 
-A source that failed, is not configured, or does not cover a place
-returns an error, a note or a `data_gaps` entry. That means unknown, not
-none. Zero events in a region a source covers is a measurement; zero
-events in a region it does not cover is nothing at all.
+Many tools report a source that failed, is not configured, or does not
+cover a place with an error, a note or a `data_gaps` entry. That means
+unknown, not none. Not every tool does: some return an empty list, a
+zero count or a neutral score when every upstream request failed, so an
+empty list or a zero means nothing was returned, not that nothing
+happened. Zero events from a fetch that worked, in a region the source
+covers, is a measurement; zero events in a region it does not cover is
+nothing at all.
 """
 
 
@@ -361,14 +412,69 @@ _HEALTH_SCOPE = (
     "circuit_breakers covers requests made by this server process since it "
     "started; the collector, dashboard and CLI keep their own. An empty map "
     "means no requests yet, not that every source is healthy.",
-    "cache_freshness reads the shared cache database: the newest entry per "
-    "key prefix, written by whichever process fetched it. A fresh entry shows "
-    "a recent successful fetch, not that the collector is on schedule.",
+    "stale_serves counts, per source, the stale cached copies this process "
+    "served when a live fetch failed, whatever the payload type.",
+    "cache_freshness reads the cache database: the newest entry per key "
+    "prefix, written by whichever process fetched it. A fresh entry shows a "
+    "recent successful fetch, not that the collector is on schedule.",
+    "cache.requested_path is the database this process was configured to "
+    "use; when it could not be opened, cache.fell_back is true and db_path "
+    "is a temporary database that no other process shares. "
+    "cache.available is false when the database could not be read at all.",
     "keyed_sources says whether each variable is set in this server's "
     "environment. It never shows values and does not check that a key works.",
     "Not read here: vector store statistics (intel_vector_stats) and the "
     "collector's run history. Reading this resource starts no fetches.",
 )
+
+
+def _read_cache(cache: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Cache statistics and per-prefix freshness, or why they are unreadable.
+
+    A broken database (table missing, file corrupt, disk error) becomes
+    ``available: false`` with the error text, so the rest of the health
+    snapshot still reaches the caller.
+    """
+    paths = {
+        "db_path": str(cache.db_path),
+        "requested_path": str(cache.requested_path),
+        "fell_back": cache.fell_back,
+    }
+    try:
+        stats = cache.stats()
+        by_prefix = cache.freshness()
+    except (sqlite3.Error, OSError) as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}", **paths}, None
+    return {"available": True, **stats, **paths}, by_prefix
+
+
+def _verdict(breakers: dict[str, Any], cache_info: dict[str, Any]) -> str:
+    entries = cache_info.get("total_entries") or 0
+    if not breakers and not entries:
+        state = "is empty" if cache_info["available"] else "could not be read"
+        verdict = (
+            "no information yet: this process has made no requests since it "
+            f"started and the cache {state}, so nothing here shows whether any "
+            "source works"
+        )
+    elif not breakers:
+        verdict = (
+            "cache only: this process has made no requests since it started; "
+            "cache_freshness shows what any process sharing the cache fetched last"
+        )
+    else:
+        unavailable = sum(1 for info in breakers.values() if info.get("status") != "closed")
+        noun = "source" if len(breakers) == 1 else "sources"
+        verdict = (
+            f"{len(breakers)} {noun} called by this process, {unavailable} "
+            "with an open or half-open circuit breaker"
+        )
+    if cache_info["fell_back"]:
+        verdict += (
+            "; the configured cache could not be opened, so this process uses "
+            "a temporary cache of its own"
+        )
+    return verdict
 
 
 def source_health(
@@ -380,7 +486,7 @@ def source_health(
     """Read-only health snapshot from in-process state and the cache DB."""
     env = os.environ if environ is None else environ
     breakers = breaker.status()
-    freshness = cache.freshness()
+    cache_info, freshness = _read_cache(cache)
     keyed = []
     for ks in KEYED_SOURCES:
         set_vars = [name for name in ks.env if env.get(name)]
@@ -396,6 +502,7 @@ def source_health(
     generated = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
     return {
         "generated_at": generated.isoformat(),
+        "verdict": _verdict(breakers, cache_info),
         "scope": list(_HEALTH_SCOPE),
         "open_breakers": sorted(
             name for name, info in breakers.items() if info.get("status") != "closed"
@@ -405,11 +512,11 @@ def source_health(
             for name, info in sorted(breakers.items())
             if info.get("total_stale_serves")
         },
-        "stale_cache_prefixes": sorted(
-            prefix for prefix, info in freshness.items() if info.get("is_stale")
-        ),
+        "stale_cache_prefixes": None
+        if freshness is None
+        else sorted(prefix for prefix, info in freshness.items() if info.get("is_stale")),
         "circuit_breakers": breakers,
-        "cache": cache.stats(),
+        "cache": cache_info,
         "cache_freshness": freshness,
         "keyed_sources": keyed,
     }
@@ -488,7 +595,7 @@ def list_prompts() -> list[Prompt]:
             title=p.title,
             description=p.description,
             arguments=[
-                PromptArgument(name=a.name, description=a.description, required=a.required)
+                PromptArgument(name=a.name, description=a.help, required=a.required)
                 for a in p.arguments
             ],
         )

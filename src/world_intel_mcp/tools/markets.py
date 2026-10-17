@@ -158,7 +158,7 @@ TOOLS: list[Tool] = [
     # --- BTC Technicals (1 tool) ---
     Tool(
         name="intel_btc_technicals",
-        description="Bitcoin technical indicators: SMA-50, SMA-200, Mayer Multiple, golden/death cross, distance from ATH, 7d/30d changes.",
+        description="Bitcoin technical indicators: SMA-50, SMA-200, Mayer Multiple, golden/death cross, distance from the highest daily price of the last 200 days (ath_in_period, not the all-time high), 7d/30d changes.",
         inputSchema={"type": "object", "properties": {}},
     ),
     # --- Central Banks (1 tool) ---

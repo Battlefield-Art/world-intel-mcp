@@ -47,7 +47,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_risk_scores",
-        description="Get country risk scores computed from ACLED conflict data vs historical baselines. Requires ACLED_ACCESS_TOKEN.",
+        description="Get country risk scores computed from ACLED conflict data vs historical baselines. Requires ACLED_EMAIL and ACLED_PASSWORD.",
         inputSchema={
             "type": "object",
             "properties": {

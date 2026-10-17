@@ -179,7 +179,7 @@ cannot support, before it calls anything.
 | Resource | Type | What it holds |
 |----------|------|---------------|
 | `intel://guide` | Markdown | How to ask a strong question (name the period, the comparison, the measure and the place), what an answer contains, what this server will not do, the worked prompts, and every tool grouped by domain. Built from the live tool registry on each read, so it always matches `tools/list`. |
-| `intel://guide/source-health` | JSON | Open circuit breakers, stale serves, cache freshness per source prefix, and which keyed sources have their variables set (names only, never values). Reading it starts no fetch. Breaker state covers this server process only; the collector keeps its own. |
+| `intel://guide/source-health` | JSON | Open circuit breakers, stale serves, cache freshness per source prefix, and which keyed sources have their variables set (names only, never values). Reading it starts no fetch. Breaker state covers this server process only; the collector keeps its own. A `verdict` line says when there is nothing to go on yet (no requests made and an empty cache). A cache that cannot be read is reported as `cache.available: false` with the error, next to the rest of the snapshot, and `cache.requested_path` and `cache.fell_back` show when the configured database could not be opened and a temporary one is in use. |
 | `intel://guide/measures` | Markdown | Amount outstanding versus flow, growth versus acceleration, percentage points, seasonal adjustment, observation versus publication versus collection dates, revisions, correlation and timing offsets, composite scores, and why missing data is not zero. |
 
 **29 prompts**, each a worked research question that names the tools to
@@ -207,16 +207,28 @@ required):
 `prompts/get` with `conflict-trend` and `{"country": "Sudan"}` returns one
 user message: the question with Sudan and the default 30-day window
 filled in, the numbered tools (`intel_ucdp_events`, `intel_acled_events`,
-`intel_unrest_events`) with what each call is for, the limits (recent
-days are the least complete; count events and fatalities separately;
-compare each source only with itself), and the shape of a complete
-answer. A missing required argument, an unknown argument or an unknown
+`intel_unrest_events`) with the arguments to pass and what each call is
+for, the limits (recent days are the least complete; count events and
+fatalities separately; compare each source only with itself), and the
+shape of a complete answer. A missing required argument, an unknown
+argument, a number outside its range (latitude -90 to 90, longitude -180
+to 180, an AOI radius of 1 to 2000 km), a value outside an argument's
+list, a value that names a tool the prompt does not call, or an unknown
 prompt is an `invalid params` error, never a guess. The tests fail if a
-prompt names a tool that is not registered, or if the guide leaves out a
-registered tool.
+prompt names a tool that is not registered, passes an argument the
+tool's schema does not take (wrong name, type or listed value), cites an
+output field the code does not produce, describes a step in words that
+share nothing with the called tool's own description, or if the guide
+leaves out a registered tool. Tools that cannot work without an API key carry a
+`[needs VARIABLE]` mark in the guide's tool list.
 
 From the shell, `intel guide` prints the same guide markdown and
-`intel guide --measures` prints the glossary.
+`intel guide --measures` prints the glossary. `intel guide` builds its
+tool list from the live registry, so it opens the cache database and
+creates it on first run (`~/.cache/world-intel-mcp/cache.db`, or the
+path set by `WORLD_INTEL_CACHE_DB` or `XDG_CACHE_HOME`). Starting the CLI
+at all, `intel --help` and `intel guide --measures` included, creates
+`~/.cache/world-intel-mcp/temporal.db` under your home directory.
 
 ---
 
@@ -767,13 +779,19 @@ The vector store uses FastEmbed (ONNX-based, BAAI/bge-small-en-v1.5) for embeddi
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ACLED_ACCESS_TOKEN` | No | ACLED conflict events |
+| `ACLED_EMAIL` | No | ACLED account email: conflict events, unrest and risk scores (with `ACLED_PASSWORD`) |
+| `ACLED_PASSWORD` | No | ACLED account password (with `ACLED_EMAIL`) |
+| `UCDP_ACCESS_TOKEN` | No | UCDP organized violence events; the UCDP API refuses requests without it |
 | `NASA_FIRMS_API_KEY` | No | Satellite wildfire data |
 | `EIA_API_KEY` | No | Energy price data |
 | `CLOUDFLARE_API_TOKEN` | No | Internet outage data |
 | `FRED_API_KEY` | No | Macro economic data (also used for yield curve) |
 | `OPENSKY_CLIENT_ID` | No | Military flight fallback |
 | `OPENSKY_CLIENT_SECRET` | No | Military flight fallback |
+| `OPENSKY_USERNAME` | No | OpenSky account for the aviation tools (with `OPENSKY_PASSWORD`); requests are anonymous without it |
+| `OPENSKY_PASSWORD` | No | OpenSky account password (with `OPENSKY_USERNAME`) |
+| `TOMTOM_API_KEY` | No | Traffic flow and incidents |
+| `WINDY_API_KEY` | No | Webcams |
 | `OLLAMA_API_URL` | No | Ollama server for AI-generated briefs (default: `http://localhost:11434`) |
 | `OLLAMA_MODEL` | No | Ollama model for AI-generated briefs (default: `llama3.2`) |
 | `WORLD_INTEL_LOG_LEVEL` | No | Logging level (default: INFO) |

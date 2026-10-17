@@ -262,19 +262,25 @@ async def fetch_ucdp_events(
 ) -> dict:
     """Fetch recent conflict events from the UCDP GED API.
 
-    Optionally uses ``UCDP_ACCESS_TOKEN`` if set (required since 2026).
-    Fetches multiple pages in parallel when the dataset spans more than
-    one page.
+    Sends ``UCDP_ACCESS_TOKEN`` when set; the API refuses requests
+    without one (HTTP 401 since 2026). Fetches multiple pages in parallel
+    when the dataset spans more than one page.
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
         days: Only include events whose ``date_start`` is within this
               many days from now.
-        limit: Page size (max 1000 per page).
+        limit: Page size (max 1000 per page). Every page is fetched, so
+               this does not cap the number of events returned.
 
     Returns:
         Dict with events list, count, total fatalities, query params,
-        source, and timestamp.
+        source, and timestamp. When the first page cannot be fetched
+        (no token, a refused token, an outage) it carries ``error``,
+        ``degraded`` and ``reason`` (``ucdp_unconfigured`` or
+        ``ucdp_fetch_failed``) next to the empty events list, the same
+        shape as ACLED's fetch failure, so a failure never reads as zero
+        events.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
@@ -284,20 +290,40 @@ async def fetch_ucdp_events(
     if ucdp_token:
         ucdp_headers["x-ucdp-access-token"] = ucdp_token
 
-    # Fetch page 1 to discover total pages (UCDP is slow — 30s timeout)
+    # Every page, the first included, has its own cache key, and the key
+    # carries the page size: pages of different sizes hold different
+    # events.
+    page_size = min(limit, 1000)
+
+    # Fetch the first page to discover total pages (UCDP is slow — 30s timeout)
     page1_data = await fetcher.get_json(
         _UCDP_GED_URL,
         source="ucdp",
-        cache_key=f"conflict:ucdp:{days}:page1",
+        cache_key=f"conflict:ucdp:{days}:{page_size}:page0",
         cache_ttl=21600,
-        params={"pagesize": min(limit, 1000), "page": 0},
+        params={"pagesize": page_size, "page": 0},
         headers=ucdp_headers or None,
         timeout=30.0,
     )
 
     if page1_data is None:
-        logger.warning("UCDP GED API returned no data")
+        if ucdp_token:
+            reason = "ucdp_fetch_failed"
+            error = (
+                "UCDP fetch failed (token refused, rate limited, API error, "
+                "or malformed response)"
+            )
+        else:
+            reason = "ucdp_unconfigured"
+            error = (
+                "UCDP_ACCESS_TOKEN is not set and the request failed; the UCDP "
+                "API refuses requests without a token"
+            )
+        logger.warning("UCDP GED API returned no data (%s)", reason)
         return {
+            "error": error,
+            "degraded": True,
+            "reason": reason,
             "events": [],
             "count": 0,
             "total_fatalities_best": 0,
@@ -315,9 +341,9 @@ async def fetch_ucdp_events(
             fetcher.get_json(
                 _UCDP_GED_URL,
                 source="ucdp",
-                cache_key=f"conflict:ucdp:{days}:page{p}",
+                cache_key=f"conflict:ucdp:{days}:{page_size}:page{p}",
                 cache_ttl=21600,
-                params={"pagesize": min(limit, 1000), "page": p},
+                params={"pagesize": page_size, "page": p},
                 headers=ucdp_headers or None,
                 timeout=30.0,
             )

@@ -137,34 +137,80 @@ source here, and no proxy is substituted for any of these measures.
 - The server now answers `resources/list`, `resources/read`, `prompts/list`
   and `prompts/get`, and advertises the resources and prompts capabilities
   at initialize. Before this it exposed tools only. No tools were added or
-  changed.
+  removed, and no tool name, parameter or existing response key changed;
+  the corrected tool descriptions and the new UCDP failure fields are
+  listed under Fixed.
+- At initialize the server sends `instructions` that point a model at
+  `intel://guide` before its first tool call.
 - `intel://guide` (markdown): how to ask a strong question (period,
   comparison, measure, place), what an answer contains, what this server
   will not do, the worked prompts, and every registered tool grouped by
-  domain module. Built from the live registry on every read; a test fails
-  if a registered tool is missing or listed twice.
+  domain module, with a `[needs VARIABLE]` mark on each tool that returns
+  an error without its API key. Built from the live registry on every
+  read; a test fails if a registered tool is missing or listed twice. It
+  says plainly that not every tool marks a failure: with every upstream
+  request forced to fail (measured 2026-10-17), 53 of the 85 tools that
+  call a source returned an empty list, a zero count or a neutral score
+  with no error, `degraded` or `data_gaps` field.
 - `intel://guide/source-health` (JSON): open circuit breakers, stale
   serves, stale cache prefixes, cache freshness, and which keyed sources
-  have their variables set (names only, never values). Reads in-process
-  state and the cache database only; reading it starts no fetch. It says
-  that breaker state covers this server process only. The keyed-source
-  list is checked against the credentials `sources/*.py` actually read.
+  have their variables set (names only, never values), with a `verdict`
+  line that says when there is nothing to go on yet. Reads in-process
+  state and the cache database only; reading it starts no fetch. A cache
+  that cannot be read becomes `cache.available: false` with the error,
+  and the rest of the snapshot is still returned. It says that breaker
+  state covers this server process only. The keyed-source list is checked
+  against every credential name quoted anywhere in the package.
 - `intel://guide/measures` (markdown): stock versus flow, growth versus
   acceleration, percentage points, seasonal adjustment, the three dates
   (observation, publication, collection), revisions, correlation and
   timing offsets, composite scores, missing data versus zero.
 - 29 prompts across conflict, markets, hazards, migration, aviation, cyber,
   infrastructure, maritime, areas of interest, news, politics, sanctions,
-  health, stored history and country views. Each names the tools to call
-  and the limits to respect; arguments (country, topic, period and so on)
-  are validated, and a missing, unknown or invalid one is an
-  `invalid params` error. A test fails if any prompt names a tool that is
-  not registered.
+  health, stored history and country views. Each names the tools to call,
+  the arguments to pass and the limits to respect. Arguments are
+  validated: numbers and their ranges, listed values, no tool names from
+  outside the prompt, whitespace collapsed so a value stays on its line.
+  A missing, unknown or invalid one is an `invalid params` error. Tests
+  fail if a prompt names a tool that is not registered, passes an argument
+  its schema does not take (name, type, listed value or range), cites an
+  output field the code does not produce, describes a step in words that
+  share nothing with the called tool's description or names a provider
+  that tool does not, or states a count or a table size the code does not
+  match.
 - `intel guide` prints the guide markdown; `intel guide --measures` prints
   the glossary.
-- A test spawns the installed `world-intel-mcp` console script and drives
-  initialize, resources/list, resources/read, prompts/list, prompts/get
-  and tools/list over stdio.
+- Two tests drive initialize, resources/list, resources/read, prompts/list,
+  prompts/get and tools/list over stdio: one against the installed
+  `world-intel-mcp` console script (or `python -m world_intel_mcp.server`
+  where none is installed), one always against the module form. Neither
+  is skipped.
+
+### Fixed
+- `intel_ucdp_events`: a missing token or a refused request (the UCDP API
+  answers 401 without a token) now returns `error`, `degraded: true` and
+  `reason` (`ucdp_unconfigured` or `ucdp_fetch_failed`) next to the empty
+  events list, the same shape as ACLED's fetch failure, instead of reading
+  as zero events. The first page shared a cache key with the second, so a
+  multi-page result repeated the first page in place of the second; every
+  page now has its own key, which also carries the page size.
+- Stale serves are counted for dictionary payloads too (before, only lists
+  and text were counted), so `total_stale_serves` in breaker status and
+  `stale_serves` in source health include every stale copy served.
+- The cache records the database path it was asked to use and whether it
+  fell back to a temporary one (`requested_path`, `fell_back`); source
+  health shows both.
+- `serverInfo.version` at initialize is the package version; it was the
+  MCP SDK's version.
+- Tool descriptions: `intel_acled_events` and `intel_risk_scores` name
+  `ACLED_EMAIL` and `ACLED_PASSWORD`; `intel_ucdp_events` names
+  `UCDP_ACCESS_TOKEN` and all three violence types and says its limit is a
+  page size; `intel_btc_technicals` says its distance is from the highest
+  daily price of the last 200 days, not the all-time high.
+- README environment table: `ACLED_EMAIL` and `ACLED_PASSWORD` replace
+  `ACLED_ACCESS_TOKEN`, which no code reads; added `UCDP_ACCESS_TOKEN`,
+  `TOMTOM_API_KEY`, `WINDY_API_KEY`, `OPENSKY_USERNAME` and
+  `OPENSKY_PASSWORD`.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
