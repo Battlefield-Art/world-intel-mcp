@@ -745,9 +745,11 @@ async def api_migration(request):
 # ``error`` is a 503 with the payload intact, a timeout a 504, an exception a
 # 503 with the reason. None of them answers with an empty list that could
 # read as "nothing happened".
+#
+# No Access-Control-Allow-Origin header: the panel fetches from its own
+# origin, so a page from another site cannot read these answers (the
+# collector run log, the cache database path).
 # ---------------------------------------------------------------------------
-
-_CORS = {"Access-Control-Allow-Origin": "*"}
 
 # The budget /api/stream gives its slow sources. The RSS panels read every
 # feed: 5 to 15 s per call measured 2026-10-17, warm cache included, as a
@@ -802,7 +804,7 @@ async def _research_payload(name: str, coro) -> tuple[dict, int]:
 
 
 def _bad_request(exc: ValueError) -> JSONResponse:
-    return JSONResponse({"error": str(exc)}, status_code=400, headers=_CORS)
+    return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def api_liquidity_board(request):
@@ -823,7 +825,7 @@ async def api_liquidity_board(request):
         "liquidity board", liquidity.fetch_liquidity_board(_ensure_fetcher(), sort=sort)
     )
     payload.setdefault("net_liquidity_method", copy.deepcopy(liquidity.NET_LIQUIDITY_METHOD))
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 async def api_situations(request):
@@ -844,7 +846,7 @@ async def api_situations(request):
     payload, status = await _research_payload(
         "situations", news_signals.fetch_situations(_ensure_fetcher(), **kwargs)
     )
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 async def api_top_stories(request):
@@ -863,7 +865,7 @@ async def api_top_stories(request):
     payload, status = await _research_payload(
         "top stories", news_signals.fetch_top_stories(_ensure_fetcher(), **kwargs)
     )
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 def _history_db_path() -> Path:
@@ -924,9 +926,8 @@ async def api_collection_health(request):
                 "db_path": None if db_path is None else str(db_path),
             },
             status_code=503,
-            headers=_CORS,
         )
-    return JSONResponse(data, status_code=404 if "error" in data else 200, headers=_CORS)
+    return JSONResponse(data, status_code=404 if "error" in data else 200)
 
 
 async def api_health(request):

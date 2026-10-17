@@ -208,7 +208,7 @@ def test_liquidity_board_passes_payload_through_with_the_method_block(client, fe
     calls = _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD)
     r = client.get("/api/liquidity-board")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     # Partial outage (unavailable), stale-cache row and blocked list all stay in the payload.
     assert r.json() == {**_BOARD, "net_liquidity_method": _METHOD}
     assert calls == [(fetcher, {"sort": "biggest_move"})]
@@ -272,7 +272,7 @@ def test_situations_pass_through_with_default_arguments(client, fetcher, monkeyp
     calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
     r = client.get("/api/situations")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     assert r.json() == _SITUATIONS
     assert calls == [(fetcher, {"hours": 24.0, "sort": "covered", "kind": "all", "limit": 20, "min_articles": 2})]
 
@@ -499,7 +499,7 @@ def test_collection_health_reads_the_store_and_returns_the_report_unchanged(clie
     _populate(health_db)
     r = client.get("/api/collection-health")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     body = r.json()
     assert body == _expected(health_db)
     states = {s["source"]: s["state"] for s in body["sources"]}
@@ -577,6 +577,32 @@ def test_collection_health_opens_the_dashboard_cache_database(client, tmp_path, 
     assert r.status_code == 200
     assert r.json() == _expected(db_path)
     assert {s["source"]: s["state"] for s in r.json()["sources"]}["fires"] == "failing"
+
+
+def test_no_research_answer_is_readable_by_another_origin(client, fetcher, monkeypatch, tmp_path, pinned_history) -> None:
+    """The panel fetches from its own origin. No answer of the four routes,
+    success or failure, carries Access-Control-Allow-Origin, so a page from
+    another site cannot read the run log or the cache database path."""
+    _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD_OUTAGE)
+    _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    db_path = tmp_path / "cache.db"
+    _populate(db_path)
+    monkeypatch.setattr(dashboard_app, "_history_db_path", lambda: db_path)
+    origin = {"Origin": "https://other.example"}
+    answers = {
+        path: client.get(path, headers=origin)
+        for path in (
+            "/api/liquidity-board", "/api/liquidity-board?sort=x", "/api/situations",
+            "/api/top-stories", "/api/collection-health", "/api/collection-health?source=nope",
+        )
+    }
+    assert {p: r.status_code for p, r in answers.items()} == {
+        "/api/liquidity-board": 503, "/api/liquidity-board?sort=x": 400, "/api/situations": 200,
+        "/api/top-stories": 200, "/api/collection-health": 200, "/api/collection-health?source=nope": 404,
+    }
+    leaking = [p for p, r in answers.items() if any(h.startswith("access-control-") for h in r.headers)]
+    assert leaking == []
 
 
 def test_roster_is_the_collector_sources() -> None:
