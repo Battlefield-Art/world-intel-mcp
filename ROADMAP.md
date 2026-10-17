@@ -558,6 +558,42 @@ small boats).
 The roadmap above is history; this section is the actual road ahead.
 Ordered by value; numbers are proposals, not commitments.
 
+### Phase 29 (in progress, 2026-10-17): Research-Grade History and Evidence
+Clean-room design: ideas only, no third-party code or text is used. The
+pattern this phase adopts is that every answer is built from saved records
+with three separate dates: the period a value describes, when its publisher
+released it, and when this server collected it. The server could not do
+that: the cache keeps one latest value per key, so there was no history to
+correlate, revise or replay.
+
+Wave 1 runs in parallel; wave 2 builds on the history store; wave 3 is the
+dashboard.
+
+| Wave | Feature | What it means here | Status |
+|------|---------|--------------------|--------|
+| 1 | Observation history store | Every collector capture saved with `observed_at` (period the data describe), `published_at` (publisher release, when known) and `collected_at` (when we saved it); unchanged payloads stored once; bounded retention; backfill for sources that serve history (FRED CSV) | :red_circle: |
+| 1 | Capture history and revisions | Earlier saved copies of a source, and values a later copy revised | :red_circle: |
+| 1 | Collection health | Per-source expected cadence; overdue / failing / never-run per source, measured from the run log, not inferred from cache freshness. Says what it cannot prove | :red_circle: |
+| 1 | Research guide over MCP | MCP resources (guide generated from the live registry and source health, measures glossary, "what this server will not do") and MCP prompts (worked research questions, each naming the tools it needs and the limit to respect). Server exposed no prompts or resources before | :red_circle: |
+| 1 | Hostility timeline | Per country pair or country, daily counts of threat / sanction / force / criticism coverage plus tone; sortable by most covered, most hostile, biggest change | :red_circle: |
+| 1 | Story breadth | News clusters carry a distinct-outlet count; a top-stories view ranks by how many outlets carry a story | :red_circle: |
+| 1 | Liquidity and flows | Fed balance sheet, Treasury General Account, reverse repo and net liquidity (FRED keyless CSV), money supply (US M2, euro area M1/M2/M3, never summed), ECB, ICI fund flows and ETF net issuance, FINRA margin statistics, BLS series; amounts kept separate from flows | :red_circle: |
+| 1 | Kalshi + cross-venue markets | Kalshi public market data next to Polymarket; same-event comparison with an explicit match confidence; settled markets scored against pre-settlement prices (Brier) | :red_circle: |
+| 1 | News vs market reaction | Companies and countries named in story clusters mapped to tickers / country indices; same-day move against a benchmark | :red_circle: |
+| 2 | Connections with timing offsets | Correlation between retained series over a shared sample, tested at leads and lags, with minimum sample size and false-discovery control; states that it does not prove causation | :red_circle: |
+| 2 | Day timeline | What every retained source recorded for a given day, by observation date or collection date | :red_circle: |
+| 3 | Dashboard views | Liquidity board, situations, top stories, collection health panels | :red_circle: |
+
+Considered and not planned:
+
+| Feature | Reason |
+|---------|--------|
+| Sportsbook odds | Odds APIs are paid or key-gated; Kalshi and Polymarket sports markets are covered by the cross-venue work |
+| NFL analytics (rosters, depth charts, game model) | Outside a world-intelligence server's scope |
+| Bulk paper corpus (300,000+ papers) | `intel_arxiv_papers` queries live; a local corpus is a separate service |
+| Game-theory actor modelling | No measurable spec yet |
+| "Intelligent table" encoders and 88% "kernel" compression | Claimed without a published method, code or evaluation; nothing to reproduce |
+
 ### Phase 23 (planned): Geofence Depth
 | Feature | Why | Status |
 |---------|-----|--------|
