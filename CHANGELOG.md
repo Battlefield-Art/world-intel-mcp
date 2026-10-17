@@ -16,6 +16,15 @@
   neither `WORLD_INTEL_CACHE_DB` nor `XDG_CACHE_HOME` is set) is resolved
   when the cache opens, not at import, so it agrees with the baselines if
   `HOME` changes in between.
+- When the cache cannot open at its configured or default path, it now
+  falls back to a per-user directory, `world-intel-mcp-<uid>` under the
+  system temp directory, created with mode 0700, instead of a shared
+  `world-intel-mcp` directory there. It refuses that directory with an
+  error naming the reason if it is a symlink or not a directory, is owned
+  by another user, gives group or other users access, or holds a symlink
+  at `cache.db` or its `-wal`, `-shm` or `-journal` file. A fallback cache
+  left in the old shared directory is not read or moved. On Windows the
+  fallback keeps its old name and is not checked.
 - Importing the package no longer opens databases. The shared cache,
   circuit breaker, AOI store, vector store and fetcher behind the MCP
   tools are built on first use, under a lock, as one set: concurrent first

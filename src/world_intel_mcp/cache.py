@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -27,6 +28,55 @@ def _default_db_path() -> Path:
     return Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
 
 
+def _fallback_db_path() -> Path:
+    """The cache file in this user's own directory under the temp dir.
+
+    Any local user can create entries in a shared temp directory, so the
+    fallback directory is per-user and created 0700, and it is refused,
+    never used, unless it is a real directory owned by this user that no
+    one else can enter and none of the database's file names in it is a
+    symlink.
+    """
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        # No POSIX owner or mode bits to check (Windows, whose default temp
+        # directory is per-user).
+        directory = Path(tempfile.gettempdir()) / "world-intel-mcp"
+        directory.mkdir(exist_ok=True)
+        return directory / "cache.db"
+    uid = getuid()
+    directory = Path(tempfile.gettempdir()) / f"world-intel-mcp-{uid}"
+    db = directory / "cache.db"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(directory)
+    if stat.S_ISLNK(info.st_mode):
+        problem = "it is a symlink"
+    elif not stat.S_ISDIR(info.st_mode):
+        problem = "it is not a directory"
+    elif info.st_uid != uid:
+        problem = f"it is owned by uid {info.st_uid}, not by this user (uid {uid})"
+    elif info.st_mode & 0o077:
+        problem = (
+            f"its mode {stat.S_IMODE(info.st_mode):04o} gives group or other "
+            "users access"
+        )
+    else:
+        # The database and the files SQLite keeps beside it: the WAL, its
+        # shared-memory index, and the rollback journal.
+        names = [db.name, f"{db.name}-wal", f"{db.name}-shm", f"{db.name}-journal"]
+        linked = next((name for name in names if (directory / name).is_symlink()), None)
+        if linked is None:
+            return db
+        problem = f"{linked} in it is a symlink"
+    raise PermissionError(
+        f"Refusing to use {directory} for the cache fallback: {problem}. "
+        "Point WORLD_INTEL_CACHE_DB at a path only you can write."
+    )
+
+
 class Cache:
     """SQLite-backed TTL cache."""
 
@@ -39,7 +89,11 @@ class Cache:
         except (OSError, sqlite3.OperationalError) as exc:
             if explicit_path:
                 raise
-            fallback = Path(tempfile.gettempdir()) / "world-intel-mcp" / "cache.db"
+            try:
+                fallback = _fallback_db_path()
+            except OSError:
+                self.close()
+                raise
             logger.warning(
                 "Cache unavailable at %s: %s; falling back to %s",
                 self.db_path,
