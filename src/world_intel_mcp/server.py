@@ -71,8 +71,10 @@ import os
 from typing import Any
 
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import GetPromptResult, Prompt, Resource, Tool, TextContent
+from pydantic import AnyUrl
 
 logging.basicConfig(
     level=os.environ.get("WORLD_INTEL_LOG_LEVEL", "INFO"),
@@ -86,6 +88,7 @@ server = Server("world-intel-mcp")
 # aliases remain as the module's public face — external readers (and the
 # registry tests) reach the live cache and vector store as server.cache,
 # server._vector_store, etc.
+from . import guide as _guide  # noqa: E402
 from . import runtime as _runtime  # noqa: E402
 from . import tools as _tools_pkg  # noqa: E402
 
@@ -133,6 +136,32 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
     logger.info("Tool call: %s(%s)", name, json.dumps(args, default=str)[:200])
     result = await _dispatch(name, args)
     return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+
+# Research guide (Phase 29): read-only resources and worked prompts. The
+# content lives in guide.py / guide_prompts.py; registering these handlers
+# is what makes the server advertise the resources and prompts
+# capabilities at initialize.
+
+
+@server.list_resources()
+async def list_resources() -> list[Resource]:
+    return _guide.list_resources()
+
+
+@server.read_resource()
+async def read_resource(uri: AnyUrl) -> list[ReadResourceContents]:
+    return _guide.read_resource(str(uri))
+
+
+@server.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    return _guide.list_prompts()
+
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptResult:
+    return _guide.get_prompt(name, arguments)
 
 
 # ---------------------------------------------------------------------------
