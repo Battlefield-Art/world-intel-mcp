@@ -612,7 +612,7 @@ Verified absent from `sources/` on 2026-09-01 (grep, not memory):
 | Feature | Source candidate | Status |
 |---------|------------------|--------|
 | Severe weather alerts | NWS (US, 0.5.0) + Meteoalarm (39 EU countries, 0.8.0; per-country feeds only - no Europe-wide feed exists) | :white_check_mark: |
-| Tropical cyclone tracking | NHC (0.5.0) + JTWC (0.8.0: NW Pacific/N Indian/S Hemisphere; positions live in linked products). Forecast tracks still open | :yellow_circle: warnings done |
+| Tropical cyclone tracking | NHC (0.5.0) + JTWC (0.8.0: NW Pacific/N Indian/S Hemisphere). Forecast tracks (Unreleased): opt-in `include_forecast` on both tools. NHC points come from the linked forecast/advisory text and the cone from the linked `trackCone` CONE.kmz (simplified); JTWC points come from each linked warning text, and JTWC links no cone. Not upstream-blocked, measured 2026-10-17: keyless HTTP 200 for NHC CurrentStorms.json, text/MIATCMEP1.shtml, EP212026_017adv_CONE.kmz and JTWC jtwc.rss, wp2926web.txt, sh0127web.txt; nhc.noaa.gov robots.txt disallows nothing and the NWS disclaimer is public domain; JTWC jtwc.html and robots.txt answered 403 (CloudFront), so JTWC's terms are unread. Wind radii not parsed | :white_check_mark: warnings + forecast tracks |
 | Dedicated volcano monitoring | GVP weekly report shipped in 0.5.0 (`intel_volcano_activity`) | :white_check_mark: |
 | NOTAMs | BLOCKED upstream: official FAA API is key-required (401 verified live 2026-09-01); unofficial backend POST-only/undocumented. Revisit if FAA opens access | :red_circle: blocked |
 | Launch schedules | Launch Library 2 shipped in 0.5.0 (`intel_launch_schedule`) | :white_check_mark: |

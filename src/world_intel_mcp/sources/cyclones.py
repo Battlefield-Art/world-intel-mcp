@@ -17,12 +17,18 @@ returned without degradation markers; only an actual fetch failure is
 marked degraded. The quiet-season shape itself (activeStorms: []) is
 assumed from the populated shape, not observed — four storms were
 active on the day this was written.
+
+``include_forecast=True`` adds each storm's official forecast track and
+5-day cone (sources/cyclone_forecasts.py, one text and one KMZ fetch per
+storm, capped per call) plus a ``data_gaps`` list; the default call
+fetches CurrentStorms.json only.
 """
 
 import logging
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from . import cyclone_forecasts
 
 logger = logging.getLogger("world-intel-mcp.sources.cyclones")
 
@@ -48,11 +54,15 @@ _BASIN_NAMES: dict[str, str] = {
 }
 
 
-async def fetch_cyclones(fetcher: Fetcher) -> dict:
+async def fetch_cyclones(fetcher: Fetcher, include_forecast: bool = False) -> dict:
     """Fetch active tropical cyclones from the NHC.
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
+        include_forecast: Also fetch each storm's forecast track and cone
+            (adds ``forecast`` per storm and ``data_gaps``; a failed
+            track or cone is named there and marks the response
+            degraded).
 
     Returns:
         Dict with storms list (name, classification, intensity,
@@ -83,6 +93,7 @@ async def fetch_cyclones(fetcher: Fetcher) -> dict:
         }
 
     storms = []
+    entries: list[tuple[dict, dict]] = []  # (output storm, raw record)
     by_basin: dict[str, int] = {}
     for storm in data.get("activeStorms", []):
         storm_id = storm.get("id") or ""
@@ -112,14 +123,21 @@ async def fetch_cyclones(fetcher: Fetcher) -> dict:
                 "advisory_url": advisory.get("url"),
             }
         )
+        entries.append((storms[-1], storm))
 
-    return {
+    response = {
         "storms": storms,
         "count": len(storms),
         "by_basin": by_basin,
         "source": "nhc",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if include_forecast:
+        gaps, degraded = await cyclone_forecasts.attach_nhc_forecasts(fetcher, entries)
+        response["data_gaps"] = gaps
+        if degraded:
+            response["degraded"] = True
+    return response
 
 
 def _safe_int(value: str | int | None) -> int | None:

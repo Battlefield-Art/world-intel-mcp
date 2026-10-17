@@ -18,9 +18,12 @@ item says "No Current Tropical Cyclone Warnings." — that is a VALID
 empty result, not an outage. Item pubDates use a two-digit year
 ("Tue, 01 Sep 26 ..."); issued_at carries only day/time (DD/HHMMZ).
 
-Positions, intensities, and forecast tracks are NOT in the RSS — they
-live in the per-storm warning-text products this module links to but
-does not fetch (one fetch per storm would fan out unboundedly).
+Positions, intensities, and forecast tracks are NOT in the RSS; they
+live in the per-storm warning-text products this module links to. The
+default call does not fetch them. ``include_forecast=True`` does, one
+text per storm with a per-call cap (sources/cyclone_forecasts.py), and
+adds each storm's warning position, intensity and forecast track plus a
+``data_gaps`` list.
 """
 
 import logging
@@ -28,6 +31,7 @@ import re
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from . import cyclone_forecasts
 
 try:
     import feedparser
@@ -62,11 +66,15 @@ _ADVISORY_LINK_RE = re.compile(r"<a\s+href=['\"]([^'\"]+\.txt)['\"][^>]*>([^<]+)
 _QUIET_MARKER = "No Current Tropical Cyclone Warnings"
 
 
-async def fetch_jtwc_cyclones(fetcher: Fetcher) -> dict:
+async def fetch_jtwc_cyclones(fetcher: Fetcher, include_forecast: bool = False) -> dict:
     """Fetch active JTWC tropical cyclone warnings.
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
+        include_forecast: Also fetch each storm's warning text for its
+            forecast track (adds ``forecast`` per storm and
+            ``data_gaps``; a failed track is named there and marks the
+            response degraded). JTWC links no cone of uncertainty.
 
     Returns:
         Dict with storms list (id, name, classification, warning
@@ -140,7 +148,7 @@ async def fetch_jtwc_cyclones(fetcher: Fetcher) -> dict:
         by_basin[basin] = len(basin_storms)
         storms.extend(basin_storms)
 
-    return {
+    response = {
         "storms": storms,
         "count": len(storms),
         "by_basin": by_basin,
@@ -149,6 +157,12 @@ async def fetch_jtwc_cyclones(fetcher: Fetcher) -> dict:
         "source": "jtwc",
         "timestamp": timestamp,
     }
+    if include_forecast:
+        gaps, degraded = await cyclone_forecasts.attach_jtwc_forecasts(fetcher, storms)
+        response["data_gaps"] = gaps
+        if degraded:
+            response["degraded"] = True
+    return response
 
 
 def _parse_storms(description: str, basin: str) -> list[dict]:

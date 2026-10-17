@@ -61,7 +61,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Severe Weather** | 2 | NWS active CAP alerts (US), Meteoalarm (39 EU countries) |
 | **Space Launches** | 1 | Launch Library 2 upcoming launches |
 | **Volcanoes** | 1 | Smithsonian GVP weekly activity report |
-| **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
+| **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere), with opt-in forecast tracks: positions, UTC valid times and intensities, plus NHC's cone of uncertainty |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
 **Total: 139 tools** across 30+ intelligence domains.
@@ -492,8 +492,8 @@ different, openly licensed data source; no ews code is used.
 ### Tropical Cyclones (2)
 | Tool | Description |
 |------|-------------|
-| `intel_cyclones` | NHC active storms: Atlantic, Eastern and Central Pacific |
-| `intel_jtwc_cyclones` | JTWC warnings: Northwest Pacific, North Indian Ocean, Southern Hemisphere |
+| `intel_cyclones` | NHC active storms: Atlantic, Eastern and Central Pacific. `include_forecast` adds each storm's forecast track (from its forecast/advisory) and a simplified 5-day cone outline |
+| `intel_jtwc_cyclones` | JTWC warnings: Northwest Pacific, North Indian Ocean, Southern Hemisphere. `include_forecast` adds each storm's forecast track from its warning text (JTWC publishes no cone) |
 
 ### Space Launches (1)
 | Tool | Description |

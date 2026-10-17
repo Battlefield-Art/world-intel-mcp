@@ -185,8 +185,17 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_cyclones",
-        description="Get active tropical cyclones from the US National Hurricane Center: name, classification, intensity (knots), pressure (mb), position, movement, by-basin grouping. Covers the Atlantic, Eastern and Central Pacific basins only - Western Pacific / Indian Ocean storms (JTWC) are not included. Zero storms means a quiet tropics, not an outage; a fetch failure carries an explicit error. No API key needed.",
-        inputSchema={"type": "object", "properties": {}},
+        description="Get active tropical cyclones from the US National Hurricane Center: name, classification, intensity (knots), pressure (mb), position, movement, by-basin grouping. Covers the Atlantic, Eastern and Central Pacific basins only - Western Pacific / Indian Ocean storms (JTWC) are not included. Zero storms means a quiet tropics, not an outage; a fetch failure carries an explicit error. No API key needed. Optional: include_forecast (default false) adds each storm's official forecast track from its NHC forecast/advisory (positions with UTC valid times and forecast hours, max wind and gusts in knots, post-tropical/dissipated status) and the 5-day cone of uncertainty as [lat, lon] vertices simplified to 0.01 degrees (NHC's KMZ linked); a track or cone that could not be fetched is named in data_gaps and marks the response degraded.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "include_forecast": {
+                    "type": "boolean",
+                    "description": "Add each storm's forecast track and cone (one text and one KMZ fetch per storm, at most 10 storms per call). Default false.",
+                    "default": False,
+                },
+            },
+        },
     ),
     Tool(
         name="intel_meteoalarm_alerts",
@@ -208,8 +217,17 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_jtwc_cyclones",
-        description="Get active tropical cyclone warnings from the Joint Typhoon Warning Center: storm id, name, classification, warning number, issue time, warning text/graphic links, by-basin grouping, plus significant tropical weather advisories. Covers the Northwest Pacific, North Indian Ocean, and Southern Hemisphere; its Central/Eastern Pacific item overlaps NHC (intel_cyclones). Positions and intensities are not in the feed - they live in the linked warning products. Zero storms means quiet basins, not an outage. No API key needed.",
-        inputSchema={"type": "object", "properties": {}},
+        description="Get active tropical cyclone warnings from the Joint Typhoon Warning Center: storm id, name, classification, warning number, issue time, warning text/graphic links, by-basin grouping, plus significant tropical weather advisories. Covers the Northwest Pacific, North Indian Ocean, and Southern Hemisphere; its Central/Eastern Pacific item overlaps NHC (intel_cyclones). Positions and intensities are not in the feed - they live in the linked warning products. Zero storms means quiet basins, not an outage. No API key needed. Optional: include_forecast (default false) fetches each storm's warning text and adds its warning position, intensity and pressure plus the forecast track (positions with UTC valid times, forecast hours, max sustained winds and gusts in knots, status lines such as EXTRATROPICAL); JTWC publishes no cone of uncertainty, so cone is null. A warning text that could not be fetched is named in data_gaps and marks the response degraded.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "include_forecast": {
+                    "type": "boolean",
+                    "description": "Add each storm's forecast track from its warning text (one fetch per storm, at most 10 storms per call). Default false.",
+                    "default": False,
+                },
+            },
+        },
     ),
 ]
 
@@ -277,7 +295,9 @@ async def _volcano_activity(arguments: dict[str, Any]) -> Any:
 
 
 async def _cyclones(arguments: dict[str, Any]) -> Any:
-    return await cyclones.fetch_cyclones(runtime.fetcher)
+    return await cyclones.fetch_cyclones(
+        runtime.fetcher, include_forecast=arguments.get("include_forecast") is True
+    )
 
 
 async def _meteoalarm_alerts(arguments: dict[str, Any]) -> Any:
@@ -293,7 +313,9 @@ async def _meteoalarm_alerts(arguments: dict[str, Any]) -> Any:
 async def _jtwc_cyclones(arguments: dict[str, Any]) -> Any:
     from ..sources import jtwc
 
-    return await jtwc.fetch_jtwc_cyclones(runtime.fetcher)
+    return await jtwc.fetch_jtwc_cyclones(
+        runtime.fetcher, include_forecast=arguments.get("include_forecast") is True
+    )
 
 
 HANDLERS = {

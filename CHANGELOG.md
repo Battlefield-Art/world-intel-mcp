@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Added: tropical cyclone forecast tracks
+- `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
+  (boolean, default false). With it, each storm gains a `forecast`: the
+  `initial` fix and forecast `points` (forecast hour, UTC valid time,
+  latitude and longitude, max wind and gust in knots, status such as
+  POST-TROP/REMNT LOW or DISSIPATED, and the agency's section label),
+  `track_status`, and the advisory or warning number and issue time.
+  Without it, both responses and the collector's NHC call are unchanged.
+- NHC points come from the forecast/advisory text that CurrentStorms.json
+  links: the one NHC product that states UTC valid times and post-tropical
+  status outright (the KMZ track gives local times, and the shapefile
+  labels a post-tropical remnant low "Subtropical Depression"). The cone
+  comes from the linked CONE.kmz: its one ring, simplified
+  (Douglas-Peucker, 0.01 degrees; Hurricane Trudy advisory 17 went from
+  1,167 vertices to 56) to `[lat, lon]` vertices, with the source vertex
+  count, the tolerance, and a note pointing at the official geometry
+  (`cone_url`).
+- JTWC points come from each storm's linked warning text (its forecast,
+  extended outlook and long range outlook blocks). JTWC links no cone:
+  `cone_status` is `not_published`, and `data_gaps` says so.
+
+### Data honesty: forecast tracks
+- `data_gaps` names every track or cone not delivered, per storm, with a
+  status: `fetch_failed`, `unparsed`, `not_linked`, `not_published` or
+  `not_fetched_cap` (at most 10 storms per call; the rest are named,
+  never dropped). A failure marks the response `degraded`; a product the
+  agency does not link is a gap, not degradation. A quiet basin still
+  answers zero storms, not degraded, and makes no product fetches; a feed
+  outage keeps its existing degraded shape and makes none either.
+- The text pages are per storm bin, not per issuance, so one can lag the
+  feed: an advisory or warning number that disagrees with the feed is
+  returned as `stale_advisory` or `stale_warning` with the expected
+  number, and its cached copy is dropped.
+- Each product is fetched once per issuance (cache keys carry the
+  advisory or warning number; one-hour TTL) under its own circuit breaker
+  (`nhc-forecast`, `nhc-gis`, `jtwc-warning`), so a product outage does
+  not trip the warning feeds' breakers.
+- Remote KML is parsed with the standard library: strict UTF-8, any
+  DOCTYPE refused, size caps (KMZ 2 MB, KML 8 MB), and a cone with more
+  than one ring refused, never trimmed.
+- Measured 2026-10-17: every product used answered HTTP 200 without a
+  key; nhc.noaa.gov robots.txt disallows nothing and the NWS disclaimer
+  puts the products in the public domain. The JTWC home page and
+  robots.txt answered 403 (CloudFront "Request blocked"), so JTWC's site
+  terms could not be read; its RSS and warning texts served 200 to the
+  same client. Wind radii and seas are not parsed.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard
