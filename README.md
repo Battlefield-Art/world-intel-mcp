@@ -647,10 +647,19 @@ built-in hotspots, but scoped to your AOI's own radius instead of a fixed
 2-degree window.
 
 AOIs persist in a dedicated table inside the same SQLite cache database
-the server already uses (`~/.cache/world-intel-mcp/cache.db` by default,
-or `$WORLD_INTEL_CACHE_DB`), so a scheduled agent can watch any named
+the server already uses (`$WORLD_INTEL_CACHE_DB` when set, otherwise
+`$XDG_CACHE_HOME/world-intel-mcp/cache.db`, falling back to
+`~/.cache/world-intel-mcp/cache.db`), so a scheduled agent can watch any named
 area across restarts with `intel_aoi_list` / `intel_aoi_delete` to manage
 them.
+
+Temporal and keyword spike baselines use `temporal.db` and
+`keyword_spikes.db` in `$XDG_CACHE_HOME/world-intel-mcp/`, or
+`~/.cache/world-intel-mcp/` when `XDG_CACHE_HOME` is unset.
+`WORLD_INTEL_CACHE_DB` only overrides the main cache database, not these
+baseline files. Databases open on first use, not on import. If you set
+`XDG_CACHE_HOME`, move the two baseline files from `~/.cache/world-intel-mcp/`
+to `$XDG_CACHE_HOME/world-intel-mcp/` to keep existing baselines.
 
 ---
 

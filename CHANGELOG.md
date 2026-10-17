@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed: development runs no longer touch user databases
+- Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
+  the cache: `$XDG_CACHE_HOME/world-intel-mcp/temporal.db` and
+  `$XDG_CACHE_HOME/world-intel-mcp/keyword_spikes.db`. With it unset, they
+  remain in `~/.cache/world-intel-mcp/`. Users who set `XDG_CACHE_HOME`
+  can keep existing baselines by moving these two files from
+  `~/.cache/world-intel-mcp/` to `$XDG_CACHE_HOME/world-intel-mcp/`.
+  Importing the package no longer opens databases; they open on first use.
+- Apply per-source request spacing to every HTTP retry, including JSON,
+  text, XML and binary fetches.
+
 ### Added: liquidity and money (Phase 29)
 Keyless sources only: the FRED graph CSV (`fred.stlouisfed.org/graph/fredgraph.csv`,
 allowed by robots.txt with `Crawl-delay: 1`, honored by a 1 s `fred-graph` rate

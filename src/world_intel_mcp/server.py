@@ -85,18 +85,20 @@ logger = logging.getLogger("world-intel-mcp")
 server = Server("world-intel-mcp")
 
 # Shared infrastructure lives in runtime.py (Phase 26 split); the local
-# aliases remain as the module's public face — external readers (and the
+# lazy aliases remain as the module's public face; external readers (and the
 # registry tests) reach the live cache and vector store as server.cache,
 # server._vector_store, etc.
 from . import guide as _guide  # noqa: E402
 from . import runtime as _runtime  # noqa: E402
 from . import tools as _tools_pkg  # noqa: E402
 
-cache = _runtime.cache
-breaker = _runtime.breaker
-_aoi_store = _runtime.aoi_store
-_vector_store = _runtime.vector_store
-fetcher = _runtime.fetcher
+
+def __getattr__(name: str):
+    aliases = {"_aoi_store": "aoi_store", "_vector_store": "vector_store"}
+    if name in {"cache", "breaker", "fetcher", *aliases}:
+        return getattr(_runtime, aliases.get(name, name))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ---------------------------------------------------------------------------
 # Tool registry — aggregated from the domain modules under tools/
@@ -171,8 +173,8 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
 
 async def _run() -> None:
     logger.info("World Intelligence MCP Server starting (%d tools)", len(TOOLS))
-    if _vector_store:
-        await _vector_store.start()
+    if _runtime.vector_store:
+        await _runtime.vector_store.start()
         logger.info("Vector store worker started")
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -180,8 +182,8 @@ async def _run() -> None:
                 read_stream, write_stream, server.create_initialization_options()
             )
     finally:
-        if _vector_store:
-            await _vector_store.stop()
+        if _runtime.vector_store:
+            await _runtime.vector_store.stop()
 
 
 def run() -> None:
