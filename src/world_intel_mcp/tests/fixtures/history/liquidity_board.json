@@ -1,0 +1,253 @@
+{
+ "sort": "biggest_move",
+ "ranking_rule": "biggest_move ranks absolute changes in billions of each row currency; no FX conversion, and observation horizons differ. Percentage changes do not affect ranking.",
+ "count": 9,
+ "indicators": [
+  {
+   "indicator": "us_m2",
+   "label": "US M2 money stock",
+   "dataset": "FRED M2SL",
+   "source": "fred-graph",
+   "measure": "amount_outstanding",
+   "frequency": "monthly",
+   "units": "USD billions",
+   "latest_value": 23342.8,
+   "status": null,
+   "observed_at": "2026-08-01",
+   "period_end": "2026-08-31",
+   "previous_value": 23217.9,
+   "previous_observed_at": "2026-07-01",
+   "change": 124.9,
+   "change_pct": 0.5379,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 47,
+    "expected_max_age_days": 100,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "euro_area_m3",
+   "label": "Euro area M3 (stock)",
+   "dataset": "BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.E",
+   "source": "ecb-data-portal",
+   "measure": "amount_outstanding",
+   "frequency": "monthly",
+   "units": "EUR millions",
+   "latest_value": 17646463.0,
+   "status": "Provisional value",
+   "observed_at": "2026-08",
+   "period_end": "2026-08-31",
+   "previous_value": 17615092.0,
+   "previous_observed_at": "2026-07",
+   "change": 31371.0,
+   "change_pct": 0.1781,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 47,
+    "expected_max_age_days": 75,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "euro_area_m2",
+   "label": "Euro area M2 (stock)",
+   "dataset": "BSI.M.U2.Y.V.M20.X.1.U2.2300.Z01.E",
+   "source": "ecb-data-portal",
+   "measure": "amount_outstanding",
+   "frequency": "monthly",
+   "units": "EUR millions",
+   "latest_value": 16447405.0,
+   "status": "Provisional value",
+   "observed_at": "2026-08",
+   "period_end": "2026-08-31",
+   "previous_value": 16434747.0,
+   "previous_observed_at": "2026-07",
+   "change": 12658.0,
+   "change_pct": 0.077,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 47,
+    "expected_max_age_days": 75,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "net_liquidity",
+   "label": "US net liquidity (WALCL - WDTGAL - RRPONTSYD)",
+   "dataset": "derived from FRED WALCL, WDTGAL, RRPONTSYD",
+   "source": "fred-graph",
+   "measure": "amount_outstanding",
+   "frequency": "weekly, as of Wednesday",
+   "units": "USD billions",
+   "latest_value": 5869.615,
+   "status": null,
+   "observed_at": "2026-10-14",
+   "period_end": "2026-10-14",
+   "previous_value": 5859.439,
+   "previous_observed_at": "2026-10-07",
+   "change": 10.176,
+   "change_pct": 0.1737,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 3,
+    "expected_max_age_days": 10,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "fed_total_assets",
+   "label": "Federal Reserve total assets",
+   "dataset": "FRED WALCL",
+   "source": "fred-graph",
+   "measure": "amount_outstanding",
+   "frequency": "weekly, as of Wednesday",
+   "units": "USD millions",
+   "latest_value": 6755639.0,
+   "status": null,
+   "observed_at": "2026-10-14",
+   "period_end": "2026-10-14",
+   "previous_value": 6747560.0,
+   "previous_observed_at": "2026-10-07",
+   "change": 8079.0,
+   "change_pct": 0.1197,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 3,
+    "expected_max_age_days": 10,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "eurosystem_total_assets",
+   "label": "Total assets/liabilities - Eurosystem",
+   "dataset": "ILM.W.U2.C.T000000.Z5.Z01",
+   "source": "ecb-data-portal",
+   "measure": "amount_outstanding",
+   "frequency": "weekly",
+   "units": "EUR millions",
+   "latest_value": 5943911.0,
+   "status": "Normal value",
+   "observed_at": "2026-W41",
+   "period_end": "2026-10-11",
+   "previous_value": 5947826.0,
+   "previous_observed_at": "2026-W40",
+   "change": -3915.0,
+   "change_pct": -0.0658,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 6,
+    "expected_max_age_days": 16,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "euro_area_m1",
+   "label": "Euro area M1 (stock)",
+   "dataset": "BSI.M.U2.Y.V.M10.X.1.U2.2300.Z01.E",
+   "source": "ecb-data-portal",
+   "measure": "amount_outstanding",
+   "frequency": "monthly",
+   "units": "EUR millions",
+   "latest_value": 11293328.0,
+   "status": "Provisional value",
+   "observed_at": "2026-08",
+   "period_end": "2026-08-31",
+   "previous_value": 11291831.0,
+   "previous_observed_at": "2026-07",
+   "change": 1497.0,
+   "change_pct": 0.0133,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 47,
+    "expected_max_age_days": 75,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "reverse_repo",
+   "label": "Fed overnight reverse repo",
+   "dataset": "FRED RRPONTSYD",
+   "source": "fred-graph",
+   "measure": "amount_outstanding",
+   "frequency": "daily (business days)",
+   "units": "USD billions",
+   "latest_value": 0.1,
+   "status": null,
+   "observed_at": "2026-10-16",
+   "period_end": "2026-10-16",
+   "previous_value": 1.201,
+   "previous_observed_at": "2026-10-15",
+   "change": -1.101,
+   "change_pct": -91.6736,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 1,
+    "expected_max_age_days": 6,
+    "stale": false
+   }
+  },
+  {
+   "indicator": "treasury_general_account",
+   "label": "Treasury General Account (Wednesday level)",
+   "dataset": "FRED WDTGAL",
+   "source": "fred-graph",
+   "measure": "amount_outstanding",
+   "frequency": "weekly, as of Wednesday",
+   "units": "USD millions",
+   "latest_value": 885823.0,
+   "status": null,
+   "observed_at": "2026-10-14",
+   "period_end": "2026-10-14",
+   "previous_value": 885783.0,
+   "previous_observed_at": "2026-10-07",
+   "change": 40.0,
+   "change_pct": 0.0045,
+   "change_basis": "vs previous observation",
+   "freshness": {
+    "latest_age_days": 3,
+    "expected_max_age_days": 10,
+    "stale": false
+   }
+  }
+ ],
+ "unavailable": [],
+ "blocked": [
+  {
+   "measure": "money market fund assets, weekly",
+   "publisher": "ICI",
+   "status": "blocked",
+   "measured": "2026-10-17: HTTP 403 (Akamai 'Access Denied') on www.ici.org/research/stats/mmf and on /robots.txt"
+  },
+  {
+   "measure": "ETF net issuance, monthly actuals and weekly estimates",
+   "publisher": "ICI",
+   "status": "blocked",
+   "measured": "2026-10-17: HTTP 403 (Akamai 'Access Denied') on www.ici.org/research/stats/etf and on /robots.txt"
+  },
+  {
+   "measure": "customer margin balances (debit and free credit), monthly",
+   "publisher": "FINRA",
+   "status": "blocked",
+   "measured": "2026-10-17: the margin-statistics XLSX answers 200, but the finra.org Terms of Use (Restrictions d and e) forbid creating a database from the site and using data mining, scraping or harvesting tools, robots included"
+  },
+  {
+   "measure": "BLS series (for example CPI-U, nonfarm payrolls)",
+   "publisher": "BLS",
+   "status": "blocked",
+   "measured": "2026-10-17: public API v1 answers 200 without a key, but api.bls.gov/robots.txt is 'Disallow: /' and the www.bls.gov terms page answers 403 to this server's User-Agent"
+  }
+ ],
+ "net_liquidity_formula": "net_liquidity = WALCL - WDTGAL - RRPONTSYD, in USD billions: WALCL and WDTGAL are USD millions divided by 1,000; RRPONTSYD is already USD billions",
+ "note": "M1 is contained in M2 and M2 in M3: the aggregates nest, so they are never added together.",
+ "sources": [
+  "fred-graph",
+  "ecb-data-portal"
+ ],
+ "data_gaps": [
+  "Changes are vs each indicator's previous observation, so horizons differ (daily RRP, weekly Fed and Eurosystem data, monthly money supply).",
+  "published_at is null for every row: neither FRED's keyless CSV nor the ECB payload carries release dates. FRED units come from the server's series catalog; ECB units come from the response.",
+  "Not covered (see blocked): ICI money market fund assets and ETF net issuance, FINRA margin statistics and BLS series; no proxy is substituted for them."
+ ],
+ "timestamp": "2026-10-17T18:59:47.488802+00:00"
+}

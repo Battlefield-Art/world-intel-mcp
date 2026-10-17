@@ -30,6 +30,7 @@ from . import (  # noqa: E402
     geospatial,
     hazards,
     history,
+    history_backfill,
     infrastructure,
     intelligence,
     lagged_connections,
@@ -65,6 +66,7 @@ _MODULES = [
     history,
     lagged_connections,
     day_timeline,
+    history_backfill,
     system,
 ]
 

@@ -1,0 +1,153 @@
+{
+ "source": "fred-graph",
+ "formula": "net_liquidity = WALCL - WDTGAL - RRPONTSYD, in USD billions: WALCL and WDTGAL are USD millions divided by 1,000; RRPONTSYD is already USD billions",
+ "alignment": "One point per WALCL Wednesday. WDTGAL must be reported for that same Wednesday. RRPONTSYD is taken from that Wednesday, or when that day is blank on or after 2013-09-23, from Tuesday only; before that date a blank Wednesday has no fallback. Each point names the RRP date used. Weeks without an aligned TGA or RRP value are skipped and counted, never filled with zero.",
+ "method": {
+  "formula": "net_liquidity = WALCL - WDTGAL - RRPONTSYD, in USD billions: WALCL and WDTGAL are USD millions divided by 1,000; RRPONTSYD is already USD billions",
+  "components": {
+   "WALCL": {
+    "term": "Federal Reserve total assets",
+    "observed": "Wednesday level",
+    "units": "USD millions",
+    "conversion": "divided by 1,000 to USD billions"
+   },
+   "WDTGAL": {
+    "term": "Treasury General Account",
+    "observed": "Wednesday level",
+    "units": "USD millions",
+    "conversion": "divided by 1,000 to USD billions"
+   },
+   "RRPONTSYD": {
+    "term": "Fed overnight reverse repo",
+    "observed": "daily, business days",
+    "units": "USD billions",
+    "conversion": "none: already USD billions",
+    "alignment": "the value for the WALCL Wednesday; when blank on or after 2013-09-23, Tuesday only; no fallback before that date. Reported per point as reverse_repo_observed_at; never a later day"
+   }
+  },
+  "alignment": "One point per WALCL Wednesday. WDTGAL must be reported for that same Wednesday. RRPONTSYD is taken from that Wednesday, or when that day is blank on or after 2013-09-23, from Tuesday only; before that date a blank Wednesday has no fallback. Each point names the RRP date used. Weeks without an aligned TGA or RRP value are skipped and counted, never filled with zero.",
+  "tga_choice": "The Treasury General Account term is WDTGAL (Wednesday level), not WTREGEN (week average), so all three terms describe the same Wednesday. WTREGEN is not a drop-in replacement: subtracting a week average from Wednesday-level total assets mixes two different measures. WTREGEN is served on its own by intel_fed_liquidity_series."
+ },
+ "units": "USD billions",
+ "measure": "amount_outstanding",
+ "frequency": "weekly, as of Wednesday",
+ "latest": {
+  "observed_at": "2026-10-14",
+  "value": 5869.615,
+  "units": "USD billions",
+  "fed_total_assets": 6755.639,
+  "treasury_general_account": 885.823,
+  "reverse_repo": 0.201,
+  "reverse_repo_observed_at": "2026-10-14"
+ },
+ "previous": {
+  "observed_at": "2026-10-07",
+  "value": 5859.439,
+  "units": "USD billions",
+  "fed_total_assets": 6747.56,
+  "treasury_general_account": 885.783,
+  "reverse_repo": 2.338,
+  "reverse_repo_observed_at": "2026-10-07"
+ },
+ "change": {
+  "absolute": 10.176,
+  "units": "USD billions",
+  "pct": 0.1737,
+  "from": "2026-10-07",
+  "to": "2026-10-14",
+  "basis": "vs previous observation"
+ },
+ "components": {
+  "WALCL": {
+   "label": "Federal Reserve total assets",
+   "units": "USD millions",
+   "frequency": "weekly, as of Wednesday",
+   "measure": "amount_outstanding",
+   "release": "H.4.1 Factors Affecting Reserve Balances",
+   "latest": {
+    "observed_at": "2026-10-14",
+    "value": 6755639.0,
+    "units": "USD millions"
+   },
+   "freshness": {
+    "latest_age_days": 3,
+    "expected_max_age_days": 10,
+    "stale": false
+   }
+  },
+  "WDTGAL": {
+   "label": "Treasury General Account (Wednesday level)",
+   "units": "USD millions",
+   "frequency": "weekly, as of Wednesday",
+   "measure": "amount_outstanding",
+   "release": "H.4.1 Factors Affecting Reserve Balances",
+   "latest": {
+    "observed_at": "2026-10-14",
+    "value": 885823.0,
+    "units": "USD millions"
+   },
+   "freshness": {
+    "latest_age_days": 3,
+    "expected_max_age_days": 10,
+    "stale": false
+   }
+  },
+  "RRPONTSYD": {
+   "label": "Fed overnight reverse repo",
+   "units": "USD billions",
+   "frequency": "daily (business days)",
+   "measure": "amount_outstanding",
+   "release": "Temporary Open Market Operations",
+   "latest": {
+    "observed_at": "2026-10-16",
+    "value": 0.1,
+    "units": "USD billions"
+   },
+   "freshness": {
+    "latest_age_days": 1,
+    "expected_max_age_days": 6,
+    "stale": false
+   }
+  }
+ },
+ "first_observed_at": "2003-03-19",
+ "skipped_weeks": 539,
+ "order": "newest_first",
+ "count": 3,
+ "points": [
+  {
+   "observed_at": "2026-10-14",
+   "value": 5869.615,
+   "units": "USD billions",
+   "fed_total_assets": 6755.639,
+   "treasury_general_account": 885.823,
+   "reverse_repo": 0.201,
+   "reverse_repo_observed_at": "2026-10-14"
+  },
+  {
+   "observed_at": "2026-10-07",
+   "value": 5859.439,
+   "units": "USD billions",
+   "fed_total_assets": 6747.56,
+   "treasury_general_account": 885.783,
+   "reverse_repo": 2.338,
+   "reverse_repo_observed_at": "2026-10-07"
+  },
+  {
+   "observed_at": "2026-09-30",
+   "value": 5747.446,
+   "units": "USD billions",
+   "fed_total_assets": 6743.031,
+   "treasury_general_account": 984.046,
+   "reverse_repo": 11.539,
+   "reverse_repo_observed_at": "2026-09-30"
+  }
+ ],
+ "published_at": null,
+ "data_gaps": [
+  "FRED's keyless CSV carries observation dates only: published_at is null, and units/frequency come from the server's series catalog, not the payload.",
+  "The Treasury General Account term is WDTGAL (Wednesday level), not WTREGEN (week average), so all three terms describe the same Wednesday.",
+  "539 of 1244 WALCL weeks skipped (no aligned TGA or RRP value), first 2002-12-18, last 2018-12-05"
+ ],
+ "timestamp": "2026-10-17T18:59:47.502762+00:00"
+}

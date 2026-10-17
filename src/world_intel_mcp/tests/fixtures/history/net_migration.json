@@ -1,0 +1,214 @@
+{
+ "region_filter": null,
+ "countries": 217,
+ "net_total": 24459,
+ "top_net_immigration": [
+  {
+   "name": "Ukraine",
+   "iso3": "UKR",
+   "year": 2025,
+   "net_migration": 1702358,
+   "per_1000": 43.67,
+   "migrant_stock": 5064173,
+   "migrant_stock_pct": 13.0,
+   "region": "Europe & Central Asia"
+  },
+  {
+   "name": "United States",
+   "iso3": "USA",
+   "year": 2025,
+   "net_migration": 1230663,
+   "per_1000": 3.6,
+   "migrant_stock": 52375047,
+   "migrant_stock_pct": 15.3,
+   "region": "North America"
+  },
+  {
+   "name": "Syrian Arab Republic",
+   "iso3": "SYR",
+   "year": 2025,
+   "net_migration": 421693,
+   "per_1000": 16.46,
+   "migrant_stock": 896042,
+   "migrant_stock_pct": 3.5,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  },
+  {
+   "name": "United Kingdom",
+   "iso3": "GBR",
+   "year": 2025,
+   "net_migration": 389911,
+   "per_1000": 5.61,
+   "migrant_stock": 11845479,
+   "migrant_stock_pct": 17.0,
+   "region": "Europe & Central Asia"
+  }
+ ],
+ "top_net_emigration": [
+  {
+   "name": "Pakistan",
+   "iso3": "PAK",
+   "year": 2025,
+   "net_migration": -1235336,
+   "per_1000": -4.84,
+   "migrant_stock": 4175958,
+   "migrant_stock_pct": 1.6,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  },
+  {
+   "name": "India",
+   "iso3": "IND",
+   "year": 2025,
+   "net_migration": -495753,
+   "per_1000": -0.34,
+   "migrant_stock": 4796255,
+   "migrant_stock_pct": 0.3,
+   "region": "South Asia"
+  },
+  {
+   "name": "Bangladesh",
+   "iso3": "BGD",
+   "year": 2025,
+   "net_migration": -402100,
+   "per_1000": -2.29,
+   "migrant_stock": 2906338,
+   "migrant_stock_pct": 1.7,
+   "region": "South Asia"
+  },
+  {
+   "name": "Nepal",
+   "iso3": "NPL",
+   "year": 2025,
+   "net_migration": -364699,
+   "per_1000": -12.31,
+   "migrant_stock": 470719,
+   "migrant_stock_pct": 1.6,
+   "region": "South Asia"
+  }
+ ],
+ "highest_rate_immigration": [
+  {
+   "name": "Ukraine",
+   "iso3": "UKR",
+   "year": 2025,
+   "net_migration": 1702358,
+   "per_1000": 43.67,
+   "migrant_stock": 5064173,
+   "migrant_stock_pct": 13.0,
+   "region": "Europe & Central Asia"
+  },
+  {
+   "name": "Oman",
+   "iso3": "OMN",
+   "year": 2025,
+   "net_migration": 113734,
+   "per_1000": 20.7,
+   "migrant_stock": 2283366,
+   "migrant_stock_pct": 41.6,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  },
+  {
+   "name": "Syrian Arab Republic",
+   "iso3": "SYR",
+   "year": 2025,
+   "net_migration": 421693,
+   "per_1000": 16.46,
+   "migrant_stock": 896042,
+   "migrant_stock_pct": 3.5,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  },
+  {
+   "name": "United Arab Emirates",
+   "iso3": "ARE",
+   "year": 2025,
+   "net_migration": 158634,
+   "per_1000": 13.78,
+   "migrant_stock": 8157000,
+   "migrant_stock_pct": 70.8,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  }
+ ],
+ "highest_rate_emigration": [
+  {
+   "name": "St. Martin (French part)",
+   "iso3": "MAF",
+   "year": 2025,
+   "net_migration": -1170,
+   "per_1000": -46.91,
+   "migrant_stock": null,
+   "migrant_stock_pct": null,
+   "region": "Latin America & Caribbean"
+  },
+  {
+   "name": "Marshall Islands",
+   "iso3": "MHL",
+   "year": 2025,
+   "net_migration": -1698,
+   "per_1000": -46.8,
+   "migrant_stock": 3309,
+   "migrant_stock_pct": 9.1,
+   "region": "East Asia & Pacific"
+  },
+  {
+   "name": "Tuvalu",
+   "iso3": "TUV",
+   "year": 2025,
+   "net_migration": -255,
+   "per_1000": -26.86,
+   "migrant_stock": 246,
+   "migrant_stock_pct": 2.6,
+   "region": "East Asia & Pacific"
+  },
+  {
+   "name": "Jordan",
+   "iso3": "JOR",
+   "year": 2025,
+   "net_migration": -303267,
+   "per_1000": -26.32,
+   "migrant_stock": 5280168,
+   "migrant_stock_pct": 45.8,
+   "region": "Middle East, North Africa, Afghanistan & Pakistan"
+  }
+ ],
+ "world_regions": [
+  {
+   "name": "North America",
+   "iso3": "NAC",
+   "year": 2025,
+   "net_migration": 1556865,
+   "per_1000": 4.06,
+   "migrant_stock": 61201057,
+   "migrant_stock_pct": 16.0
+  },
+  {
+   "name": "Europe & Central Asia",
+   "iso3": "ECS",
+   "year": 2025,
+   "net_migration": 1180849,
+   "per_1000": 1.27,
+   "migrant_stock": 105627719,
+   "migrant_stock_pct": 11.3
+  },
+  {
+   "name": "World",
+   "iso3": "WLD",
+   "year": 2025,
+   "net_migration": 0,
+   "per_1000": 0.0,
+   "migrant_stock": 303397238,
+   "migrant_stock_pct": 3.7
+  },
+  {
+   "name": "East Asia & Pacific",
+   "iso3": "EAS",
+   "year": 2025,
+   "net_migration": -37630,
+   "per_1000": -0.02,
+   "migrant_stock": 32481305,
+   "migrant_stock_pct": 1.4
+  }
+ ],
+ "measure": "World Bank SM.POP.NETM: immigrants minus emigrants over the year, citizens and non-citizens, all reasons (work, family, study, forced). Positive = net inflow. Source is the UN World Population Prospects: modelled values, and the most recent years can be WPP projections rather than observed counts.",
+ "source": "worldbank",
+ "timestamp": "2026-10-17T18:59:47Z"
+}

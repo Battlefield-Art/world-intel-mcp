@@ -15,7 +15,9 @@ from ..history import HistoryStore
 
 _ACCRUAL = (
     "History accrues only while the collector (intel-collector, or intel_collect) "
-    "runs; nothing before its first recorded cycle exists."
+    "runs; nothing before its first recorded cycle exists, except series under "
+    "backfill:fred and backfill:ecb, which intel_history_backfill loads from the "
+    "publisher's current data."
 )
 
 TOOLS: list[Tool] = [
@@ -24,16 +26,20 @@ TOOLS: list[Tool] = [
         description=(
             "Per-source collection health from the collector's run log: last attempt, "
             "last success, consecutive failures, overdue against the expected cadence "
-            "(default 300 s, overdue past 3 cadences), never-run sources, and history "
-            "storage size. States what it cannot prove: a fresh capture does not mean "
-            "upstream observations are current (see latest_observed_at). " + _ACCRUAL
+            "(default 300 s, overdue past 3 cadences), never-run sources, backfill runs "
+            "listed apart (backfills), and history storage size. States what it cannot "
+            "prove: a fresh capture does not mean upstream observations are current (see "
+            "latest_observed_at). " + _ACCRUAL
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "One collector source name (e.g. 'earthquakes'); omit for all",
+                    "description": (
+                        "One collector source name (e.g. 'earthquakes') or backfill "
+                        "source ('backfill:fred'); omit for all"
+                    ),
                 },
             },
         },
