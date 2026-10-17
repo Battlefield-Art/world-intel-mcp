@@ -1,5 +1,6 @@
 """Tests for source modules — uses respx to mock HTTP calls."""
 
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,14 +14,22 @@ from world_intel_mcp.fetcher import Fetcher
 
 
 @pytest.fixture
-def cache(tmp_path: Path) -> Cache:
-    return Cache(db_path=tmp_path / "test_cache.db")
+def cache(tmp_path: Path) -> Iterator[Cache]:
+    cache = Cache(db_path=tmp_path / "test_cache.db")
+    try:
+        yield cache
+    finally:
+        cache.close()
 
 
 @pytest.fixture
-def fetcher(cache: Cache) -> Fetcher:
+async def fetcher(cache: Cache) -> AsyncIterator[Fetcher]:
     breaker = CircuitBreaker()
-    return Fetcher(cache=cache, breaker=breaker, default_timeout=5.0)
+    fetcher = Fetcher(cache=cache, breaker=breaker, default_timeout=5.0)
+    try:
+        yield fetcher
+    finally:
+        await fetcher.close()
 
 
 # ---------------------------------------------------------------------------

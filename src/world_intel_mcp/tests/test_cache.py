@@ -2,6 +2,7 @@
 
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,12 @@ from world_intel_mcp.cache import Cache
 
 
 @pytest.fixture
-def cache(tmp_path: Path) -> Cache:
-    return Cache(db_path=tmp_path / "test_cache.db")
+def cache(tmp_path: Path) -> Iterator[Cache]:
+    cache = Cache(db_path=tmp_path / "test_cache.db")
+    try:
+        yield cache
+    finally:
+        cache.close()
 
 
 def test_set_and_get(cache: Cache) -> None:

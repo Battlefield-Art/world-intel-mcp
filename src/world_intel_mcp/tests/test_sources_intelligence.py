@@ -31,7 +31,6 @@ import httpx
 import pytest
 import respx
 
-from world_intel_mcp.analysis.temporal import TemporalBaseline
 from world_intel_mcp.fetcher import Fetcher
 from world_intel_mcp.sources import (
     conflict,
@@ -557,10 +556,10 @@ async def test_fetch_signal_summary_discloses_acled_gaps(
 
 @pytest.mark.asyncio
 async def test_fetch_temporal_anomalies_records_observations(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     monkeypatch.setattr(
-        intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db"))
+        intelligence, "_temporal", temporal_baseline
     )
     monkeypatch.setattr(
         military,
@@ -596,10 +595,10 @@ async def test_fetch_temporal_anomalies_records_observations(
 
 @pytest.mark.asyncio
 async def test_fetch_temporal_anomalies_acled_outage_disclosed(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     monkeypatch.setattr(
-        intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db"))
+        intelligence, "_temporal", temporal_baseline
     )
     monkeypatch.setattr(
         military,
@@ -789,10 +788,10 @@ async def test_fetch_hotspot_escalation_attributes_nearby_events(
 
 @pytest.mark.asyncio
 async def test_fetch_military_surge_detects_surge(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     monkeypatch.setattr(
-        intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db"))
+        intelligence, "_temporal", temporal_baseline
     )
     # 40 US aircraft in the european theater map onto baltic_sea, whose US
     # baseline is 2 -> ratio 20 -> critical. black_sea has no US baseline,
@@ -821,10 +820,10 @@ async def test_fetch_military_surge_detects_surge(
 
 @pytest.mark.asyncio
 async def test_fetch_military_surge_quiet_posture(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     monkeypatch.setattr(
-        intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db"))
+        intelligence, "_temporal", temporal_baseline
     )
     monkeypatch.setattr(
         military, "fetch_theater_posture", _async_return({"theaters": {}})

@@ -6,6 +6,7 @@ for fresh data. Prior to the fix, ``_stale_fallback`` returned the cached
 value completely unmodified — the marker was documented but never set.
 """
 
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,12 @@ from world_intel_mcp.fetcher import Fetcher
 
 
 @pytest.fixture
-def cache(tmp_path: Path) -> Cache:
-    return Cache(db_path=tmp_path / "test_cache.db")
+def cache(tmp_path: Path) -> Iterator[Cache]:
+    cache = Cache(db_path=tmp_path / "test_cache.db")
+    try:
+        yield cache
+    finally:
+        cache.close()
 
 
 @pytest.fixture
@@ -26,8 +31,12 @@ def breaker() -> CircuitBreaker:
 
 
 @pytest.fixture
-def fetcher(cache: Cache, breaker: CircuitBreaker) -> Fetcher:
-    return Fetcher(cache=cache, breaker=breaker, default_timeout=5.0)
+async def fetcher(cache: Cache, breaker: CircuitBreaker) -> AsyncIterator[Fetcher]:
+    fetcher = Fetcher(cache=cache, breaker=breaker, default_timeout=5.0)
+    try:
+        yield fetcher
+    finally:
+        await fetcher.close()
 
 
 def test_stale_fallback_marks_dict_responses(fetcher: Fetcher) -> None:

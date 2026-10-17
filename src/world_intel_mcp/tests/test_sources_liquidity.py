@@ -15,6 +15,7 @@ ECB responses with more than 50 series; FRED full-history downloads
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from datetime import date
 from pathlib import Path
 
@@ -47,13 +48,18 @@ def _fixed_clock_and_no_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def fetcher(tmp_path: Path) -> Fetcher:
-    return Fetcher(
+async def fetcher(tmp_path: Path) -> AsyncIterator[Fetcher]:
+    fetcher = Fetcher(
         cache=Cache(db_path=tmp_path / "liq.db"),
         breaker=CircuitBreaker(),
         default_timeout=5.0,
         max_retries=0,
     )
+    try:
+        yield fetcher
+    finally:
+        await fetcher.close()
+        fetcher.cache.close()
 
 
 def _fred_router(overrides: dict[str, httpx.Response] | None = None):
@@ -532,9 +538,12 @@ async def test_net_liquidity_method_states_wednesday_levels_conversion_and_rrp_a
     # The method travels with an error too, so a failed call still says what it would compute.
     # A fresh cache, so the 503 is not hidden behind the first call's cached CSVs.
     respx.get(_FRED_URL).mock(side_effect=_fred_router({"WDTGAL": httpx.Response(503)}))
-    failed = await liquidity.fetch_net_liquidity(
-        Fetcher(cache=Cache(db_path=tmp_path / "cold.db"), breaker=CircuitBreaker(), max_retries=0)
-    )
+    cold = Fetcher(cache=Cache(db_path=tmp_path / "cold.db"), breaker=CircuitBreaker(), max_retries=0)
+    try:
+        failed = await liquidity.fetch_net_liquidity(cold)
+    finally:
+        await cold.close()
+        cold.cache.close()
     assert "error" in failed and failed["method"]["components"]["WDTGAL"]["units"] == "USD millions"
 
 

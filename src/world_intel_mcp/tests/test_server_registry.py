@@ -19,11 +19,12 @@ from pathlib import Path
 
 import pytest
 
-_TMP_CACHE = Path(tempfile.mkdtemp(prefix="wim-server-test-")) / "cache.db"
+_TMP_DIRECTORY = tempfile.TemporaryDirectory(prefix="wim-server-test-")
+_TMP_CACHE = Path(_TMP_DIRECTORY.name) / "cache.db"
 
 
 @pytest.fixture(scope="module")
-def server():
+def server(isolated_runtime):
     """Import server.py exactly once, cache pointed at a temp file."""
     prior = os.environ.get("WORLD_INTEL_CACHE_DB")
     os.environ["WORLD_INTEL_CACHE_DB"] = str(_TMP_CACHE)
@@ -33,7 +34,7 @@ def server():
         # and an earlier test module may already have touched it under a
         # different path. Rebind it here, under the override, so this
         # file's premise holds whatever order the modules run in.
-        importlib.import_module("world_intel_mcp.runtime")._initialize()
+        isolated_runtime._initialize()
         yield module
     finally:
         if prior is None:

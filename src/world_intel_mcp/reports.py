@@ -785,4 +785,10 @@ async def generate_report_standalone(
     cache = Cache()
     breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
     fetcher = Fetcher(cache=cache, breaker=breaker)
-    return await generate_report(fetcher, output_path, title, sections, fmt)
+    try:
+        return await generate_report(fetcher, output_path, title, sections, fmt)
+    finally:
+        try:
+            await fetcher.close()
+        finally:
+            cache.close()

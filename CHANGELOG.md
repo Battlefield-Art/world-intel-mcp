@@ -44,6 +44,17 @@
 - Apply per-source request spacing to every HTTP retry, including JSON,
   text, XML and binary fetches.
 
+### Fixed: database handles close on every exit path
+- The collector (`run_once` and the daemon), standalone report generation
+  and the weekly trends query now close their cache, HTTP client and SQLite
+  connections when they finish or fail, instead of leaving them to garbage
+  collection.
+- The test suite closes every cache, fetcher and database it opens. Under
+  `--cov` on Python 3.13 it held about 1,550 SQLite descriptors open (each
+  unclosed connection's ResourceWarning kept it alive) and failed at the
+  default 1,024 open-file limit. Test runs also no longer leave
+  `wim-server-test-*` directories in the system temp directory.
+
 ### Added: liquidity and money (Phase 29)
 Keyless sources only: the FRED graph CSV (`fred.stlouisfed.org/graph/fredgraph.csv`,
 allowed by robots.txt with `Crawl-delay: 1`, honored by a 1 s `fred-graph` rate

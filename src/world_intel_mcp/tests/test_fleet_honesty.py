@@ -401,11 +401,11 @@ def _baseline_keys(baseline: TemporalBaseline) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_surge_with_posture_down_is_an_error_and_records_nothing(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     """Regression (M1): a posture outage recorded a zero in every region's
     surge baseline and reported no surges, the reading of an empty sky."""
-    baseline = TemporalBaseline(db_path=str(tmp_path / "t.db"))
+    baseline = temporal_baseline
     monkeypatch.setattr(intelligence, "_temporal", baseline)
     monkeypatch.setattr(
         military,
@@ -425,9 +425,9 @@ async def test_surge_with_posture_down_is_an_error_and_records_nothing(
 
 @pytest.mark.asyncio
 async def test_surge_skips_regions_whose_theater_had_no_source(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
-    baseline = TemporalBaseline(db_path=str(tmp_path / "t.db"))
+    baseline = temporal_baseline
     monkeypatch.setattr(intelligence, "_temporal", baseline)
     monkeypatch.setattr(
         military,
@@ -462,7 +462,7 @@ async def test_surge_skips_regions_whose_theater_had_no_source(
 @respx.mock
 @pytest.mark.asyncio
 async def test_every_upstream_down_reads_unknown_through_the_real_components(
-    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, tmp_path, temporal_baseline
 ) -> None:
     """Regression (M1, measured by the reviewer with a real Fetcher): NGA,
     adsb.lol and OpenSky all failing gave LOW_ACTIVITY, score 0, zero
@@ -470,7 +470,7 @@ async def test_every_upstream_down_reads_unknown_through_the_real_components(
     zero aircraft and only the snapshot reported it."""
     monkeypatch.setattr(asyncio_mod, "sleep", _no_sleep)
     monkeypatch.setattr(
-        intelligence, "_temporal", TemporalBaseline(db_path=str(tmp_path / "t.db"))
+        intelligence, "_temporal", temporal_baseline
     )
     for host in (r"msi\.nga\.mil", r"api\.adsb\.lol", r"opensky-network\.org"):
         respx.get(url__regex=rf".*{host}.*").mock(return_value=httpx.Response(500))

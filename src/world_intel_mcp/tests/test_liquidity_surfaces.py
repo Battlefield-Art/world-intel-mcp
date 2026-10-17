@@ -70,21 +70,25 @@ def _fetcher(tmp_path: Path) -> Fetcher:
 
 async def _build_payloads(tmp_path: Path) -> dict:
     f = _fetcher(tmp_path)
-    with respx.mock:
-        _mock_all()
-        ecb_key = "M.U2.Y.V.M10+M20+M30.X.1+4+I.U2.2300.Z01.E+A"
-        respx.get(f"https://data-api.ecb.europa.eu/service/data/BSI/{ecb_key}").mock(
-            return_value=httpx.Response(200, json=json.loads(
-                (Path(__file__).parent / "fixtures" / "liquidity" / "ecb_bsi_money.json").read_text()
-            ))
-        )
-        return {
-            "board": await liquidity.fetch_liquidity_board(f),
-            "net": await liquidity.fetch_net_liquidity(f, limit=3),
-            "money": await liquidity.fetch_money_supply(f, limit=2),
-            "fed": await liquidity.fetch_fed_liquidity_series(f, "WALCL", limit=2),
-            "ecb": await liquidity.fetch_ecb_series(f, key=ecb_key, limit=1),
-        }
+    try:
+        with respx.mock:
+            _mock_all()
+            ecb_key = "M.U2.Y.V.M10+M20+M30.X.1+4+I.U2.2300.Z01.E+A"
+            respx.get(f"https://data-api.ecb.europa.eu/service/data/BSI/{ecb_key}").mock(
+                return_value=httpx.Response(200, json=json.loads(
+                    (Path(__file__).parent / "fixtures" / "liquidity" / "ecb_bsi_money.json").read_text()
+                ))
+            )
+            return {
+                "board": await liquidity.fetch_liquidity_board(f),
+                "net": await liquidity.fetch_net_liquidity(f, limit=3),
+                "money": await liquidity.fetch_money_supply(f, limit=2),
+                "fed": await liquidity.fetch_fed_liquidity_series(f, "WALCL", limit=2),
+                "ecb": await liquidity.fetch_ecb_series(f, key=ecb_key, limit=1),
+            }
+    finally:
+        await f.close()
+        f.cache.close()
 
 
 def _payloads(tmp_path: Path) -> dict:

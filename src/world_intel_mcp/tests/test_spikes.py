@@ -6,6 +6,7 @@ from Welford's recurrence: for observations [10, 20, 30, 20] the running
 state is n=4, mean=20, M2=200, so variance=50 and stddev=sqrt(50)=7.0711.
 """
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,13 @@ from world_intel_mcp.sources import news
 
 
 @pytest.fixture
-def detector(tmp_path: Path) -> KeywordSpikeDetector:
-    return KeywordSpikeDetector(db_path=str(tmp_path / "spikes.db"))
+def detector(tmp_path: Path) -> Iterator[KeywordSpikeDetector]:
+    detector = KeywordSpikeDetector(db_path=str(tmp_path / "spikes.db"))
+    try:
+        yield detector
+    finally:
+        if detector._conn is not None:
+            detector._conn.close()
 
 
 def _feed(detector: KeywordSpikeDetector, keyword: str, values: list[int]) -> None:
@@ -84,19 +90,21 @@ def test_spikes_sorted_by_magnitude_descending(detector: KeywordSpikeDetector) -
     assert result[0]["z_score"] > result[1]["z_score"]
 
 
-def test_baselines_persist_across_instances(tmp_path: Path) -> None:
+def test_baselines_persist_across_instances(tmp_path: Path, request) -> None:
     db = str(tmp_path / "persist.db")
     first = KeywordSpikeDetector(db_path=db)
+    request.addfinalizer(lambda: first._conn.close() if first._conn is not None else None)
     _feed(first, "coup", [10, 10, 10])
 
     second = KeywordSpikeDetector(db_path=db)
+    request.addfinalizer(lambda: second._conn.close() if second._conn is not None else None)
     result = second.detect_spikes({"coup": 40})
     assert len(result) == 1  # baseline survived the restart
     assert result[0]["baseline_mean"] == 10.0
 
 
 async def test_fetch_keyword_spikes_composes_news_sources(
-    fetcher, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fetcher, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request
 ) -> None:
     async def _fake_trending(fetcher, min_count=3):
         return {"keywords": [{"keyword": "gaza", "count": 30}]}
@@ -112,9 +120,9 @@ async def test_fetch_keyword_spikes_composes_news_sources(
     monkeypatch.setattr(news, "fetch_trending_keywords", _fake_trending)
     monkeypatch.setattr(news, "fetch_news_feed", _fake_feed)
     # Point the module singleton at a throwaway database.
-    monkeypatch.setattr(
-        spikes_mod, "_detector", KeywordSpikeDetector(db_path=str(tmp_path / "kw.db"))
-    )
+    detector = KeywordSpikeDetector(db_path=str(tmp_path / "kw.db"))
+    request.addfinalizer(lambda: detector._conn.close() if detector._conn is not None else None)
+    monkeypatch.setattr(spikes_mod, "_detector", detector)
 
     result = await fetch_keyword_spikes(fetcher, min_count=3, z_threshold=2.0)
     assert result["keywords_analyzed"] == 1

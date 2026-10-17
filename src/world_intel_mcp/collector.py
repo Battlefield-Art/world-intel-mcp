@@ -23,6 +23,7 @@ import signal
 import sqlite3
 import sys
 import time
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -367,76 +368,79 @@ async def run_daemon(
     source_filter: str | None = None,
 ) -> None:
     """Run the collector in daemon mode with a configurable interval."""
-    cache = Cache()
-    breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
-    vector_store = VectorStore(enabled=True)
-    await vector_store.start()
-    fetcher = Fetcher(cache=cache, breaker=breaker, vector_store=vector_store)
+    async with AsyncExitStack() as resources:
+        cache = Cache()
+        resources.callback(cache.close)
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
+        vector_store = VectorStore(enabled=True)
+        resources.push_async_callback(vector_store.stop)
+        await vector_store.start()
+        fetcher = Fetcher(cache=cache, breaker=breaker, vector_store=vector_store)
+        resources.push_async_callback(fetcher.close)
 
-    resolved_filter = _resolve_source_filter(source_filter)
-    filter_desc = source_filter or "all"
+        resolved_filter = _resolve_source_filter(source_filter)
+        filter_desc = source_filter or "all"
 
-    logger.info(
-        "Collector daemon starting: interval=%ds, sources=%s",
-        interval,
-        filter_desc,
-    )
+        logger.info(
+            "Collector daemon starting: interval=%ds, sources=%s",
+            interval,
+            filter_desc,
+        )
 
-    stop_event = asyncio.Event()
+        stop_event = asyncio.Event()
 
-    def _handle_signal(sig, frame):
-        logger.info("Received signal %s, stopping...", sig)
-        stop_event.set()
+        def _handle_signal(sig, frame):
+            logger.info("Received signal %s, stopping...", sig)
+            stop_event.set()
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
-    cycle = 0
-    while not stop_event.is_set():
-        cycle += 1
-        logger.info("Starting collection cycle %d", cycle)
-        try:
-            summary = await collect_once(fetcher, vector_store, resolved_filter)
-            logger.info("Cycle %d complete: %s", cycle, summary)
-        except Exception as exc:
-            logger.error("Cycle %d failed: %s", cycle, exc)
+        cycle = 0
+        while not stop_event.is_set():
+            cycle += 1
+            logger.info("Starting collection cycle %d", cycle)
+            try:
+                summary = await collect_once(fetcher, vector_store, resolved_filter)
+                logger.info("Cycle %d complete: %s", cycle, summary)
+            except Exception as exc:
+                logger.error("Cycle %d failed: %s", cycle, exc)
 
-        # Evict expired cache entries periodically
-        if cycle % 12 == 0:  # Every ~hour at 5min interval
-            evicted = cache.evict_expired()
-            if evicted:
-                logger.info("Evicted %d expired cache entries", evicted)
+            # Evict expired cache entries periodically
+            if cycle % 12 == 0:  # Every ~hour at 5min interval
+                evicted = cache.evict_expired()
+                if evicted:
+                    logger.info("Evicted %d expired cache entries", evicted)
 
-        # Wait for next cycle or stop signal
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
+            # Wait for next cycle or stop signal
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
 
-    await vector_store.stop()
-    await fetcher.close()
     logger.info("Collector daemon stopped")
 
 
 async def run_once(source_filter: str | None = None) -> dict:
     """Run a single collection cycle and exit."""
-    cache = Cache()
-    breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
-    vector_store = VectorStore(enabled=True)
-    await vector_store.start()
-    fetcher = Fetcher(cache=cache, breaker=breaker, vector_store=vector_store)
+    async with AsyncExitStack() as resources:
+        cache = Cache()
+        resources.callback(cache.close)
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300)
+        vector_store = VectorStore(enabled=True)
+        resources.push_async_callback(vector_store.stop)
+        await vector_store.start()
+        fetcher = Fetcher(cache=cache, breaker=breaker, vector_store=vector_store)
+        resources.push_async_callback(fetcher.close)
 
-    resolved_filter = _resolve_source_filter(source_filter)
-    summary = await collect_once(fetcher, vector_store, resolved_filter)
+        resolved_filter = _resolve_source_filter(source_filter)
+        summary = await collect_once(fetcher, vector_store, resolved_filter)
 
-    # Wait for vector store queue to drain
-    if vector_store._store_queue:
-        await vector_store._store_queue.join()
+        # Wait for vector store queue to drain
+        if vector_store._store_queue:
+            await vector_store._store_queue.join()
 
-    await vector_store.stop()
-    await fetcher.close()
-
-    return summary
+        return summary
 
 
 def main():

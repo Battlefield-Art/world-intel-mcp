@@ -182,12 +182,17 @@ def _item(title, published, category="technology", feed="Ars Technica"):
 
 
 @pytest.fixture
-def fast_fetcher(tmp_path, monkeypatch):
+async def fast_fetcher(tmp_path, monkeypatch):
     """Fetcher without retries or Yahoo spacing so failure paths stay fast."""
     monkeypatch.setattr(fetcher_mod, "_YAHOO_MIN_INTERVAL", 0.0)
     monkeypatch.setitem(fetcher_mod._SOURCE_RATE_LIMITS, "yahoo-finance", 0.0)
-    return Fetcher(cache=Cache(db_path=tmp_path / "nm.db"), breaker=CircuitBreaker(),
-                   default_timeout=5.0, max_retries=0)
+    fetcher = Fetcher(cache=Cache(db_path=tmp_path / "nm.db"), breaker=CircuitBreaker(),
+                      default_timeout=5.0, max_retries=0)
+    try:
+        yield fetcher
+    finally:
+        await fetcher.close()
+        fetcher.cache.close()
 
 
 def _feed(monkeypatch, items):

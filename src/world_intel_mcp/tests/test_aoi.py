@@ -1108,10 +1108,8 @@ def test_segment_distance_perpendicular_pole() -> None:
     assert d == pytest.approx(10007, rel=0.01)
 
 
-def test_store_update_missing_aoi_raises() -> None:
-    import tempfile as _tf
-
-    s = AOIStore(Path(_tf.mkdtemp()) / "kx.db")
+def test_store_update_missing_aoi_raises(tmp_path: Path) -> None:
+    s = AOIStore(tmp_path / "kx.db")
     try:
         with pytest.raises(KeyError):
             s.update("Nowhere", radius_km=10.0)

@@ -9,6 +9,7 @@ import asyncio
 import logging
 import math
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 
 logger = logging.getLogger("world-intel-mcp.analysis.alerts")
@@ -261,11 +262,10 @@ async def fetch_weekly_trends(fetcher) -> dict:
     trends: list[dict] = []
 
     try:
-        conn = sqlite3.connect(_default_db_path())
-        rows = conn.execute(
-            "SELECT key, count, mean, m2, updated_at FROM baselines WHERE count >= 5"
-        ).fetchall()
-        conn.close()
+        with closing(sqlite3.connect(_default_db_path())) as conn:
+            rows = conn.execute(
+                "SELECT key, count, mean, m2, updated_at FROM baselines WHERE count >= 5"
+            ).fetchall()
 
         for key, n, mean, m2, updated_at in rows:
             parts = key.split(":")

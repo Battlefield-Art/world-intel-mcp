@@ -803,7 +803,7 @@ def test_user_facing_text_has_no_em_dashes() -> None:
 
 
 @pytest.fixture(scope="module")
-def server():
+def server(isolated_runtime):
     """server.py imported under test_server_registry's temp cache path, the
     shared runtime rebound while the override is in force (that file's
     fixture pattern)."""
@@ -811,7 +811,7 @@ def server():
     os.environ["WORLD_INTEL_CACHE_DB"] = str(_TMP_CACHE)
     try:
         module = importlib.import_module("world_intel_mcp.server")
-        importlib.import_module("world_intel_mcp.runtime")._initialize()
+        isolated_runtime._initialize()
         yield module
     finally:
         if prior is None:

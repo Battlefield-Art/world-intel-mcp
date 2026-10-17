@@ -55,6 +55,9 @@ class FakeCache:
     def __init__(self, *args, **kwargs):
         self.evictions = 0
 
+    def close(self) -> None:
+        pass
+
     def evict_expired(self) -> int:
         self.evictions += 1
         return 3

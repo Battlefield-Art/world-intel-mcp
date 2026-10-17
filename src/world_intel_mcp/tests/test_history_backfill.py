@@ -73,12 +73,15 @@ def db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def fetcher(db: Path):
+async def fetcher(db: Path):
     # The history store lives in the cache DB in production; same file here.
     f = Fetcher(cache=Cache(db_path=db), breaker=CircuitBreaker(),
                 default_timeout=5.0, max_retries=0)
-    yield f
-    f.cache.close()
+    try:
+        yield f
+    finally:
+        await f.close()
+        f.cache.close()
 
 
 @pytest.fixture
