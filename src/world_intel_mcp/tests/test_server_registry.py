@@ -1,10 +1,10 @@
 """Import-based tests for server.py's tool registry and dispatcher.
 
-Every other test file reads server.py as *text* because importing it
-opens a live ``Cache()``/``AOIStore()`` at the default on-disk path.
-Here we import it for real, under a temp cache path
-(``WORLD_INTEL_CACHE_DB`` is honored by ``Cache`` before the module-level
-``cache = Cache()`` runs), which is what lets these tests verify the
+Every other test file reads server.py as *text* because its shared
+``Cache()``/``AOIStore()`` open at the default on-disk path. Here we
+import it for real, under a temp cache path (``WORLD_INTEL_CACHE_DB`` is
+honored by ``Cache``; the fixture binds the shared infrastructure while
+the override is in force), which is what lets these tests verify the
 registry structurally instead of by regex: the TOOLS/_dispatch parity
 invariant, schema well-formedness, and the actual dispatch path for the
 pure (no-network) tools.
@@ -29,6 +29,11 @@ def server():
     os.environ["WORLD_INTEL_CACHE_DB"] = str(_TMP_CACHE)
     try:
         module = importlib.import_module("world_intel_mcp.server")
+        # The shared infrastructure binds its cache path on first access,
+        # and an earlier test module may already have touched it under a
+        # different path. Rebind it here, under the override, so this
+        # file's premise holds whatever order the modules run in.
+        importlib.import_module("world_intel_mcp.runtime")._initialize()
         yield module
     finally:
         if prior is None:
