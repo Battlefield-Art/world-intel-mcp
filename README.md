@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Real-time global intelligence across **30+ domains** with **139 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
+Real-time global intelligence across **30+ domains** with **144 MCP tools**, a live ops-center dashboard, a CLI, and a **Qdrant vector store** for enterprise-grade semantic search across accumulated intelligence. All data comes from free, public APIs: no paid subscriptions required.
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
@@ -25,6 +25,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Macro Composite** | 1 | Weighted 6-signal market verdict (Fear&Greed, VIX, sectors, DXY, BTC, yields) |
 | **Economic Indicators** | 6 | AAA fuel prices, EIA energy, FRED macro, World Bank |
 | **Central Banks** | 1 | 15 central bank policy rates |
+| **Liquidity and Money** | 5 | Keyless FRED graph CSV (Fed balance sheet, Treasury General Account, overnight reverse repo, US M2) and ECB Data Portal (euro area M1/M2/M3 stocks, flows and growth, Eurosystem balance sheet); derived net liquidity with its formula, unit conversion and date alignment stated |
 | **BTC Technicals** | 1 | SMA 50/200, golden/death cross, Mayer Multiple |
 | **Natural Disasters** | 2 | USGS earthquakes, NASA FIRMS wildfires |
 | **Environmental** | 2 | NASA EONET, GDACS disaster alerts |
@@ -64,7 +65,7 @@ Built for AI agents that need world awareness: market conditions, geopolitical r
 | **Tropical Cyclones** | 2 | NHC (Atlantic, E/C Pacific) + JTWC (NW Pacific, N Indian, S Hemisphere) |
 | **Situation Brief** | 1 | Cited situational awareness brief over MCP: bounded server-side overview synthesized via local Ollama, with a mechanically-cited fallback |
 
-**Total: 139 tools** across 30+ intelligence domains.
+**Total: 144 tools** across 30+ intelligence domains.
 
 ---
 
@@ -129,6 +130,8 @@ intel markets              # stock indices
 intel earthquakes --min-mag 5.0
 intel migration-surges     # year-over-year displacement jumps (UNHCR)
 intel migration-flows -o Sudan
+intel liquidity            # Fed balance sheet, TGA, RRP, net liquidity, US M2, euro area M1-M3
+intel net-liquidity -n 0   # full weekly history, components and RRP date per week
 intel status               # cache + circuit breaker health
 ```
 
@@ -147,7 +150,7 @@ collector.py  (daemon)    ─┘
 - **CircuitBreaker**: Per-source tracking. 3 consecutive failures trips for 5 minutes. Each RSS feed gets its own breaker.
 - **Cache**: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 - **VectorStore**: Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim). Async background worker queue for non-blocking storage. Enables semantic search across all accumulated intelligence.
-- **Collector**: Standalone daemon that fetches all 55 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
+- **Collector**: Standalone daemon that fetches all 57 sources in parallel and populates the vector store. Run once or as a daemon (default: 5-minute interval). Includes the AOI change sweep, so a running daemon continuously watches every defined geofence.
 - **Sources** (`sources/*.py`): 30+ modules, each exports `async def fetch_*(fetcher, **kwargs) -> dict`.
 - **Analysis** (`analysis/*.py`): Cross-domain synthesis — signal aggregation, instability indexing, NLP, company enrichment, macro composite.
 - **Config** (`config/*.py`): Curated datasets — 22 hotspots, 70+ bases, 40 ports, 24 pipelines, 24 nuclear facilities, 34 cables, 48 datacenters, 27 spaceports, 82 exchanges.
@@ -217,6 +220,17 @@ collector.py  (daemon)    ─┘
 | Tool | Description |
 |------|-------------|
 | `intel_central_bank_rates` | Policy rates for 15 major central banks |
+
+### Liquidity and Money (5)
+Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observation date, value and units; every series is typed `amount_outstanding`, `flow`, `growth_rate` or `index`, and carries a freshness block (age of the newest observation against its publication cadence). `limit=0` returns the full history. A failed upstream is an error or an `unavailable` row, never a zero.
+
+| Tool | Description |
+|------|-------------|
+| `intel_liquidity_board` | Latest reading and change vs the previous observation for the Fed balance sheet, TGA, overnight reverse repo, net liquidity, US M2, euro area M1/M2/M3 and Eurosystem total assets; sort by `biggest_move` or `newest`; a `blocked` list names the measures not covered (ICI fund flows and ETF net issuance, FINRA margin statistics, BLS) with the upstream status measured, and no proxy stands in for them |
+| `intel_net_liquidity` | Weekly WALCL minus WDTGAL minus RRPONTSYD in USD billions (millions divided by 1,000), aligned on the WALCL Wednesday; each point names its components and the RRP date used; unaligned weeks are skipped and counted; a `method` block states each term's observation basis, units, conversion and RRP alignment |
+| `intel_money_supply` | US M2 (FRED M2SL) and euro area M1, M2, M3 (ECB BSI stocks, monthly flows, annual growth rates), reported separately and never summed; US M3 is reported as discontinued |
+| `intel_fed_liquidity_series` | One FRED liquidity series (WALCL, WDTGAL, WTREGEN, RRPONTSYD, M2SL) with full history; blank source dates are counted, not read as zero |
+| `intel_ecb_series` | ECB Data Portal series by SDMX key from BSI (monetary aggregates) or ILM (Eurosystem weekly financial statement), with units, scale and provisional flags from the response |
 
 ### BTC Technicals (1)
 | Tool | Description |
@@ -665,7 +679,7 @@ Everything else uses free, unauthenticated public APIs.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 973 tests (991 total, 18 live-network smoke tests deselected by default)
+pytest                       # 1037 tests (1055 total, 18 live-network smoke tests deselected by default)
 pytest --cov=world_intel_mcp # with coverage
 pytest tests/test_forex.py -v # single module
 ```

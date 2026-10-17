@@ -68,6 +68,7 @@ from .sources.github_trending import fetch_trending_repos
 from .sources.arxiv_papers import fetch_arxiv_papers
 from .sources.usa_spending import fetch_usa_spending
 from .sources import geospatial
+from .sources import liquidity
 
 console = Console()
 
@@ -1572,6 +1573,186 @@ def central_banks_cmd(ctx: click.Context) -> None:
             _cell(r.get("as_of", "")),
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Liquidity and money (Phase 29)
+# ---------------------------------------------------------------------------
+
+
+def _liq_num(value: Any, signed: bool = False) -> str:
+    """Two decimals, rounded half-up on the value as reported: binary
+    float formatting would show 5869.615 as 5,869.61."""
+    if value is None:
+        return "n/a"
+    from decimal import ROUND_HALF_UP, Decimal
+
+    d = Decimal(repr(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{d:+,.2f}" if signed else f"{d:,.2f}"
+
+
+def _liq_points_table(title: str, points: list[dict], extra: tuple[str, ...] = ()) -> Table:
+    table = Table(title=title, box=box.SIMPLE_HEAVY)
+    table.add_column("Observed", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_column("Units")
+    for col in extra:
+        table.add_column(col.replace("_", " ").title(), justify="right")
+    for p in points:
+        table.add_row(
+            _cell(p.get("observed_at", "")),
+            _liq_num(p.get("value")),
+            _cell(p.get("units") or ""),
+            *(
+                _liq_num(p.get(c)) if isinstance(p.get(c), (int, float)) else _cell(p.get(c) or "")
+                for c in extra
+            ),
+        )
+    return table
+
+
+@main.command(name="liquidity")
+@click.option(
+    "--sort", type=click.Choice(["biggest_move", "newest"]), default="biggest_move",
+    help="Order rows by absolute percent change or by newest period",
+)
+@click.pass_context
+def liquidity_cmd(ctx: click.Context, sort: str) -> None:
+    """Liquidity board: Fed balance sheet, TGA, RRP, net liquidity, M2, euro M1-M3."""
+    data = _run(liquidity.fetch_liquidity_board(_get_fetcher(), sort=sort))
+    if _bail_on_error(ctx, data):
+        return
+    table = Table(title=f"Liquidity board (sorted by {sort})", box=box.SIMPLE_HEAVY)
+    table.add_column("Indicator", style="bold")
+    table.add_column("Observed")
+    table.add_column("Latest", justify="right")
+    table.add_column("Units")
+    table.add_column("Change", justify="right")
+    table.add_column("Change %", justify="right")
+    table.add_column("Measure")
+    for r in data.get("indicators", []):
+        stale = (r.get("freshness") or {}).get("stale")
+        measure = r.get("measure", "")
+        table.add_row(
+            _cell(r.get("indicator", "")),
+            Text(f"{r.get('observed_at')} (stale)", style="yellow") if stale else _cell(r.get("observed_at", "")),
+            _liq_num(r.get("latest_value")),
+            _cell(r.get("units") or ""),
+            _liq_num(r.get("change"), signed=True),
+            _liq_num(r.get("change_pct"), signed=True),
+            _cell("stock" if measure == "amount_outstanding" else measure),
+        )
+    console.print(table)
+    for u in data.get("unavailable", []):
+        console.print(
+            f"[red]Unavailable:[/red] {escape(str(u.get('indicator')))}: {escape(str(u.get('error')))}"
+        )
+    for b in data.get("blocked", []):
+        console.print(
+            f"[dim]Not covered: {escape(str(b.get('measure')))} ({escape(str(b.get('publisher')))}): "
+            f"{escape(str(b.get('measured')))}[/dim]"
+        )
+    _print_data_gaps(data)
+
+
+@main.command(name="net-liquidity")
+@click.option("--limit", "-n", default=12, help="Newest weeks (0 = full history)")
+@click.option("--start", default=None, help="Only weeks on or after YYYY-MM-DD")
+@click.pass_context
+def net_liquidity_cmd(ctx: click.Context, limit: int, start: str | None) -> None:
+    """US net liquidity = WALCL - WDTGAL - RRPONTSYD, weekly, USD billions."""
+    data = _run(liquidity.fetch_net_liquidity(_get_fetcher(), limit=limit, start=start))
+    if _bail_on_error(ctx, data):
+        return
+    console.print(f"[bold]{escape(str(data.get('formula', '')))}[/bold]")
+    console.print(f"[dim]{escape(str(data.get('alignment', '')))}[/dim]\n")
+    console.print(
+        _liq_points_table(
+            "US net liquidity",
+            data.get("points", []),
+            ("fed_total_assets", "treasury_general_account", "reverse_repo", "reverse_repo_observed_at"),
+        )
+    )
+    _print_data_gaps(data)
+
+
+@main.command(name="money-supply")
+@click.option(
+    "--region", type=click.Choice(["all", "us", "euro_area"]), default="all",
+    help="US M2, euro area M1/M2/M3, or both",
+)
+@click.option("--limit", "-n", default=6, help="Newest months per series (0 = full history)")
+@click.pass_context
+def money_supply_cmd(ctx: click.Context, region: str, limit: int) -> None:
+    """Money supply: US M2 and euro area M1/M2/M3, never summed."""
+    data = _run(liquidity.fetch_money_supply(_get_fetcher(), region=region, limit=limit))
+    if _bail_on_error(ctx, data):
+        return
+    us = data.get("us")
+    if us is not None:
+        m2 = us.get("M2", {})
+        if "error" in m2:
+            console.print(f"[red]US M2 unavailable:[/red] {escape(str(m2['error']))}")
+        else:
+            console.print(_liq_points_table("US M2 (FRED M2SL, seasonally adjusted)", m2.get("points", [])))
+        console.print(f"[dim]{escape(str(us.get('M3', {}).get('note', '')))}[/dim]")
+    ea = data.get("euro_area")
+    if ea is not None:
+        if "error" in ea:
+            console.print(f"[red]Euro area unavailable:[/red] {escape(str(ea['error']))}")
+        else:
+            for name, roles in ea.get("aggregates", {}).items():
+                for role, s in roles.items():
+                    console.print(
+                        _liq_points_table(f"Euro area {name} {role}", s.get("points", []), ("status",))
+                    )
+    console.print(f"[dim]{escape(str(data.get('note', '')))}[/dim]")
+    _print_data_gaps(data)
+
+
+@main.command(name="fed-liquidity")
+@click.argument("series_id", type=click.Choice(sorted(liquidity.FRED_SERIES), case_sensitive=False))
+@click.option("--limit", "-n", default=20, help="Newest points (0 = full history)")
+@click.option("--start", default=None, help="Only points on or after YYYY-MM-DD")
+@click.pass_context
+def fed_liquidity_cmd(ctx: click.Context, series_id: str, limit: int, start: str | None) -> None:
+    """One keyless FRED liquidity series (WALCL, WDTGAL, WTREGEN, RRPONTSYD, M2SL)."""
+    data = _run(
+        liquidity.fetch_fed_liquidity_series(
+            _get_fetcher(), series_id=series_id, limit=limit, start=start
+        )
+    )
+    if _bail_on_error(ctx, data):
+        return
+    console.print(
+        _liq_points_table(
+            f"{data.get('label')} ({data.get('series_id')}, {data.get('frequency')}, {data.get('measure')})",
+            data.get("points", []),
+        )
+    )
+    _print_data_gaps(data)
+
+
+@main.command(name="ecb-series")
+@click.argument("key")
+@click.option("--dataset", "-d", type=click.Choice(sorted(liquidity.ECB_DATASETS)), default="BSI")
+@click.option("--limit", "-n", default=12, help="Newest points per series (0 = full history)")
+@click.option("--start", default=None, help="Only points on or after YYYY-MM-DD")
+@click.pass_context
+def ecb_series_cmd(
+    ctx: click.Context, key: str, dataset: str, limit: int, start: str | None
+) -> None:
+    """ECB Data Portal series by SDMX key (BSI money, ILM Eurosystem balance sheet)."""
+    data = _run(
+        liquidity.fetch_ecb_series(_get_fetcher(), dataset=dataset, key=key, limit=limit, start=start)
+    )
+    if _bail_on_error(ctx, data):
+        return
+    for s in data.get("series", []):
+        # ECB titles are remote free text: escape them in the table title.
+        title = escape(f"{s.get('title') or s.get('key')} ({s.get('measure')})")
+        console.print(_liq_points_table(title, s.get("points", []), ("status",)))
+    _print_data_gaps(data)
 
 
 @main.command(name="shipping")

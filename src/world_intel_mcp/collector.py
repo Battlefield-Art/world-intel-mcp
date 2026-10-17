@@ -52,6 +52,13 @@ SOURCES = [
     ("residential_natgas", "sources.economic", "fetch_residential_natgas_prices", {}),
     ("electricity_rates", "sources.economic", "fetch_electricity_rates", {}),
     ("central_bank_rates", "sources.central_banks", "fetch_central_bank_rates", {}),
+    # Liquidity (2): FRED H.4.1 data are weekly (Thursday release), RRP
+    # daily, M2 and euro area M1-M3 monthly. The fetcher caches FRED CSVs
+    # 1 h and ECB responses 3 h, so a 5-minute daemon cycle reaches each
+    # upstream at most once per TTL; the response's freshness block, not
+    # the cycle, says whether the data are current.
+    ("liquidity_board", "sources.liquidity", "fetch_liquidity_board", {}),
+    ("net_liquidity", "sources.liquidity", "fetch_net_liquidity", {}),
     # Natural Disasters & Hazards (5)
     ("earthquakes", "sources.seismology", "fetch_earthquakes", {}),
     ("wildfires", "sources.wildfire", "fetch_wildfires", {}),
@@ -148,6 +155,7 @@ DOMAIN_GROUPS = {
         "electricity_rates",
         "central_bank_rates",
     ],
+    "liquidity": ["liquidity_board", "net_liquidity"],
     "natural": [
         "earthquakes",
         "wildfires",
