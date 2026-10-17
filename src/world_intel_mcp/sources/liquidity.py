@@ -813,22 +813,29 @@ def parse_sdmx_json(data: dict, dataset: str) -> list[dict]:
 _JSON_KINDS = {list: "array", str: "string", int: "number", float: "number", bool: "boolean", type(None): "null"}
 
 
+# How the portal's answer to a key that matches no series opens its
+# "detail" (application/problem+json, "title": "Not Found", "status": 404;
+# every no-series 404 seen live on 2026-10-17).
+_ECB_NO_SERIES_DETAIL = "No Series was returned for the query"
+
+
 def _ecb_404_is_no_data(body: bytes) -> bool:
     """Whether an ECB 404 is the portal's own answer to a key that matches
-    no series: an empty body or a JSON object (its problem+json, e.g.
-    "No Series was returned for the query"). A 404 with any other body
-    (an HTML or plain-text error page, JSON that is not an object) came
-    from something in front of the portal and takes the outage path.
+    no series: a JSON object whose "detail" starts with
+    ``_ECB_NO_SERIES_DETAIL``. Any other 404 (an empty body, an HTML or
+    plain-text error page, any other JSON) is not that answer and takes
+    the outage path.
 
-    Residual risk: a JSON-object 404 from a moved gateway would still
-    read as no-data.
+    Residual risk: if the portal rewords that detail, its real no-series
+    answers take the outage path too (retried, counted as breaker
+    failures, a marked stale copy served where one exists).
     """
-    if not body.strip():
-        return True
     try:
-        return isinstance(json.loads(body), dict)
+        doc = json.loads(body)
     except (ValueError, RecursionError):  # UnicodeError is a ValueError
         return False
+    detail = doc.get("detail") if isinstance(doc, dict) else None
+    return isinstance(detail, str) and detail.startswith(_ECB_NO_SERIES_DETAIL)
 
 
 async def _ecb_fetch(
