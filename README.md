@@ -222,11 +222,11 @@ collector.py  (daemon)    ─┘
 | `intel_central_bank_rates` | Policy rates for 15 major central banks |
 
 ### Liquidity and Money (5)
-Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observation date, value and units; every series is typed `amount_outstanding`, `flow`, `growth_rate` or `index`, and carries a freshness block (age of the newest observation against its publication cadence). `limit=0` returns the full history. A failed upstream is an error or an `unavailable` row, never a zero.
+Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observation date, value and units; every series is typed `amount_outstanding`, `flow`, `growth_rate`, `index` or `unknown`, and carries a freshness block (age of the newest observation against its publication cadence). `limit=0` returns the full history. A failed upstream is an error or an `unavailable` row, never a zero.
 
 | Tool | Description |
 |------|-------------|
-| `intel_liquidity_board` | Latest reading and change vs the previous observation for the Fed balance sheet, TGA, overnight reverse repo, net liquidity, US M2, euro area M1/M2/M3 and Eurosystem total assets; sort by `biggest_move` or `newest`; a `blocked` list names the measures not covered (ICI fund flows and ETF net issuance, FINRA margin statistics, BLS) with the upstream status measured, and no proxy stands in for them |
+| `intel_liquidity_board` | Latest reading and change vs the previous observation for the Fed balance sheet, TGA, overnight reverse repo, net liquidity, US M2, euro area M1/M2/M3 and Eurosystem total assets; sort by `biggest_move` (absolute change in billions of each row currency, no FX conversion; horizons differ) or `newest`; a `blocked` list names the measures not covered (ICI fund flows and ETF net issuance, FINRA margin statistics, BLS) with the upstream status measured, and no proxy stands in for them |
 | `intel_net_liquidity` | Weekly WALCL minus WDTGAL minus RRPONTSYD in USD billions (millions divided by 1,000), aligned on the WALCL Wednesday; each point names its components and the RRP date used; unaligned weeks are skipped and counted; a `method` block states each term's observation basis, units, conversion and RRP alignment |
 | `intel_money_supply` | US M2 (FRED M2SL) and euro area M1, M2, M3 (ECB BSI stocks, monthly flows, annual growth rates), reported separately and never summed; US M3 is reported as discontinued |
 | `intel_fed_liquidity_series` | One FRED liquidity series (WALCL, WDTGAL, WTREGEN, RRPONTSYD, M2SL) with full history; blank source dates are counted, not read as zero |
