@@ -16,6 +16,9 @@ Every point carries ``observed_at`` (the period the value describes),
 outstanding, a flow (transactions within the period), a growth rate or an
 index. A blank FRED cell is a missing observation, never a zero, and a
 failed component is an error, never a zero term in the net liquidity sum.
+RRP uses the Wednesday value; a blank Wednesday on or after 2013-09-23
+may use Tuesday only. Earlier blank Wednesdays and missing Tuesdays are
+skipped and counted, never filled.
 
 Blocked upstreams (measured 2026-10-17, see ROADMAP Phase 29 and
 ``BLOCKED_SOURCES``): ICI money market fund assets and ETF net issuance
@@ -31,10 +34,14 @@ import calendar
 import copy
 import csv
 import io
+import json
 import logging
+import math
 import re
+import time
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 from ..fetcher import Fetcher
 
@@ -133,10 +140,7 @@ NESTING_NOTE = (
     "never added together."
 )
 
-# Net liquidity components and the unit each is converted to before the
-# subtraction. RRP may come from up to this many days before the
-# Wednesday (a holiday leaves a blank FRED cell); never from after it.
-_NET_LIQUIDITY_RRP_LOOKBACK_DAYS = 5
+_DAILY_RRP_START = date(2013, 9, 23)
 NET_LIQUIDITY_FORMULA = (
     "net_liquidity = WALCL - WDTGAL - RRPONTSYD, in USD billions: WALCL and "
     "WDTGAL are USD millions divided by 1,000; RRPONTSYD is already USD billions"
@@ -144,8 +148,8 @@ NET_LIQUIDITY_FORMULA = (
 NET_LIQUIDITY_ALIGNMENT = (
     "One point per WALCL Wednesday. WDTGAL must be reported for that same "
     "Wednesday. RRPONTSYD is taken from that Wednesday, or when that day is "
-    f"blank, from the latest earlier business day within "
-    f"{_NET_LIQUIDITY_RRP_LOOKBACK_DAYS} days; each point names the RRP date "
+    "blank on or after 2013-09-23, from Tuesday only; before that date a "
+    "blank Wednesday has no fallback. Each point names the RRP date "
     "used. Weeks without an aligned TGA or RRP value are skipped and counted, "
     "never filled with zero."
 )
@@ -182,9 +186,9 @@ NET_LIQUIDITY_METHOD: dict[str, Any] = {
             "units": "USD billions",
             "conversion": "none: already USD billions",
             "alignment": (
-                "the value for the WALCL Wednesday; when that day is blank, the "
-                f"latest earlier day within {_NET_LIQUIDITY_RRP_LOOKBACK_DAYS} days, "
-                "reported per point as reverse_repo_observed_at; never a later day"
+                "the value for the WALCL Wednesday; when blank on or after "
+                "2013-09-23, Tuesday only; no fallback before that date. "
+                "Reported per point as reverse_repo_observed_at; never a later day"
             ),
         },
     },
@@ -248,7 +252,6 @@ ECB_DATASETS = {
 _ECB_MAX_AGE_DAYS = {"M": 75, "W": 16, "D": 6, "Q": 200, "A": 500}
 
 _ECB_KEY_RE = re.compile(r"^[A-Za-z0-9_+.]{1,200}$")
-_FRED_ID_RE = re.compile(r"^[A-Z0-9]{2,30}$")
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +304,7 @@ def _change(latest: dict | None, previous: dict | None, relative: bool = True) -
     a, b = latest["value"], previous["value"]
     return {
         "absolute": _round(a - b),
+        "units": latest.get("units") if relative else "percentage points",
         "pct": _round((a - b) / abs(b) * 100, 4) if b and relative else None,
         "from": previous["observed_at"],
         "to": latest["observed_at"],
@@ -320,6 +324,11 @@ def _freshness(period_end: date | None, max_age_days: int) -> dict:
 
 
 def _stale_gap(name: str, observed_at: str, fresh: dict) -> str | None:
+    if fresh.get("served_from_stale_cache"):
+        return (
+            f"{name}: upstream fetch failed or circuit open; served from stale cache "
+            f"({fresh['cache_age_seconds']} seconds old)"
+        )
     if fresh.get("stale"):
         return (
             f"{name}: newest observation {observed_at} is {fresh['latest_age_days']} "
@@ -357,27 +366,53 @@ def parse_fred_csv(text: str, series_id: str) -> list[tuple[date, float | None]]
     return rows
 
 
+def _cache_meta(fetcher: Fetcher, key: str) -> dict:
+    meta = fetcher.cache.get_stale_meta(key)
+    if meta is None:
+        return {}
+    return {
+        "served_from_stale_cache": True,
+        "cache_age_seconds": round(max(0.0, time.time() - meta[1]), 1),
+    }
+
+
+def _mark_cached(series: dict, meta: dict) -> dict:
+    if meta:
+        series.update(meta)
+        series.setdefault("freshness", {}).update(meta, stale=True)
+    return series
+
+
 async def _fred_rows(
     fetcher: Fetcher, series_id: str
-) -> tuple[list[tuple[date, float | None]] | None, str | None]:
-    text = await fetcher.get_text(
-        _FRED_GRAPH_URL,
-        source=FRED_SOURCE,
-        cache_key=f"liquidity:fred:{series_id}",
-        cache_ttl=_FRED_TTL,
-        headers=_HEADERS,
-        params={"id": series_id},
-        timeout=20.0,
-    )
+) -> tuple[list[tuple[date, float | None]] | None, str | None, dict]:
+    key = f"liquidity:fred:{series_id}"
+    text = fetcher.cache.get(key)
+    meta = {}
+    fetched = text is None
+    if fetched:
+        result = await fetcher.get_bytes(
+            f"{_FRED_GRAPH_URL}?{urlencode({'id': series_id})}",
+            source=FRED_SOURCE, headers=_HEADERS, timeout=20.0,
+        )
+        if result.ok:
+            text = result.content.decode("utf-8", errors="replace")
+        else:
+            text = fetcher.cache.get_stale(key)
+            meta = _cache_meta(fetcher, key)
     if text is None:
-        return None, f"FRED graph CSV for {series_id} unavailable (fetch failed, no cached copy)"
+        return None, f"FRED graph CSV for {series_id} unavailable (fetch failed, no cached copy)", {}
     try:
         rows = parse_fred_csv(text, series_id)
-    except ValueError as exc:
-        return None, f"FRED graph CSV for {series_id} not in the expected format: {exc}"
+    except (ValueError, csv.Error) as exc:
+        if not fetched:
+            fetcher.cache.delete(key)
+        return None, f"FRED graph CSV for {series_id} not in the expected format: {exc}", {}
     if not any(v is not None for _, v in rows):
-        return None, f"FRED graph CSV for {series_id} has no observations"
-    return rows, None
+        return None, f"FRED graph CSV for {series_id} has no observations", {}
+    if fetched and not meta:
+        fetcher.cache.set(key, text, _FRED_TTL)
+    return rows, None, meta
 
 
 def _fred_period_end(series_id: str, d: date) -> date:
@@ -459,7 +494,7 @@ async def fetch_fed_liquidity_series(
     except ValueError as exc:
         return {"error": str(exc), "timestamp": _utc_now_iso()}
 
-    rows, err = await _fred_rows(fetcher, sid)
+    rows, err, cache_meta = await _fred_rows(fetcher, sid)
     if rows is None:
         return {
             "error": err,
@@ -468,7 +503,7 @@ async def fetch_fed_liquidity_series(
             "data_gaps": [err],
             "timestamp": _utc_now_iso(),
         }
-    series = _build_fred_series(sid, rows, n, start_d)
+    series = _mark_cached(_build_fred_series(sid, rows, n, start_d), cache_meta)
     gaps = [_FRED_GAP]
     stale = _stale_gap(sid, series["latest"]["observed_at"], series["freshness"])
     if stale:
@@ -506,7 +541,7 @@ def compute_net_liquidity(
             continue
         tga_v = tga_by_day.get(day)
         rrp_day: date | None = None
-        for back in range(_NET_LIQUIDITY_RRP_LOOKBACK_DAYS + 1):
+        for back in range(2 if day >= _DAILY_RRP_START else 1):
             candidate = date.fromordinal(day.toordinal() - back)
             if candidate in rrp_by_day:
                 rrp_day = candidate
@@ -545,7 +580,7 @@ async def fetch_net_liquidity(
 
     ids = ("WALCL", "WDTGAL", "RRPONTSYD")
     fetched = await asyncio.gather(*(_fred_rows(fetcher, sid) for sid in ids))
-    failures = {sid: err for sid, (rows, err) in zip(ids, fetched) if rows is None}
+    failures = {sid: err for sid, (rows, err, _) in zip(ids, fetched) if rows is None}
     base = {
         "source": FRED_SOURCE,
         "formula": NET_LIQUIDITY_FORMULA,
@@ -567,7 +602,7 @@ async def fetch_net_liquidity(
             "data_gaps": gaps,
             "timestamp": _utc_now_iso(),
         }
-    walcl, tga, rrp = (rows for rows, _ in fetched)
+    walcl, tga, rrp = (rows for rows, _, _ in fetched)
     all_points, skipped = compute_net_liquidity(walcl, tga, rrp)
     if not all_points:
         return {
@@ -586,9 +621,12 @@ async def fetch_net_liquidity(
         newest_first = newest_first[:n]
     keep = ("label", "units", "frequency", "measure", "release", "latest", "freshness")
     components = {}
-    for sid, rows in zip(ids, (walcl, tga, rrp)):
+    for sid, (rows, _, cache_meta) in zip(ids, fetched):
         built = _build_fred_series(sid, rows, 1, None)
-        components[sid] = {k: built[k] for k in keep}
+        components[sid] = _mark_cached({k: built[k] for k in keep}, cache_meta)
+    stale_components = [meta for _, _, meta in fetched if meta]
+    if stale_components:
+        _mark_cached(base, max(stale_components, key=lambda m: m["cache_age_seconds"]))
     gaps = [_FRED_GAP, TGA_CHOICE_NOTE]
     for sid, comp in components.items():
         stale = _stale_gap(sid, comp["latest"]["observed_at"], comp["freshness"])
@@ -633,6 +671,9 @@ def _attr_lookup(defs: list[dict], indexes: list[Any]) -> dict[str, dict]:
 
 
 def _ecb_units(attrs: dict[str, dict]) -> tuple[str | None, int | None]:
+    base = attrs.get("UNIT_INDEX_BASE")
+    if base:
+        return f"index ({base.get('name') or base.get('id')})", 1
     unit = attrs.get("UNIT", {})
     mult = attrs.get("UNIT_MULT", {})
     unit_id = unit.get("id")
@@ -737,26 +778,41 @@ async def _ecb_fetch(
         params["lastNObservations"] = last_n
     if start is not None:
         params["startPeriod"] = start.isoformat()
-    data = await fetcher.get_json(
-        _ECB_DATA_URL.format(dataset=dataset, key=key),
-        source=ECB_SOURCE,
-        cache_key=f"liquidity:ecb:{dataset}:{key}:{last_n}:{start}",
-        cache_ttl=_ECB_TTL,
-        headers=_HEADERS,
-        params=params,
-        timeout=30.0,
-    )
-    if not isinstance(data, dict):
-        return None, (
-            f"ECB Data Portal returned no data for {dataset}/{key} "
-            "(outage, or no series matches the key)"
+    cache_key = f"liquidity:ecb:{dataset}:{key}:{last_n}:{start}"
+    data = fetcher.cache.get(cache_key)
+    cache_meta = {}
+    fetched = data is None
+    if fetched:
+        result = await fetcher.get_bytes(
+            f"{_ECB_DATA_URL.format(dataset=dataset, key=key)}?{urlencode(params)}",
+            source=ECB_SOURCE, headers=_HEADERS, timeout=30.0,
         )
+        if result.status == 404:
+            return None, f"ECB Data Portal: no series matches the key {dataset}/{key}"
+        if result.ok and not result.content.strip():
+            return None, f"ECB Data Portal: no observations on or after {start or 'the requested start'} for {dataset}/{key}"
+        if result.ok:
+            try:
+                data = json.loads(result.content)
+            except (ValueError, UnicodeError) as exc:
+                return None, f"ECB Data Portal response not in the expected SDMX-JSON shape: {exc!r:.80}"
+        else:
+            data = fetcher.cache.get_stale(cache_key)
+            cache_meta = _cache_meta(fetcher, cache_key)
+    if not isinstance(data, dict):
+        return None, f"ECB Data Portal returned no data for {dataset}/{key} (upstream fetch failed or circuit open)"
     try:
         series = parse_sdmx_json(data, dataset)
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+        if not fetched:
+            fetcher.cache.delete(cache_key)
         return None, f"ECB Data Portal response for {dataset}/{key} not in the expected SDMX-JSON shape: {exc!r:.80}"
     if not any(s["points"] for s in series):
         return None, f"ECB Data Portal returned no observations for {dataset}/{key}"
+    if fetched and not cache_meta:
+        fetcher.cache.set(cache_key, data, _ECB_TTL)
+    for item in series:
+        item.update(cache_meta)
     return series, None
 
 
@@ -782,7 +838,12 @@ def _finish_ecb_series(series: dict, limit: int) -> dict:
             if series["measure"] == "flow"
             else _change(latest, previous, relative=series["measure"] != "growth_rate")
         ),
-        "freshness": _freshness(end, max_age),
+        "freshness": {
+            **_freshness(end, max_age),
+            **({"stale": True, "served_from_stale_cache": True,
+                "cache_age_seconds": series["cache_age_seconds"]}
+               if series.get("served_from_stale_cache") else {}),
+        },
         "order": "newest_first",
         "count": len(newest_first),
         "points": newest_first,
@@ -811,9 +872,17 @@ async def fetch_ecb_series(
             "timestamp": _utc_now_iso(),
         }
     key = str(key or "").strip()
-    if not _ECB_KEY_RE.match(key):
+    if not _ECB_KEY_RE.fullmatch(key):
         return {
             "error": "key must be an SDMX series key: letters, digits, '.', '+' and '_' only",
+            "timestamp": _utc_now_iso(),
+        }
+    dimensions = key.split(".")
+    if (len(dimensions) != {"BSI": 11, "ILM": 6}[ds]
+            or any(not code for dim in dimensions for code in dim.split("+"))
+            or math.prod(len(dim.split("+")) for dim in dimensions) > _MAX_ECB_SERIES):
+        return {
+            "error": "key must specify every SDMX dimension without wildcards and at most 50 series combinations",
             "timestamp": _utc_now_iso(),
         }
     try:
@@ -894,12 +963,12 @@ async def fetch_money_supply(
     want_us = reg in ("all", "us")
     want_ea = reg in ("all", "euro_area")
 
-    async def _none() -> tuple[None, None]:
-        return None, None
+    async def _none(value):
+        return value
 
-    us_task = _fred_rows(fetcher, "M2SL") if want_us else _none()
-    ea_task = _ecb_fetch(fetcher, "BSI", _ECB_MONEY_KEY, n + 1 if n else 0, None) if want_ea else _none()
-    (us_rows, us_err), (ea_series, ea_err) = await asyncio.gather(us_task, ea_task)
+    us_task = _fred_rows(fetcher, "M2SL") if want_us else _none((None, None, {}))
+    ea_task = _ecb_fetch(fetcher, "BSI", _ECB_MONEY_KEY, n + 1 if n else 0, None) if want_ea else _none((None, None))
+    (us_rows, us_err, us_cache), (ea_series, ea_err) = await asyncio.gather(us_task, ea_task)
 
     gaps: list[str] = []
     out: dict[str, Any] = {"region": reg, "note": NESTING_NOTE}
@@ -909,7 +978,7 @@ async def fetch_money_supply(
             us["M2"] = {"error": us_err}
             gaps.append(us_err)
         else:
-            m2 = _build_fred_series("M2SL", us_rows, n, None)
+            m2 = _mark_cached(_build_fred_series("M2SL", us_rows, n, None), us_cache)
             us["M2"] = {**m2, "source": FRED_SOURCE}
             gaps.append(_FRED_GAP)
             stale = _stale_gap("M2SL", m2["latest"]["observed_at"], m2["freshness"])
@@ -939,9 +1008,10 @@ async def fetch_money_supply(
                         stale = _stale_gap(f"euro area {name} {role}", s["latest"]["observed_at"], s["freshness"])
                         if stale:
                             gaps.append(stale)
-            missing = sorted(set(_ECB_AGGREGATE_CODES.values()) - set(aggregates))
-            if missing:
-                gaps.append(f"euro area aggregates missing from the ECB response: {missing}")
+            for name in _ECB_AGGREGATE_CODES.values():
+                for role in ("stock", "flow", "annual_growth_rate"):
+                    if not aggregates.get(name, {}).get(role, {}).get("latest"):
+                        gaps.append(f"euro area {name} {role}: missing observations from the ECB response")
 
     us_failed = want_us and "error" in out.get("us", {}).get("M2", {})
     ea_failed = want_ea and "error" in out.get("euro_area", {})
@@ -980,6 +1050,9 @@ def _row(
         "frequency": frequency,
         "units": units,
         "latest_value": latest["value"] if latest else None,
+        "status": latest.get("status") if latest else None,
+        **({k: freshness[k] for k in ("served_from_stale_cache", "cache_age_seconds")}
+           if freshness.get("served_from_stale_cache") else {}),
         "observed_at": latest["observed_at"] if latest else None,
         "period_end": period_end.isoformat() if period_end else None,
         "previous_value": previous["value"] if previous else None,
@@ -997,6 +1070,11 @@ _BOARD_FRED = (
     ("reverse_repo", "RRPONTSYD"),
     ("us_m2", "M2SL"),
 )
+
+
+def _board_move(row: dict) -> float:
+    divisor = 1000 if (row.get("units") or "").endswith(" millions") else 1
+    return abs(row["change"] or 0.0) / divisor
 
 
 async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") -> dict:
@@ -1019,12 +1097,12 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
     gaps: list[str] = []
 
     for indicator, sid in _BOARD_FRED:
-        fr, err = fred_results[sid]
+        fr, err, cache_meta = fred_results[sid]
         if fr is None:
             unavailable.append({"indicator": indicator, "dataset": f"FRED {sid}", "error": err})
             gaps.append(err)
             continue
-        s = _build_fred_series(sid, fr, 1, None)
+        s = _mark_cached(_build_fred_series(sid, fr, 1, None), cache_meta)
         rows.append(
             _row(
                 indicator, s["label"], s["dataset"], FRED_SOURCE, s["measure"], s["frequency"],
@@ -1035,8 +1113,8 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
         )
 
     nl_parts = [fred_results[s] for s in ("WALCL", "WDTGAL", "RRPONTSYD")]
-    if all(rows_ is not None for rows_, _ in nl_parts):
-        points, _ = compute_net_liquidity(*(rows_ for rows_, _ in nl_parts))
+    if all(rows_ is not None for rows_, _, _ in nl_parts):
+        points, _ = compute_net_liquidity(*(rows_ for rows_, _, _ in nl_parts))
         if points:
             latest = points[-1]
             previous = points[-2] if len(points) > 1 else None
@@ -1051,6 +1129,9 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
                     end, _freshness(end, FRED_SERIES["WALCL"]["max_age_days"]),
                 )
             )
+            stale_parts = [meta for _, _, meta in nl_parts if meta]
+            if stale_parts:
+                _mark_cached(rows[-1], max(stale_parts, key=lambda m: m["cache_age_seconds"]))
         else:
             unavailable.append({"indicator": "net_liquidity", "error": "no aligned week"})
             gaps.append("net liquidity: no week had all three components aligned")
@@ -1065,10 +1146,7 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
         (ilm_err, ilm, "ILM"),
     ):
         if payload is None:
-            name = "euro area M1/M2/M3" if wanted == "BSI" else "Eurosystem total assets"
-            unavailable.append({"indicator": name, "dataset": f"ECB {wanted}", "error": err})
-            gaps.append(err)
-            continue
+            payload = []
         for s in payload:
             if wanted == "BSI":
                 agg = _ECB_AGGREGATE_CODES.get(s["dimensions"].get("BS_ITEM", ""))
@@ -1079,6 +1157,8 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
                 indicator, label = "eurosystem_total_assets", s["title"] or "Eurosystem total assets"
             f = _finish_ecb_series(s, 1)
             latest = f["latest"]
+            if latest is None:
+                continue
             end = date.fromisoformat(latest["period_end"]) if latest and latest["period_end"] else None
             rows.append(
                 _row(
@@ -1088,6 +1168,14 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
                 )
             )
 
+        expected = ("euro_area_m1", "euro_area_m2", "euro_area_m3") if wanted == "BSI" else ("eurosystem_total_assets",)
+        present = {r["indicator"] for r in rows}
+        for indicator in expected:
+            if indicator not in present:
+                reason = err or "missing stock observations from the ECB response"
+                unavailable.append({"indicator": indicator, "dataset": f"ECB {wanted}", "error": reason})
+                gaps.append(f"{indicator}: {reason}")
+
     for r in rows:
         stale = _stale_gap(r["indicator"], r["observed_at"], r["freshness"])
         if stale:
@@ -1096,7 +1184,7 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
     if sort == "newest":
         rows.sort(key=lambda r: (r["period_end"] or "", r["indicator"]), reverse=True)
     else:
-        rows.sort(key=lambda r: (r["change_pct"] is None, -abs(r["change_pct"] or 0.0), r["indicator"]))
+        rows.sort(key=lambda r: (r["change"] is None, -_board_move(r), r["indicator"]))
 
     gaps.append(
         "Changes are vs each indicator's previous observation, so horizons differ "
@@ -1114,6 +1202,11 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
     )
     out: dict[str, Any] = {
         "sort": sort,
+        "ranking_rule": (
+            "biggest_move ranks absolute changes in billions of each row currency; "
+            "no FX conversion, and observation horizons differ. Percentage changes "
+            "do not affect ranking."
+        ),
         "count": len(rows),
         "indicators": rows,
         "unavailable": unavailable,

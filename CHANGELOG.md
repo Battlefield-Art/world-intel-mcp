@@ -18,7 +18,7 @@ Keyless sources only: the FRED graph CSV (`fred.stlouisfed.org/graph/fredgraph.c
 allowed by robots.txt with `Crawl-delay: 1`, honored by a 1 s `fred-graph` rate
 floor) and the ECB Data Portal (SDMX-JSON). Every point carries `observed_at`,
 `value` and `units`; every series is typed `amount_outstanding`, `flow`,
-`growth_rate` or `index` and carries a freshness block that flags data older than
+`growth_rate`, `index` or `unknown` and carries a freshness block that flags data older than
 its publication cadence allows (a served stale cache copy or an outage shows up
 there). `published_at` is null: neither payload carries release dates, and the
 responses say so. `limit=0` returns the full history.
@@ -26,9 +26,9 @@ responses say so. `limit=0` returns the full history.
   Account (WDTGAL) minus overnight reverse repo (RRPONTSYD), in USD billions.
   WALCL and WDTGAL are USD millions and are divided by 1,000; RRPONTSYD is already
   USD billions. One point per WALCL Wednesday; the TGA must be reported for that
-  Wednesday; RRP comes from that day or, when that day is blank (a holiday), the
-  latest earlier business day within 5 days, and each point names the RRP date
-  used. Weeks without aligned components are skipped and counted, never filled
+  Wednesday; RRP comes from that day or, when blank on or after 2013-09-23,
+  Tuesday only. Before that date a blank Wednesday has no fallback. Each point
+  names the RRP date used. Weeks without aligned components are skipped and counted, never filled
   with zero, and a failed component makes the whole response an error. The TGA
   term is the Wednesday level (WDTGAL), not the week average (WTREGEN). A
   `method` block, returned with errors too, states each term's observation basis
@@ -36,7 +36,10 @@ responses say so. `limit=0` returns the full history.
   billions), its conversion, the RRP alignment and why WTREGEN is not used.
 - `intel_liquidity_board`: latest reading and change vs the previous observation
   for the Fed balance sheet, TGA, RRP, net liquidity, US M2, euro area M1/M2/M3
-  stocks and Eurosystem total assets, sortable by `biggest_move` or `newest`. A
+  stocks and Eurosystem total assets, sortable by `biggest_move` or `newest`.
+  `biggest_move` ranks absolute changes in billions of each row currency, with
+  no FX conversion; observation horizons differ. Percentage changes do not
+  affect ranking. A
   failed source becomes an `unavailable` row; net liquidity is dropped, not
   computed with a zero term, when any of its components fails. A `blocked` list
   names each measure not covered with its publisher and the status measured on
@@ -48,11 +51,15 @@ responses say so. `limit=0` returns the full history.
 - `intel_fed_liquidity_series`: WALCL, WDTGAL, WTREGEN, RRPONTSYD or M2SL with full
   history; blank source dates (2,833 for RRPONTSYD on 2026-10-17, 2,679 of them
   before 2013-09-23, when daily values begin) are counted, not read as zero.
-  Net liquidity therefore starts at 2003-02-12 with 523 earlier or unaligned
-  weeks skipped and counted, the last of them 2013-09-18.
 - `intel_ecb_series`: any ECB BSI or ILM series by SDMX key, with units, scale,
   titles and provisional flags taken from the response. A growth rate's change is
   reported in points, not as a percent of a percent.
+- Stale cache responses carry `served_from_stale_cache` and `cache_age_seconds`,
+  and name the upstream failure in `data_gaps`. Only parsed bodies enter the cache.
+  ECB 404 and empty responses are final no-data answers, without outage retries.
+  Missing ECB roles and board rows are named; index bases, provisional status
+  and percentage-point change units are retained. ECB keys must specify every
+  dimension and request at most 50 series combinations.
 - CLI: `intel liquidity`, `intel net-liquidity`, `intel money-supply`,
   `intel fed-liquidity`, `intel ecb-series`. Collector: `liquidity_board` and
   `net_liquidity` (group `liquidity`).
