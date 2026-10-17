@@ -226,8 +226,8 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 
 | Tool | Description |
 |------|-------------|
-| `intel_liquidity_board` | Latest reading and change vs the previous observation for the Fed balance sheet, TGA, overnight reverse repo, net liquidity, US M2, euro area M1/M2/M3 and Eurosystem total assets; sort by `biggest_move` or `newest` |
-| `intel_net_liquidity` | Weekly WALCL minus WDTGAL minus RRPONTSYD in USD billions (millions divided by 1,000), aligned on the WALCL Wednesday; each point names its components and the RRP date used; unaligned weeks are skipped and counted |
+| `intel_liquidity_board` | Latest reading and change vs the previous observation for the Fed balance sheet, TGA, overnight reverse repo, net liquidity, US M2, euro area M1/M2/M3 and Eurosystem total assets; sort by `biggest_move` or `newest`; a `blocked` list names the measures not covered (ICI fund flows and ETF net issuance, FINRA margin statistics, BLS) with the upstream status measured, and no proxy stands in for them |
+| `intel_net_liquidity` | Weekly WALCL minus WDTGAL minus RRPONTSYD in USD billions (millions divided by 1,000), aligned on the WALCL Wednesday; each point names its components and the RRP date used; unaligned weeks are skipped and counted; a `method` block states each term's observation basis, units, conversion and RRP alignment |
 | `intel_money_supply` | US M2 (FRED M2SL) and euro area M1, M2, M3 (ECB BSI stocks, monthly flows, annual growth rates), reported separately and never summed; US M3 is reported as discontinued |
 | `intel_fed_liquidity_series` | One FRED liquidity series (WALCL, WDTGAL, WTREGEN, RRPONTSYD, M2SL) with full history; blank source dates are counted, not read as zero |
 | `intel_ecb_series` | ECB Data Portal series by SDMX key from BSI (monetary aggregates) or ILM (Eurosystem weekly financial statement), with units, scale and provisional flags from the response |
@@ -679,7 +679,7 @@ Everything else uses free, unauthenticated public APIs.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 1034 tests (1052 total, 18 live-network smoke tests deselected by default)
+pytest                       # 1037 tests (1055 total, 18 live-network smoke tests deselected by default)
 pytest --cov=world_intel_mcp # with coverage
 pytest tests/test_forex.py -v # single module
 ```

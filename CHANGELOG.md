@@ -19,12 +19,17 @@ responses say so. `limit=0` returns the full history.
   latest earlier business day within 5 days, and each point names the RRP date
   used. Weeks without aligned components are skipped and counted, never filled
   with zero, and a failed component makes the whole response an error. The TGA
-  term is the Wednesday level (WDTGAL), not the week average (WTREGEN).
+  term is the Wednesday level (WDTGAL), not the week average (WTREGEN). A
+  `method` block, returned with errors too, states each term's observation basis
+  (WALCL and WDTGAL Wednesday levels in USD millions, RRPONTSYD daily in USD
+  billions), its conversion, the RRP alignment and why WTREGEN is not used.
 - `intel_liquidity_board`: latest reading and change vs the previous observation
   for the Fed balance sheet, TGA, RRP, net liquidity, US M2, euro area M1/M2/M3
   stocks and Eurosystem total assets, sortable by `biggest_move` or `newest`. A
   failed source becomes an `unavailable` row; net liquidity is dropped, not
-  computed with a zero term, when any of its components fails.
+  computed with a zero term, when any of its components fails. A `blocked` list
+  names each measure not covered with its publisher and the status measured on
+  2026-10-17.
 - `intel_money_supply`: US M2 (FRED M2SL) and euro area M1, M2 and M3 from the ECB
   BSI dataset (end-of-month stocks, monthly flows, annual growth rates), kept
   separate and never summed. US M3 is reported as discontinued (FRED M3SL ends at
@@ -45,10 +50,12 @@ responses say so. `limit=0` returns the full history.
   RRPONTSYD 0.201 billion, all observed 2026-10-14).
 
 Not added, measured 2026-10-17: ICI money market fund assets and ETF net issuance
-(403 on every path, robots.txt included); FINRA margin statistics (finra.org terms
-of use forbid robots and building a database from the site); BLS public API (keyless
-v1 answers, but api.bls.gov robots.txt disallows all paths and the terms page
-answers 403).
+(403 on every path, robots.txt included); FINRA margin statistics (the finra.org
+Terms of Use, Restrictions d and e, forbid building a database from the site and
+data mining, scraping or harvesting tools, robots included); BLS public API (keyless
+v1 answers for CPI-U and payrolls, but api.bls.gov robots.txt disallows all paths
+and the terms page answers 403). Fund flows and ETF net issuance therefore have no
+source here, and no proxy is substituted for any of these measures.
 
 ## 0.11.0 - 2026-10-12
 

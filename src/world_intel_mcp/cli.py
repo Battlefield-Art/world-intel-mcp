@@ -1647,6 +1647,11 @@ def liquidity_cmd(ctx: click.Context, sort: str) -> None:
         console.print(
             f"[red]Unavailable:[/red] {escape(str(u.get('indicator')))}: {escape(str(u.get('error')))}"
         )
+    for b in data.get("blocked", []):
+        console.print(
+            f"[dim]Not covered: {escape(str(b.get('measure')))} ({escape(str(b.get('publisher')))}): "
+            f"{escape(str(b.get('measured')))}[/dim]"
+        )
     _print_data_gaps(data)
 
 

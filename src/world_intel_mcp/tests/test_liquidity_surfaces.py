@@ -242,3 +242,17 @@ def test_cli_fed_liquidity_and_ecb_series_render(tmp_path, monkeypatch) -> None:
     assert ecb_calls == [{"dataset": "BSI", "key": "M.U2.Y.V.M30.X.1.U2.2300.Z01.E", "limit": 1, "start": None}]
     assert "Monetary aggregate M3, Stocks (amount_outstanding)" in out
     assert "(growth_rate)" in out
+
+
+def test_cli_liquidity_board_lists_blocked_sources(tmp_path, monkeypatch) -> None:
+    payload = _payloads(tmp_path)["board"]
+    monkeypatch.setattr(cli.liquidity, "fetch_liquidity_board", _fake(payload))
+    out = _invoke("liquidity").output
+    lines = [line for line in out.splitlines() if line.startswith("Not covered:")]
+    assert len(lines) == len(liquidity.BLOCKED_SOURCES) == 4
+    assert "Not covered: money market fund assets, weekly (ICI): 2026-10-17: HTTP 403" in out
+    assert "(FINRA)" in out and "Restrictions d and e" in out
+    assert "(BLS)" in out and "Disallow: /" in out
+    # A board without the key (an older cached payload) prints no such lines.
+    payload.pop("blocked")
+    assert "Not covered:" not in _invoke("liquidity").output

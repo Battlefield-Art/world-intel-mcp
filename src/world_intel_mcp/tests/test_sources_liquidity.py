@@ -497,3 +497,67 @@ async def test_requests_send_descriptive_user_agent(fetcher: Fetcher) -> None:
 def test_fred_rate_floor_matches_robots_crawl_delay() -> None:
     # Read at import time: the autouse fixture zeroes it for speed.
     assert _FRED_FLOOR_AT_IMPORT == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Method statement and blocked sources (lead rulings 2026-10-17)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_net_liquidity_method_states_wednesday_levels_conversion_and_rrp_alignment(
+    fetcher: Fetcher, tmp_path: Path
+) -> None:
+    respx.get(_FRED_URL).mock(side_effect=_fred_router())
+    out = await liquidity.fetch_net_liquidity(fetcher, limit=1)
+    method = out["method"]
+    tga = method["components"]["WDTGAL"]
+    assert (tga["observed"], tga["units"]) == ("Wednesday level", "USD millions")
+    assert tga["conversion"] == "divided by 1,000 to USD billions"
+    assert method["components"]["WALCL"]["observed"] == "Wednesday level"
+    rrp = method["components"]["RRPONTSYD"]
+    assert (rrp["observed"], rrp["units"]) == ("daily, business days", "USD billions")
+    assert rrp["conversion"] == "none: already USD billions"
+    assert "never a later day" in rrp["alignment"] and "within 5 days" in rrp["alignment"]
+    # The statement matches the arithmetic: raw WDTGAL millions / 1,000 and
+    # the raw same-Wednesday RRP billions, unconverted.
+    point = out["points"][0]
+    raw_tga = dict(_rows(_FRED["WDTGAL"], "WDTGAL"))[date(2026, 10, 14)]
+    raw_rrp = dict(_rows(_FRED["RRPONTSYD"], "RRPONTSYD"))[date(2026, 10, 14)]
+    assert point["treasury_general_account"] == raw_tga / 1000
+    assert point["reverse_repo"] == raw_rrp
+    assert point["reverse_repo_observed_at"] == point["observed_at"] == "2026-10-14"
+    # Anyone tempted to "fix" the TGA term back to WTREGEN reads why not.
+    assert "WTREGEN" in method["tga_choice"] and "week average" in method["tga_choice"]
+    # The method travels with an error too, so a failed call still says what it would compute.
+    # A fresh cache, so the 503 is not hidden behind the first call's cached CSVs.
+    respx.get(_FRED_URL).mock(side_effect=_fred_router({"WDTGAL": httpx.Response(503)}))
+    failed = await liquidity.fetch_net_liquidity(
+        Fetcher(cache=Cache(db_path=tmp_path / "cold.db"), breaker=CircuitBreaker(), max_retries=0)
+    )
+    assert "error" in failed and failed["method"]["components"]["WDTGAL"]["units"] == "USD millions"
+
+
+@respx.mock
+async def test_board_names_blocked_sources_and_substitutes_no_proxy(fetcher: Fetcher) -> None:
+    _mock_all()
+    out = await liquidity.fetch_liquidity_board(fetcher)
+    blocked = {(b["publisher"], b["measure"]) for b in out["blocked"]}
+    assert blocked == {
+        ("ICI", "money market fund assets, weekly"),
+        ("ICI", "ETF net issuance, monthly actuals and weekly estimates"),
+        ("FINRA", "customer margin balances (debit and free credit), monthly"),
+        ("BLS", "BLS series (for example CPI-U, nonfarm payrolls)"),
+    }
+    assert all(b["status"] == "blocked" and b["measured"].startswith("2026-10-17: ") for b in out["blocked"])
+    by_publisher = {b["publisher"]: b["measured"] for b in out["blocked"]}
+    assert "403" in by_publisher["ICI"]
+    assert "Restrictions d and e" in by_publisher["FINRA"]
+    assert "Disallow: /" in by_publisher["BLS"]
+    # No indicator row stands in for a blocked measure.
+    labels = " ".join(f"{r['indicator']} {r['label']}" for r in out["indicators"]).lower()
+    assert not any(word in labels for word in ("fund", "etf", "margin", "cpi", "payroll"))
+    assert any("no proxy is substituted" in g for g in out["data_gaps"])
+    # The response holds a copy: mutating it leaves the module constant intact.
+    out["blocked"][0]["status"] = "mutated"
+    assert liquidity.BLOCKED_SOURCES[0]["status"] == "blocked"

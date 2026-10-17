@@ -17,14 +17,18 @@ outstanding, a flow (transactions within the period), a growth rate or an
 index. A blank FRED cell is a missing observation, never a zero, and a
 failed component is an error, never a zero term in the net liquidity sum.
 
-Blocked upstreams (measured 2026-10-17, see ROADMAP Phase 29): ICI money
-market fund assets and ETF net issuance answer 403 on every path,
-robots.txt included; FINRA margin statistics answer 200 but finra.org's
-terms of use forbid robots and building a database from the site.
+Blocked upstreams (measured 2026-10-17, see ROADMAP Phase 29 and
+``BLOCKED_SOURCES``): ICI money market fund assets and ETF net issuance
+answer 403 on every path, robots.txt included; FINRA margin statistics
+answer 200 but the finra.org Terms of Use (Restrictions d and e) forbid
+building a database from the site and robots; the BLS public API answers
+without a key but api.bls.gov/robots.txt disallows every path. No proxy is
+substituted for any of them.
 """
 
 import asyncio
 import calendar
+import copy
 import csv
 import io
 import logging
@@ -149,6 +153,87 @@ TGA_CHOICE_NOTE = (
     "The Treasury General Account term is WDTGAL (Wednesday level), not "
     "WTREGEN (week average), so all three terms describe the same Wednesday."
 )
+# Do not swap WDTGAL for WTREGEN: WTREGEN averages the week ending
+# Wednesday, while WALCL and WDTGAL are Wednesday levels, so the swap
+# would subtract a weekly average from a point-in-time balance sheet.
+TGA_WTREGEN_NOTE = (
+    "WTREGEN is not a drop-in replacement: subtracting a week average from "
+    "Wednesday-level total assets mixes two different measures. WTREGEN is "
+    "served on its own by intel_fed_liquidity_series."
+)
+NET_LIQUIDITY_METHOD: dict[str, Any] = {
+    "formula": NET_LIQUIDITY_FORMULA,
+    "components": {
+        "WALCL": {
+            "term": "Federal Reserve total assets",
+            "observed": "Wednesday level",
+            "units": "USD millions",
+            "conversion": "divided by 1,000 to USD billions",
+        },
+        "WDTGAL": {
+            "term": "Treasury General Account",
+            "observed": "Wednesday level",
+            "units": "USD millions",
+            "conversion": "divided by 1,000 to USD billions",
+        },
+        "RRPONTSYD": {
+            "term": "Fed overnight reverse repo",
+            "observed": "daily, business days",
+            "units": "USD billions",
+            "conversion": "none: already USD billions",
+            "alignment": (
+                "the value for the WALCL Wednesday; when that day is blank, the "
+                f"latest earlier day within {_NET_LIQUIDITY_RRP_LOOKBACK_DAYS} days, "
+                "reported per point as reverse_repo_observed_at; never a later day"
+            ),
+        },
+    },
+    "alignment": NET_LIQUIDITY_ALIGNMENT,
+    "tga_choice": f"{TGA_CHOICE_NOTE} {TGA_WTREGEN_NOTE}",
+}
+
+# Measures the Phase 29 brief named that this module does not serve, with
+# the status measured 2026-10-17. No proxy is substituted for any of them.
+BLOCKED_SOURCES: list[dict[str, str]] = [
+    {
+        "measure": "money market fund assets, weekly",
+        "publisher": "ICI",
+        "status": "blocked",
+        "measured": (
+            "2026-10-17: HTTP 403 (Akamai 'Access Denied') on "
+            "www.ici.org/research/stats/mmf and on /robots.txt"
+        ),
+    },
+    {
+        "measure": "ETF net issuance, monthly actuals and weekly estimates",
+        "publisher": "ICI",
+        "status": "blocked",
+        "measured": (
+            "2026-10-17: HTTP 403 (Akamai 'Access Denied') on "
+            "www.ici.org/research/stats/etf and on /robots.txt"
+        ),
+    },
+    {
+        "measure": "customer margin balances (debit and free credit), monthly",
+        "publisher": "FINRA",
+        "status": "blocked",
+        "measured": (
+            "2026-10-17: the margin-statistics XLSX answers 200, but the finra.org "
+            "Terms of Use (Restrictions d and e) forbid creating a database from the "
+            "site and using data mining, scraping or harvesting tools, robots included"
+        ),
+    },
+    {
+        "measure": "BLS series (for example CPI-U, nonfarm payrolls)",
+        "publisher": "BLS",
+        "status": "blocked",
+        "measured": (
+            "2026-10-17: public API v1 answers 200 without a key, but "
+            "api.bls.gov/robots.txt is 'Disallow: /' and the www.bls.gov terms page "
+            "answers 403 to this server's User-Agent"
+        ),
+    },
+]
 
 # ECB Data Portal series used by the money-supply view and the board.
 # Data types: 1 = outstanding amounts (stocks), 4 = transactions (flows),
@@ -465,6 +550,7 @@ async def fetch_net_liquidity(
         "source": FRED_SOURCE,
         "formula": NET_LIQUIDITY_FORMULA,
         "alignment": NET_LIQUIDITY_ALIGNMENT,
+        "method": copy.deepcopy(NET_LIQUIDITY_METHOD),
         "units": "USD billions",
         "measure": "amount_outstanding",
         "frequency": "weekly, as of Wednesday",
@@ -1021,11 +1107,17 @@ async def fetch_liquidity_board(fetcher: Fetcher, sort: str = "biggest_move") ->
         "ECB payload carries release dates. FRED units come from the server's "
         "series catalog; ECB units come from the response."
     )
+    gaps.append(
+        "Not covered (see blocked): ICI money market fund assets and ETF net "
+        "issuance, FINRA margin statistics and BLS series; no proxy is "
+        "substituted for them."
+    )
     out: dict[str, Any] = {
         "sort": sort,
         "count": len(rows),
         "indicators": rows,
         "unavailable": unavailable,
+        "blocked": copy.deepcopy(BLOCKED_SOURCES),
         "net_liquidity_formula": NET_LIQUIDITY_FORMULA,
         "note": NESTING_NOTE,
         "sources": [FRED_SOURCE, ECB_SOURCE],
