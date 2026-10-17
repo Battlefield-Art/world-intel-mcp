@@ -241,10 +241,14 @@ source here, and no proxy is substituted for any of these measures.
   default (levels of trending series correlate spuriously).
 - Per pair: the lag with the smallest p, with r, n (overlapping periods
   after the transform and shift), a two-sided p from Student's t (computed
-  from the regularized incomplete beta function, standard library only) and
-  the Benjamini-Hochberg q across every test in the call, with the
-  Benjamini-Yekutieli `q_by` alongside. Significant at q <= 0.05 by default
-  (allowed 0.001 to 0.25); the other significant lags are listed too.
+  from the regularized incomplete beta function, standard library only)
+  that treats periods as independent, `p_ar1` (p recomputed with an AR(1)
+  effective sample size, below), and the Benjamini-Hochberg `q` and `q_ar1`
+  across every test in the call, with the Benjamini-Yekutieli `q_by` (of
+  `q_ar1`) alongside. `significant` means `q_ar1` <= 0.05 by default
+  (allowed 0.001 to 0.25), and `significant_if_independent` applies the
+  threshold to `q`; the other significant lags are listed too. The summary
+  gives both counts.
 - A pair and lag with fewer than 30 overlapping periods (callers may go down
   to 20), or a constant side, is listed as not tested with its n, never
   dropped. 30 points give about 80% power for a true |r| of 0.5 at alpha
@@ -253,26 +257,47 @@ source here, and no proxy is substituted for any of these measures.
   without `observed_at` (Yahoo quotes) are not used, with the reason: rows
   are stored only on change, so a missing day cannot be told from an
   unchanged one. A period takes its last observation; nothing is averaged.
-- Serial correlation: each series' lag-1 autocorrelation after the
-  transform, and per strongest result an AR(1) effective sample size and
-  the p recomputed with it, as a diagnostic outside q. Nothing is
-  prewhitened.
+  On the week and month grids each series reports the shortest and longest
+  interval its changes span (`change_interval_days`), and `data_gaps` names
+  unequal intervals.
+- Serial correlation: each series' lag-1 autocorrelation (phi) after the
+  transform, and on every test an AR(1) effective sample size n (1 - phi_a
+  phi_b) / (1 + phi_a phi_b), capped at n, with `p_ar1` recomputed from it;
+  significance follows `q_ar1`. Below an effective size of 3, or without a
+  measurable phi, `p_ar1` is 1 and the entry says "no evidence" or "not
+  assessed". `serial_correlation_dominates` marks an effective size under a
+  fifth of n, and `data_gaps` names those pairs and every series with
+  |phi| above 0.3. The strongest lag's p and `p_ar1` are post-selection;
+  `q` and `q_ar1` adjust for every test. Nothing is prewhitened. Measured in
+  a scratch simulation through the store: two independent random walks of
+  300 daily points in levels (seeds 0-99, defaults) have a lag with q <=
+  0.05 in 91 seeds and with `q_ar1` <= 0.05 in none; two independent series
+  of 200 AR(1) changes (4,000 runs, lag 0) reject at p <= 0.05 in 12.2%
+  (phi 0.5) and 35.3% (phi 0.8) of runs, and at `q_ar1` <= 0.05 in 4.5% and
+  5.1%.
 - `cannot_prove` in every response: correlation is not causation, a lead is
   not a causal direction, serial correlation inflates significance, a
   shared driver produces correlation, the store holds only what the
   collector recorded, BH under dependence is approximate and covers one
   call, and a small q is not a large effect.
 - An unknown grid or transform is an error naming the allowed values;
-  numeric inputs are clamped and each clamp is reported.
+  numeric inputs are clamped and each clamp is reported, in the MCP
+  response (`inputs_clamped`) and as a `Clamped:` line in the CLI. A given
+  `start` moved later by the 3,000-period window cut is reported the same
+  way.
 - Measured 2026-10-17 over a live MCP stdio session and the CLI, on four
   real FRED series (WALCL, WDTGAL, WTREGEN, RRPONTSYD) loaded into an
-  isolated store as one capture; illustrative, not findings. Week grid,
-  changes: 26 of 66 tests significant; the Wednesday TGA level against its
-  week average gives r 0.61 at lag 0 and 0.59 at lag +1, the averaging
-  window rather than a cause. Levels: Fed total assets against either TGA
-  series gives r 0.74 at lag 0 (n 1,244) with an AR(1) effective sample
-  size of 5.3 and 3.4. Day grid: the weekly series have no adjacent-day
-  changes, so nothing is tested and the response says why.
+  isolated store as one capture; illustrative, not findings. The figures
+  below were recomputed offline on that stored capture (direct, CLI and MCP
+  stdio) after `q_ar1` became the significance rule. Week grid, changes: 24
+  of 66 tests significant (26 if periods were independent); the Wednesday
+  TGA level against its week average gives r 0.61 at lag 0 and 0.59 at lag
+  +1, the averaging window rather than a cause. Levels: Fed total assets
+  against either TGA series gives r 0.74 at lag 0 (n 1,244) and p near
+  1e-214 if the weeks were independent, but AR(1) effective sample sizes of
+  5.2 and 3.3 leave `p_ar1` 0.13 and 0.37: not significant, and `data_gaps`
+  says serial correlation dominates. Day grid: the weekly series have no
+  adjacent-day changes, so nothing is tested and the response says why.
 - With the default 365-day observation retention
   (`WORLD_INTEL_HISTORY_DAYS`), a store filled only by the collector spans
   about a year, so the month grid cannot reach the 20-point floor without a
