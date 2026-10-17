@@ -132,6 +132,10 @@ async def fetch_cyclones(fetcher: Fetcher, include_forecast: bool = False) -> di
         "source": "nhc",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if data.get("_stale"):
+        # The fetcher served an expired copy of the feed: keep its marker.
+        response["_stale"] = True
+        response["_stale_age_seconds"] = data.get("_stale_age_seconds")
     if include_forecast:
         gaps, degraded = await cyclone_forecasts.attach_nhc_forecasts(fetcher, entries)
         response["data_gaps"] = gaps

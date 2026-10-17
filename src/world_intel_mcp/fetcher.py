@@ -6,6 +6,7 @@ response is returned (marked with _stale=True) so dashboards never go blank.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -54,12 +55,15 @@ class BinaryResult:
     ``status`` is the final HTTP status (None when no response arrived),
     ``content`` the body on 2xx, ``error`` a short reason otherwise. A
     404 is reported as ``status=404`` with no error so callers can tell
-    "not published (yet)" apart from "the fetch failed".
+    "not published (yet)" apart from "the fetch failed". ``location`` is
+    the absolute redirect target when ``follow_redirects=False`` and the
+    URL answered with a redirect (which was not requested).
     """
 
     status: int | None
     content: bytes | None
     error: str | None = None
+    location: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -277,13 +281,32 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         max_bytes: int = 256 * 1024 * 1024,
+        *,
+        follow_redirects: bool = True,
     ) -> BinaryResult:
         """Fetch a binary body with rate limiting, retries and circuit breaking.
 
         Not cached here: binary payloads (multi-MB) do not belong in the
         SQLite TTL cache, so callers own any on-disk caching. A 404 is a
-        definitive answer (not retried, not a breaker failure). A body
-        larger than ``max_bytes`` is refused rather than buffered.
+        definitive answer (not retried, not a breaker failure). The body
+        is read as it arrives and refused as soon as its decoded size
+        passes ``max_bytes``, so no more than ``max_bytes`` plus one
+        decoded network read is held (one 64 KiB read of gzip can decode
+        to about 64 MiB). With ``follow_redirects=False`` a redirect is
+        also a definitive answer, and its target is never requested.
+
+        The result (see BinaryResult), by outcome:
+
+        - body: ``status`` 2xx, ``content`` the decoded body.
+        - 404: ``status`` 404, ``content`` None, ``error`` None.
+        - redirect not followed: ``status`` 3xx, ``content`` None,
+          ``error`` "redirect to <location> not followed", ``location``
+          the absolute target. ``location`` is None in every other case.
+        - over the cap: ``status`` 2xx, ``content`` None, ``error``
+          "body exceeds cap <max_bytes>: stopped after <n> decoded bytes".
+        - failure (HTTP or transport error after the retries, or an open
+          circuit): ``status`` the last status or None, ``content`` None,
+          ``error`` a one-line reason.
         """
         if not self.breaker.is_available(source):
             return BinaryResult(None, None, f"circuit open for {source}")
@@ -295,24 +318,40 @@ class Fetcher:
 
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await client.get(
-                    url, headers=headers, timeout=timeout or self.default_timeout
-                )
-                last_status = resp.status_code
-                if resp.status_code == 404:
-                    self.breaker.record_success(source)
-                    return BinaryResult(404, None, None)
-                resp.raise_for_status()
-                body = resp.content
-                if len(body) > max_bytes:
-                    self.breaker.record_success(source)
-                    return BinaryResult(
-                        resp.status_code,
-                        None,
-                        f"body of {len(body)} bytes exceeds cap {max_bytes}",
-                    )
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=timeout or self.default_timeout,
+                    follow_redirects=follow_redirects,
+                ) as resp:
+                    last_status = resp.status_code
+                    if not follow_redirects and resp.next_request is not None:
+                        location = str(resp.next_request.url)
+                        self.breaker.record_success(source)
+                        return BinaryResult(
+                            resp.status_code, None, f"redirect to {location} not followed", location
+                        )
+                    if resp.status_code == 404:
+                        self.breaker.record_success(source)
+                        return BinaryResult(404, None, None)
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    size = 0
+                    async with contextlib.aclosing(resp.aiter_bytes()) as decoded:
+                        async for chunk in decoded:
+                            size += len(chunk)
+                            if size > max_bytes:
+                                break
+                            chunks.append(chunk)
                 self.breaker.record_success(source)
-                return BinaryResult(resp.status_code, body, None)
+                if size > max_bytes:
+                    return BinaryResult(
+                        last_status,
+                        None,
+                        f"body exceeds cap {max_bytes}: stopped after {size} decoded bytes",
+                    )
+                return BinaryResult(last_status, b"".join(chunks), None)
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < self.max_retries:

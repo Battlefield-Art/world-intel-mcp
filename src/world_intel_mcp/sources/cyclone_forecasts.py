@@ -43,16 +43,34 @@ answered 403 (CloudFront "Request blocked") to the same client that got
 be read.
 
 The text URLs are per bin, not per issuance (MIATCMEP1.shtml,
-wp2926web.txt), so a page can lag the feed entry pointing at it. The
-advisory or warning number in the text is checked against the feed; a
-mismatch is returned labelled stale and its cached copy is dropped.
+wp2926web.txt), so a page and the feed entry pointing at it can be out
+of step either way: a bin page can lag the feed, and the feed itself is
+cached for 600 s. The advisory or warning number in the text is compared
+with the feed's. A text older than the feed, or one whose number cannot
+be read, is labelled stale and not kept; a text newer than the feed is
+labelled feed_lags_text and kept. Both numbers are in the response:
+``advisory_number`` / ``warning_number`` from the text,
+``feed_advisory_number`` / ``feed_warning_number`` from the feed, which
+the storm's other fields also come from.
+
+Products are fetched from the linked URL only: a redirect is never
+followed (it is reported as refused_link, naming its target), so
+``track_url`` and ``cone_url`` are where the data came from. The fetcher
+stops reading a text or KMZ once its decoded size passes the cap below
+(text 1 MiB, KMZ 2 MiB), though one network read can decode to more
+before that check (about 64 MiB of gzip). A KML member is read only when
+it is stored or deflated and declares at most 100:1 expansion, and its
+decompressed size is capped at 8 MiB.
 
 Gaps / not covered: wind radii and seas are not parsed. Not observed
 live: a Central Pacific (CPHC) forecast/advisory, potential tropical
 cyclone products, a cone crossing the antimeridian (a cone with more
 than one ring is refused, never trimmed), and a JTWC final warning (a
 warning text without forecast blocks is reported unparsed). JTWC's
-danger swath is not fetched.
+danger swath is not fetched. The cone is not checked against the
+advisory number (its cache key carries the number and file time). A
+failed text fetch is never answered from an expired copy, even one of
+the same issuance.
 """
 
 import asyncio
@@ -63,12 +81,11 @@ import math
 import re
 import xml.etree.ElementTree as ET
 import zipfile
-import zlib
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..fetcher import Fetcher
+from ..fetcher import BinaryResult, Fetcher
 
 logger = logging.getLogger("world-intel-mcp.sources.cyclone_forecasts")
 
@@ -84,11 +101,19 @@ CONE_SIMPLIFY_TOLERANCE_DEG = 0.01
 # Cache keys carry the advisory/warning number, so a new issuance is a
 # new key; the TTL only bounds how long one issuance is reused.
 _FORECAST_CACHE_TTL = 3600
+# Body caps: the fetcher stops reading once a decoded body passes its cap.
+_TEXT_MAX_BYTES = 1024 * 1024
 _CONE_MAX_BYTES = 2 * 1024 * 1024
 _KML_MAX_BYTES = 8 * 1024 * 1024
-# Douglas-Peucker is quadratic in the worst case, so a ring past this is
-# refused before simplifying (Trudy #17's ring has 1,167 vertices).
-_CONE_MAX_VERTICES = 10_000
+# Declared expansion bound for the KML member (the fixture's KML,
+# deflated by zipfile, expands 2.8:1).
+_KML_MAX_RATIO = 100
+# Douglas-Peucker costs up to (kept vertices) x (ring vertices) distance
+# evaluations, so both are capped: a ring past _CONE_MAX_VERTICES is
+# refused before simplifying, an outline past _CONE_MAX_OUTLINE_VERTICES
+# while simplifying. Trudy #17: 1,167 vertices in, 56 kept.
+_CONE_MAX_VERTICES = 3_000
+_CONE_MAX_OUTLINE_VERTICES = 500
 
 # Product links come from the agencies' feeds; one is fetched only when
 # it is https on the agency's own host, so a malformed or tampered feed
@@ -107,7 +132,9 @@ _MONTHS = {
 
 # Track statuses meaning the caller asked for data and did not get it
 # (or got an older issuance). not_linked / not_published are upstream
-# coverage facts: named in data_gaps, not degradation.
+# coverage facts, and feed_lags_text a text newer than its feed entry:
+# named in data_gaps, not degradation. error is an unexpected exception
+# while building one product; the rest of the response stands.
 _FAILED_STATUSES = frozenset(
     {
         "fetch_failed",
@@ -116,8 +143,11 @@ _FAILED_STATUSES = frozenset(
         "stale_advisory",
         "stale_warning",
         "refused_link",
+        "error",
     }
 )
+# Texts kept in the cache for their issuance.
+_KEPT_STATUSES = frozenset({"ok", "feed_lags_text"})
 
 _CONE_NOTE = (
     "Outline simplified from NHC's ring (Douglas-Peucker, 0.01 degree "
@@ -208,15 +238,39 @@ def _hours_between(start: datetime | None, end: datetime | None) -> int | None:
     return round((end - start).total_seconds() / 3600)
 
 
-def _same_number(found: Any, expected: Any) -> bool:
-    try:
-        return int(found) == int(expected)
-    except (TypeError, ValueError):
-        return str(found).lstrip("0").upper() == str(expected).lstrip("0").upper()
+def _issuance_number(value: Any) -> int | None:
+    """An advisory or warning number as an int ("017" -> 17), or None."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().isdecimal():
+        return int(value.strip())
+    return None
 
 
-def _refused_link(url: str, hosts: frozenset[str]) -> str | None:
+def _compare_issuance(found: Any, listed: Any) -> str:
+    """How the number a text shows stands against the one its feed lists:
+    "same", "newer" (the text is ahead of the feed), "older", or
+    "unreadable" (the text shows none). Numbers that are not plain
+    integers can only match or not; a mismatch then counts as older."""
+    if found is None:
+        return "unreadable"
+    text_number, feed_number = _issuance_number(found), _issuance_number(listed)
+    if text_number is not None and feed_number is not None:
+        if text_number == feed_number:
+            return "same"
+        return "newer" if text_number > feed_number else "older"
+    same = str(found).strip().lstrip("0").upper() == str(listed).strip().lstrip("0").upper()
+    return "same" if same else "older"
+
+
+def _refused_link(url: Any, hosts: frozenset[str]) -> str | None:
     """Why a feed-supplied product link is not fetched, or None if it may be."""
+    if not isinstance(url, str):
+        return f"link of type {type(url).__name__} is not a string; not fetched"
+    # urlsplit drops tab, CR and LF before it reads the host, and httpx
+    # refuses them: refuse here, so the check and the request see one URL.
+    if any(ch.isspace() or not ch.isprintable() for ch in url):
+        return f"link {url!r} contains whitespace or control characters; not fetched"
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -404,17 +458,28 @@ def _segment_distance(
 
 
 def simplify_closed_ring(
-    ring: list[tuple[float, float]], tolerance: float
+    ring: list[tuple[float, float]], tolerance: float, max_vertices: int | None = None
 ) -> list[tuple[float, float]]:
     """Douglas-Peucker over a closed ring (first vertex repeated last),
     returned open. Every dropped vertex lies within ``tolerance`` (planar,
-    in the coordinates' own units) of the kept outline."""
+    in the coordinates' own units) of the kept outline.
+
+    With ``max_vertices``, an outline that would keep more vertices
+    raises ValueError as soon as it passes the cap, so the cost stays
+    under about ``max_vertices`` times the ring's length in distance
+    evaluations (each kept vertex costs at most one pass over the ring).
+    """
     count = len(ring)
     closed = count > 1 and ring[0] == ring[-1]
+    over_cap = f"simplified outline has more than {max_vertices} vertices (over the outline cap)"
     if count < 4:
-        return list(ring[:-1]) if closed else list(ring)
+        outline = list(ring[:-1]) if closed else list(ring)
+        if max_vertices is not None and len(outline) > max_vertices:
+            raise ValueError(over_cap)
+        return outline
     keep = [False] * count
     keep[0] = keep[-1] = True
+    kept = 1 if closed else 2  # vertices of the open outline returned
     stack = [(0, count - 1)]
     while stack:
         first, last = stack.pop()
@@ -425,28 +490,44 @@ def simplify_closed_ring(
                 worst_index, worst = i, distance
         if worst_index != -1 and worst > tolerance:
             keep[worst_index] = True
+            kept += 1
+            if max_vertices is not None and kept > max_vertices:
+                raise ValueError(over_cap)
             stack.append((first, worst_index))
             stack.append((worst_index, last))
-    kept = [vertex for vertex, flag in zip(ring, keep) if flag]
-    return kept[:-1] if closed else kept
+    outline = [vertex for vertex, flag in zip(ring, keep) if flag]
+    return outline[:-1] if closed else outline
 
 
 def parse_nhc_cone_kmz(content: bytes) -> dict:
     """Parse NHC's CONE.kmz into a simplified [lat, lon] outline.
 
-    Raises zipfile.BadZipFile / ValueError / ET.ParseError (and the zip
-    layer's zlib.error, RuntimeError, EOFError) on anything unreadable;
-    the caller turns those into a named cone failure.
+    Raises on anything unreadable (zipfile.BadZipFile, ValueError,
+    ET.ParseError, and whatever the zip layer raises); the caller turns
+    any exception into a named cone failure.
     """
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         members = [m for m in archive.infolist() if m.filename.lower().endswith(".kml")]
         if not members:
             raise ValueError("KMZ holds no .kml document")
-        if members[0].file_size > _KML_MAX_BYTES:
+        member = members[0]
+        # zipfile feeds bzip2 and LZMA members to decompressors with no
+        # output bound, so only stored and deflated members are opened.
+        if member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
             raise ValueError(
-                f"KML of {members[0].file_size} bytes exceeds cap {_KML_MAX_BYTES}"
+                f"KML member uses zip compression method {member.compress_type}; "
+                "only stored (0) or deflated (8) members are read"
             )
-        with archive.open(members[0]) as handle:
+        if member.file_size > _KML_MAX_BYTES:
+            raise ValueError(f"KML of {member.file_size} bytes exceeds cap {_KML_MAX_BYTES}")
+        if member.file_size > _KML_MAX_RATIO * max(member.compress_size, 1):
+            raise ValueError(
+                f"KML member expands {member.compress_size} bytes to {member.file_size}, "
+                f"past the {_KML_MAX_RATIO}:1 bound"
+            )
+        # A header that understates the member cannot get past this read:
+        # zipfile stops at the declared size, and the CRC check refuses it.
+        with archive.open(member) as handle:
             kml = handle.read(_KML_MAX_BYTES + 1)
     if len(kml) > _KML_MAX_BYTES:
         raise ValueError(f"KML exceeds cap {_KML_MAX_BYTES}")
@@ -461,7 +542,13 @@ def parse_nhc_cone_kmz(content: bytes) -> dict:
                 extended[el.get("name")] = value.text.strip()
     period = extended.get("fcstpd")
 
-    outline = simplify_closed_ring(ring + [ring[0]], CONE_SIMPLIFY_TOLERANCE_DEG)
+    outline = simplify_closed_ring(
+        ring + [ring[0]], CONE_SIMPLIFY_TOLERANCE_DEG, max_vertices=_CONE_MAX_OUTLINE_VERTICES
+    )
+    if len(outline) < 3:
+        raise ValueError(
+            f"simplified cone outline has {len(outline)} vertices; an outline needs at least 3"
+        )
     return {
         "vertices": [[lat, lon] for lat, lon in outline],
         "vertex_count": len(outline),
@@ -569,16 +656,69 @@ def parse_jtwc_warning(text: str, fallback_anchor: datetime) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _nhc_track(fetcher: Fetcher, storm_id: str, advisory: dict, now: datetime) -> dict:
-    url = advisory.get("url")
-    out: dict[str, Any] = {
-        "track_url": url,
+def _fetch_reason(result: BinaryResult) -> str:
+    """One line on why a product fetch gave no body."""
+    if result.status is not None and result.status >= 400:
+        return f"HTTP {result.status}"
+    return (result.error or f"HTTP {result.status}").split("\n", 1)[0]
+
+
+def _redirect_refusal(result: BinaryResult) -> str:
+    return (
+        f"link answered HTTP {result.status}, a redirect to {result.location!r}; "
+        "redirects are not followed, so nothing was fetched from it"
+    )
+
+
+def _unexpected(exc: BaseException) -> str:
+    """Name an unexpected exception from one product's task. Anything
+    that is not an Exception (cancellation, exit) is raised again."""
+    if not isinstance(exc, Exception):
+        raise exc
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def _fetch_text(
+    fetcher: Fetcher, url: str, source: str, key: str
+) -> tuple[str | None, BinaryResult | None]:
+    """A product text: this issuance's kept copy, else the body of ``url``
+    itself (a redirect is not followed). Returns (text, None) for the kept
+    copy, (text, result) for a fresh body, (None, result) for no body."""
+    kept = fetcher.cache.get(key)
+    if isinstance(kept, str):
+        return kept, None
+    result = await fetcher.get_bytes(
+        url, source=source, max_bytes=_TEXT_MAX_BYTES, follow_redirects=False
+    )
+    if not result.ok:
+        return None, result
+    return result.content.decode("utf-8", errors="replace"), result
+
+
+def _nhc_track_base(advisory: Any) -> dict:
+    record = advisory if isinstance(advisory, dict) else {}
+    url = record.get("url")
+    return {
+        "track_url": url if isinstance(url, str) else None,
         "track_status": "ok",
         "advisory_number": None,
+        "feed_advisory_number": record.get("advNum"),
         "issued": None,
         "initial": None,
         "points": [],
     }
+
+
+async def _nhc_track(fetcher: Fetcher, storm_id: str, advisory: Any, now: datetime) -> dict:
+    out = _nhc_track_base(advisory)
+    if not isinstance(advisory, dict):
+        out["track_status"] = "refused_link"
+        out["track_error"] = (
+            f"CurrentStorms.json forecastAdvisory is a {type(advisory).__name__}, "
+            "not an object; nothing fetched"
+        )
+        return out
+    url = advisory.get("url")
     if not url:
         out["track_status"] = "not_linked"
         out["track_error"] = "CurrentStorms.json links no forecast/advisory for this storm"
@@ -591,34 +731,64 @@ async def _nhc_track(fetcher: Fetcher, storm_id: str, advisory: dict, now: datet
 
     expected = advisory.get("advNum")
     key = f"cyclones:nhc:tcm:{storm_id}:{expected}:{advisory.get('fileUpdateTime')}"
-    page = await fetcher.get_text(
-        url, source="nhc-forecast", cache_key=key, cache_ttl=_FORECAST_CACHE_TTL
-    )
+    page, fetched = await _fetch_text(fetcher, url, "nhc-forecast", key)
     if page is None:
-        out["track_status"] = "fetch_failed"
-        out["track_error"] = "NHC forecast/advisory text unavailable (no live or cached data)"
+        if fetched.location is not None:
+            out["track_status"] = "refused_link"
+            out["track_error"] = "forecast/advisory " + _redirect_refusal(fetched)
+        else:
+            out["track_status"] = "fetch_failed"
+            out["track_error"] = "NHC forecast/advisory text unavailable: " + _fetch_reason(fetched)
         return out
 
     parsed = parse_nhc_forecast_advisory(page, fallback_anchor=now)
     out.update(parsed)
+    number = parsed["advisory_number"]
+    standing = "same" if expected in (None, "") else _compare_issuance(number, expected)
     if not parsed["points"]:
-        fetcher.cache.delete(key)
         out["track_status"] = "unparsed"
         out["track_error"] = "forecast/advisory page carried no parseable forecast points"
-    elif expected and not _same_number(parsed["advisory_number"], expected):
-        fetcher.cache.delete(key)
+    elif standing == "newer":
+        out["track_status"] = "feed_lags_text"
+        out["track_error"] = (
+            f"forecast/advisory page shows advisory {number}, newer than advisory "
+            f"{expected} that CurrentStorms.json lists; the track is advisory {number}, "
+            "the storm's other fields are the feed's"
+        )
+    elif standing == "unreadable":
         out["track_status"] = "stale_advisory"
         out["expected_advisory_number"] = expected
         out["track_error"] = (
-            f"forecast/advisory page shows advisory {parsed['advisory_number']}, "
+            "forecast/advisory page carries no readable advisory number, so it cannot "
+            f"be matched to advisory {expected} that CurrentStorms.json lists"
+        )
+    elif standing == "older":
+        out["track_status"] = "stale_advisory"
+        out["expected_advisory_number"] = expected
+        out["track_error"] = (
+            f"forecast/advisory page shows advisory {number}, "
             f"CurrentStorms.json lists {expected}"
         )
+    if fetched is not None and out["track_status"] in _KEPT_STATUSES:
+        fetcher.cache.set(key, page, _FORECAST_CACHE_TTL)
     return out
 
 
-async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: dict) -> dict:
+def _nhc_cone_base(cone_meta: Any) -> dict:
+    url = cone_meta.get("kmzFile") if isinstance(cone_meta, dict) else None
+    return {"cone_url": url if isinstance(url, str) else None, "cone_status": "ok", "cone": None}
+
+
+async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: Any) -> dict:
+    out = _nhc_cone_base(cone_meta)
+    if not isinstance(cone_meta, dict):
+        out["cone_status"] = "refused_link"
+        out["cone_error"] = (
+            f"CurrentStorms.json trackCone is a {type(cone_meta).__name__}, "
+            "not an object; nothing fetched"
+        )
+        return out
     url = cone_meta.get("kmzFile")
-    out: dict[str, Any] = {"cone_url": url, "cone_status": "ok", "cone": None}
     if not url:
         out["cone_status"] = "not_linked"
         return out
@@ -634,17 +804,21 @@ async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: dict) -> dict:
         out["cone"] = cached
         return out
 
-    result = await fetcher.get_bytes(url, source="nhc-gis", max_bytes=_CONE_MAX_BYTES)
+    result = await fetcher.get_bytes(
+        url, source="nhc-gis", max_bytes=_CONE_MAX_BYTES, follow_redirects=False
+    )
+    if result.location is not None:
+        out["cone_status"] = "refused_link"
+        out["cone_error"] = "cone KMZ " + _redirect_refusal(result)
+        return out
     if not result.ok:
         out["cone_status"] = "fetch_failed"
-        out["cone_error"] = "NHC cone KMZ fetch failed: " + (
-            result.error or f"HTTP {result.status}"
-        )
+        out["cone_error"] = "NHC cone KMZ fetch failed: " + _fetch_reason(result)
         return out
     try:
         # In a worker thread: simplifying is CPU work and must not stall the event loop.
         cone = await asyncio.to_thread(parse_nhc_cone_kmz, result.content)
-    except (zipfile.BadZipFile, zlib.error, ET.ParseError, ValueError, RuntimeError, EOFError) as exc:
+    except Exception as exc:  # any unreadable KMZ is a named gap, never a failed call
         out["cone_status"] = "unparsed"
         out["cone_error"] = f"NHC cone KMZ unreadable: {type(exc).__name__}: {exc}"
         return out
@@ -655,20 +829,34 @@ async def _nhc_cone(fetcher: Fetcher, storm_id: str, cone_meta: dict) -> dict:
 
 async def _nhc_storm_forecast(fetcher: Fetcher, raw: dict, now: datetime) -> dict:
     storm_id = raw.get("id") or "unknown"
+    advisory = raw.get("forecastAdvisory") or {}
+    cone_meta = raw.get("trackCone") or {}
+    # One product's unexpected exception is named as that product's
+    # "error"; it never fails the other product, the storm or the call.
     track, cone = await asyncio.gather(
-        _nhc_track(fetcher, storm_id, raw.get("forecastAdvisory") or {}, now),
-        _nhc_cone(fetcher, storm_id, raw.get("trackCone") or {}),
+        _nhc_track(fetcher, storm_id, advisory, now),
+        _nhc_cone(fetcher, storm_id, cone_meta),
+        return_exceptions=True,
     )
+    if isinstance(track, BaseException):
+        reason = _unexpected(track)
+        track = _nhc_track_base(advisory)
+        track.update(track_status="error", track_error="forecast track not built: " + reason)
+    if isinstance(cone, BaseException):
+        reason = _unexpected(cone)
+        cone = _nhc_cone_base(cone_meta)
+        cone.update(cone_status="error", cone_error="cone not built: " + reason)
     return {"agency": "NHC", **track, **cone}
 
 
-async def _jtwc_storm_forecast(fetcher: Fetcher, storm: dict, now: datetime) -> dict:
+def _jtwc_base(storm: dict) -> dict:
     url = storm.get("warning_text_url")
-    out: dict[str, Any] = {
+    return {
         "agency": "JTWC",
-        "track_url": url,
+        "track_url": url if isinstance(url, str) else None,
         "track_status": "ok",
         "warning_number": None,
+        "feed_warning_number": storm.get("warning_number"),
         "issued": None,
         "initial": None,
         "points": [],
@@ -676,6 +864,11 @@ async def _jtwc_storm_forecast(fetcher: Fetcher, storm: dict, now: datetime) -> 
         "cone_status": "not_published",
         "cone": None,
     }
+
+
+async def _jtwc_storm_forecast(fetcher: Fetcher, storm: dict, now: datetime) -> dict:
+    out = _jtwc_base(storm)
+    url = storm.get("warning_text_url")
     if not url:
         out["track_status"] = "not_linked"
         out["track_error"] = "the JTWC RSS item links no warning text for this storm"
@@ -688,32 +881,43 @@ async def _jtwc_storm_forecast(fetcher: Fetcher, storm: dict, now: datetime) -> 
 
     expected = storm.get("warning_number")
     key = f"jtwc:warning:{storm.get('id')}:{expected}:{storm.get('issued_at')}"
-    text = await fetcher.get_text(
-        url, source="jtwc-warning", cache_key=key, cache_ttl=_FORECAST_CACHE_TTL
-    )
+    text, fetched = await _fetch_text(fetcher, url, "jtwc-warning", key)
     if text is None:
-        out["track_status"] = "fetch_failed"
-        out["track_error"] = "JTWC warning text unavailable (no live or cached data)"
+        if fetched.location is not None:
+            out["track_status"] = "refused_link"
+            out["track_error"] = "warning text " + _redirect_refusal(fetched)
+        else:
+            out["track_status"] = "fetch_failed"
+            out["track_error"] = "JTWC warning text unavailable: " + _fetch_reason(fetched)
         return out
 
     parsed = parse_jtwc_warning(text, now)
     out.update(parsed)
+    number = parsed["warning_number"]
+    standing = "same" if expected is None else _compare_issuance(number, expected)
     if not parsed["points"]:
-        fetcher.cache.delete(key)
         out["track_status"] = "unparsed"
         out["track_error"] = "warning text carried no parseable forecast positions"
-    elif (
-        expected is not None
-        and parsed["warning_number"] is not None
-        and parsed["warning_number"] != expected
-    ):
-        fetcher.cache.delete(key)
+    elif standing == "newer":
+        out["track_status"] = "feed_lags_text"
+        out["track_error"] = (
+            f"warning text shows warning {number}, newer than warning {expected} that "
+            f"the RSS lists; the track is warning {number}, the storm's other fields "
+            "are the RSS's"
+        )
+    elif standing == "unreadable":
         out["track_status"] = "stale_warning"
         out["expected_warning_number"] = expected
         out["track_error"] = (
-            f"warning text shows warning {parsed['warning_number']}, "
-            f"the RSS lists {expected}"
+            "warning text carries no readable warning number, so it cannot be matched "
+            f"to warning {expected} that the RSS lists"
         )
+    elif standing == "older":
+        out["track_status"] = "stale_warning"
+        out["expected_warning_number"] = expected
+        out["track_error"] = f"warning text shows warning {number}, the RSS lists {expected}"
+    if fetched is not None and out["track_status"] in _KEPT_STATUSES:
+        fetcher.cache.set(key, text, _FORECAST_CACHE_TTL)
     return out
 
 
@@ -748,7 +952,7 @@ def _summarize(storms: list[dict]) -> tuple[list[str], bool]:
             gaps.append(f"{label}: forecast track {status}: {forecast.get('track_error')}")
             degraded = degraded or status in _FAILED_STATUSES
         cone_status = forecast.get("cone_status")
-        if cone_status in ("fetch_failed", "unparsed", "refused_link"):
+        if cone_status in ("fetch_failed", "unparsed", "refused_link", "error"):
             gaps.append(f"{label}: no cone, {forecast.get('cone_error')}")
             degraded = True
         elif cone_status == "not_linked":
@@ -781,10 +985,17 @@ async def attach_jtwc_forecasts(
     Returns (data_gaps, degraded)."""
     now = datetime.now(timezone.utc)
     targets = storms[:MAX_FORECAST_STORMS]
+    # One storm's unexpected exception is named as its track "error";
+    # it never fails the other storms or the call.
     forecasts = await asyncio.gather(
-        *(_jtwc_storm_forecast(fetcher, storm, now) for storm in targets)
+        *(_jtwc_storm_forecast(fetcher, storm, now) for storm in targets),
+        return_exceptions=True,
     )
     for storm, forecast in zip(targets, forecasts):
+        if isinstance(forecast, BaseException):
+            reason = _unexpected(forecast)
+            forecast = _jtwc_base(storm)
+            forecast.update(track_status="error", track_error="forecast track not built: " + reason)
         storm["forecast"] = forecast
     for storm in storms[MAX_FORECAST_STORMS:]:
         storm["forecast"] = _capped("JTWC")
