@@ -43,8 +43,10 @@
   A missing, unknown or invalid one is an `invalid params` error. Tests
   fail if a prompt names a tool that is not registered, passes an argument
   its schema does not take (name, type, listed value or range), cites an
-  output field the code does not produce, or states a count or a table
-  size the code does not match.
+  output field the code does not produce, describes a step in words that
+  share nothing with the called tool's description or names a provider
+  that tool does not, or states a count or a table size the code does not
+  match.
 - `intel guide` prints the guide markdown; `intel guide --measures` prints
   the glossary.
 - Two tests drive initialize, resources/list, resources/read, prompts/list,

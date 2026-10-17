@@ -762,7 +762,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "host view call it with destination {country} instead",
                 args=(("origin", "{country}"),),
             ),
-            ("intel_displacement_summary", "the global totals for context"),
+            ("intel_displacement_summary", "UNHCR's global displacement totals, for context"),
         ),
         limits=(
             "UNHCR figures are year-end stocks (people displaced at the end of "
@@ -1009,7 +1009,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="What entered or left {name} since the last snapshot, and is the area escalating?",
         arguments=(PromptArg("name", "The AOI name", required=True),),
         steps=(
-            ("intel_aoi_list", "confirm {name} exists and see its shape"),
+            ("intel_aoi_list", "confirm {name} is among the defined areas of interest and see its shape"),
             Step(
                 "intel_aoi_changes",
                 "new, departed and unchanged items since the previous snapshot, "
@@ -1131,7 +1131,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             ("intel_disease_outbreaks", "WHO, ProMED and CIDRAP outbreak reports"),
             ("intel_humanitarian_summary", "crisis datasets for the affected countries"),
-            ("intel_news_feed", "recent coverage, for context only"),
+            ("intel_news_feed", "recent news coverage, for context only"),
         ),
         limits=(
             "Outbreak reports arrive after cases occur and case counts are "

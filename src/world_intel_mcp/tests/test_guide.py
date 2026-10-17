@@ -729,6 +729,96 @@ def test_no_prompt_repeats_a_call() -> None:
     assert repeated == {}
 
 
+# A step's purpose says what its tool returns, so it has to agree with what
+# the tool says about itself: it shares a word with the tool's name,
+# description or parameter descriptions, and any upper-case name it uses (a
+# provider such as AAA or NWS) appears there too, as written or spelled out.
+# A step pointed at a wrong but registered tool fails one or both (review F14
+# M7). Measured 2026-10-17: the check catches 12,006 of the 13,524 ways of
+# pointing one step at another registered tool.
+_COMMON_WORDS = frozenset(
+    "about after also and any each every for from into its latest most only "
+    "over recent that the their them then this today were what when where "
+    "which while with".split()
+)
+_NOT_PROVIDERS = frozenset({"US", "UK", "EU", "UN"})
+# Provenance a tool's registered text leaves out, with the source function
+# its handler calls that states it.
+_PROVIDER_IN_CODE = {
+    ("intel_forex_timeseries", "ECB"): ("world_intel_mcp.sources.forex", "fetch_forex_timeseries"),
+}
+
+
+def _content_words(text: str) -> set[str]:
+    words = set()
+    for word in re.findall(r"[a-z][a-z0-9]+", text.lower()):
+        if len(word) >= 4 and word not in _COMMON_WORDS:
+            words.add(word[:-1] if word.endswith("s") and len(word) > 4 else word)
+    return words
+
+
+def _names(acronym: str, text: str) -> bool:
+    if re.search(rf"(?<![a-z]){acronym.lower()}s?(?![a-z])", text.lower()):
+        return True
+    words = re.findall(r"[A-Za-z]+", text)
+    n = len(acronym)
+    return any(
+        "".join(w[0] for w in words[i : i + n]) == acronym and all(w[0].isupper() for w in words[i : i + n])
+        for i in range(len(words) - n + 1)
+    )
+
+
+def _tool_text(tool: Tool) -> str:
+    props = (tool.inputSchema or {}).get("properties", {})
+    return " ".join(
+        [tool.name, tool.description or "", *(f"{k} {v.get('description', '')}" for k, v in props.items())]
+    )
+
+
+def _purpose_problems(tool: Tool, purpose: str) -> list[str]:
+    text = _tool_text(tool)
+    problems = []
+    if not _content_words(purpose) & _content_words(text):
+        problems.append(f"{tool.name}: the purpose shares no word with what the tool says about itself")
+    for acronym in sorted(set(re.findall(r"\b[A-Z]{2,}\b", purpose)) - _NOT_PROVIDERS):
+        if not _names(acronym, text) and (tool.name, acronym) not in _PROVIDER_IN_CODE:
+            problems.append(f"{tool.name}: the purpose names {acronym}, the tool does not")
+    return problems
+
+
+def test_step_purposes_agree_with_their_tools(tools_pkg) -> None:
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    problems = {
+        f"{prompt.name} step {i + 1}": found
+        for prompt in guide_prompts.PROMPTS
+        for i, step in enumerate(prompt.steps)
+        if (found := _purpose_problems(by_name[step.tool], step.purpose))
+    }
+    assert problems == {}
+
+
+def test_purpose_check_catches_a_wrong_but_registered_tool(tools_pkg) -> None:
+    """The check above has to be able to fail, also for a tool the prompt
+    does not already call, which the repeated-call test cannot see."""
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    energy = guide_prompts.get("energy-pressure")
+    purpose = next(s.purpose for s in energy.steps if s.tool == "intel_gas_prices")
+    assert _purpose_problems(by_name["intel_gas_prices"], purpose) == []
+    for wrong in ("intel_energy_prices", "intel_electricity_rates", "intel_service_status"):
+        assert f"{wrong}: the purpose names AAA, the tool does not" in _purpose_problems(by_name[wrong], purpose)
+    assert _purpose_problems(by_name["intel_service_status"], purpose)[0] == (
+        "intel_service_status: the purpose shares no word with what the tool says about itself"
+    )
+    assert _names("NWS", "the US National Weather Service") and not _names("NWS", "the weather news")
+
+
+def test_provenance_kept_in_code_is_still_there(tools_pkg) -> None:
+    for (tool_name, acronym), (module_name, function) in _PROVIDER_IN_CODE.items():
+        source = inspect.getsource(getattr(importlib.import_module(module_name), function))
+        assert acronym in source, (tool_name, acronym)
+        assert function in inspect.getsource(tools_pkg.ALL_HANDLERS[tool_name]), tool_name
+
+
 def test_every_argument_is_well_formed() -> None:
     for prompt in guide_prompts.PROMPTS:
         for arg in prompt.arguments:

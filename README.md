@@ -203,8 +203,9 @@ list, a value that names a tool the prompt does not call, or an unknown
 prompt is an `invalid params` error, never a guess. The tests fail if a
 prompt names a tool that is not registered, passes an argument the
 tool's schema does not take (wrong name, type or listed value), cites an
-output field the code does not produce, or if the guide leaves out a
-registered tool. Tools that cannot work without an API key carry a
+output field the code does not produce, describes a step in words that
+share nothing with the called tool's own description, or if the guide
+leaves out a registered tool. Tools that cannot work without an API key carry a
 `[needs VARIABLE]` mark in the guide's tool list.
 
 From the shell, `intel guide` prints the same guide markdown and
