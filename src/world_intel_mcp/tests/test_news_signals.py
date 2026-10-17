@@ -251,6 +251,49 @@ async def test_hostility_timeline_failed_base_never_reports_zero_articles(
 
 
 @respx.mock
+async def test_hostility_timeline_failed_base_still_flags_partial_days(fetcher, _fast) -> None:
+    # Live 2026-10-17 17:20Z: only the threat call answered, and its 10-15
+    # count (hours 10-23 only) carried no partial flag, because partial
+    # days were judged from the failed base series alone.
+    route, _ = _gdelt_router(fail={"articles"})
+    respx.get(url__regex=r".*api\.gdeltproject\.org.*").mock(side_effect=route)
+
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    days = {d["date"]: d for d in r["days"]}
+    assert days["2026-10-15"]["hostile"]["threat"] == sum(v // 5 for v, _ in _BASE[:14])
+    assert days["2026-10-15"]["partial"] is True
+    assert days["2026-10-15"]["hours_missing"] == [f"{h:02d}" for h in range(10)]
+    assert days["2026-10-16"]["partial"] is False
+    assert {d: v["buckets_returned"] for d, v in days.items()} == {
+        "2026-10-15": 14,
+        "2026-10-16": 24,
+        "2026-10-17": 16,
+    }
+    assert any("judged from the threat series" in g for g in r["data_gaps"])
+
+
+@respx.mock
+async def test_hostility_timeline_tone_only_leaves_partial_days_unjudged(fetcher, _fast) -> None:
+    # Volume calls answer 200 without a timeline (a failed call that does
+    # not trip the breaker, so the tone call still runs).
+    route, _ = _gdelt_router()
+
+    def _volume_malformed(request: httpx.Request) -> httpx.Response:
+        if request.url.params["mode"] == "timelinevolraw":
+            return httpx.Response(200, json={"query_details": {"date_resolution": "hour"}})
+        return route(request)
+
+    respx.get(url__regex=r".*api\.gdeltproject\.org.*").mock(side_effect=_volume_malformed)
+
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert r["degraded"] is True
+    assert all("partial" not in d and d["buckets_returned"] is None for d in r["days"])
+    tone = {d["date"]: d["tone"] for d in r["days"]}
+    assert tone["2026-10-16"] == round(sum(_TONE[14:38]) / 24, 4)
+    assert any("partial days are not flagged" in g for g in r["data_gaps"])
+
+
+@respx.mock
 async def test_hostility_timeline_unknown_resolution_is_disclosed(fetcher, _fast) -> None:
     payload = _volraw("Iran", [v for v, _ in _BASE])
     payload["query_details"]["date_resolution"] = "15 minutes"

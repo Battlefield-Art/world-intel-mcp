@@ -29,6 +29,9 @@ Gaps / not covered:
 - RSS feeds keep different amounts of history; change figures use only
   feeds whose oldest retained item predates the prior window, so a feed
   that keeps ten items never fakes a surge, but it also never counts.
+- When the base GDELT call fails, partial days are judged from a category
+  series' buckets. That every series shares the base series' bucket grid
+  was measured on one query (``Iran Israel``, 2026-10-17), not in general.
 """
 
 from __future__ import annotations
@@ -451,25 +454,39 @@ async def fetch_hostility_timeline(
             f"GDELT date_resolution {resolution!r} is not one this server has measured; "
             "partial-day detection is off"
         )
+    # The series whose buckets judge partial days: the base series, or when
+    # that call failed, the first category series that answered (measured
+    # 2026-10-17: category series carry the base series' bucket grid, zeros
+    # included). Without one, a surviving column could show a partial day's
+    # count unflagged.
+    coverage_col = next((c for c in ("articles", *GDELT_HOSTILITY_TERMS) if c in by_series), None)
+    if subdaily and coverage_col is None:
+        data_gaps.append("no volume timeline answered, so partial days are not flagged")
+    elif subdaily and coverage_col != "articles":
+        data_gaps.append(
+            f"partial days are judged from the {coverage_col} series' buckets "
+            "(the base articles call failed)"
+        )
     today = now.date()
     rows = []
     missing_days: list[str] = []
     for offset in range(days - 1, -1, -1):
         day = (today - timedelta(days=offset)).isoformat()
         base_points = by_series["articles"].get(day) if "articles" in by_series else None
+        coverage_points = by_series[coverage_col].get(day) if coverage_col else None
         # Today's UTC day has not ended: its totals are not comparable with
         # a full day's, whatever GDELT returned for the hours so far.
         row: dict[str, Any] = {"date": day, "in_progress": day == today.isoformat()}
         returned = None
-        if "articles" in by_series:
-            returned = len(base_points or [])
+        if coverage_col is not None:
+            returned = len(coverage_points or [])
         row["buckets_returned"] = returned
         if subdaily and returned is not None:
             # partial = some elapsed hour of the day has no bucket at all
             # (missing data). Today counts only wholly elapsed hours, so the
             # current one may be absent: GDELT's newest bucket lags the clock.
             hours = {
-                str(p["date"])[9:11] for p in base_points or [] if len(str(p["date"])) >= 11
+                str(p["date"])[9:11] for p in coverage_points or [] if len(str(p["date"])) >= 11
             }
             elapsed = now.hour if row["in_progress"] else 24
             missing_hours = sorted({f"{h:02d}" for h in range(elapsed)} - hours)
@@ -538,7 +555,9 @@ async def fetch_hostility_timeline(
                 "partial": (
                     "GDELT returned no bucket for at least one elapsed hour of that "
                     "UTC day (for today, only wholly elapsed hours count); "
-                    "hours_covered says how many hours had one"
+                    "hours_covered says how many hours had one. Judged from the "
+                    "base series, or the first category series that answered when "
+                    "the base call failed; absent when it cannot be judged"
                 ),
                 "in_progress": (
                     "the row is today's UTC day, which has not ended; its totals "

@@ -12,7 +12,9 @@
   every day; a day GDELT did not return is null in every column; both are
   listed in `data_gaps`. Partial days (GDELT answered 2026-10-17 in
   15-minute buckets for 3 days and hourly buckets for 7) are flagged
-  `partial`, and today's unfinished UTC day is flagged `in_progress`. The
+  `partial`, judged from the first category series that answered when the
+  base call failed, and today's unfinished UTC day is flagged
+  `in_progress`. The
   module spaces its own GDELT calls 5.5 s apart and retries a failed call
   once.
 - `intel_situations`: country pairs ("between": a headline naming two or
