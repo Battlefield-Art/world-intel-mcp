@@ -490,30 +490,41 @@ source here, and no proxy is substituted for any of these measures.
   articles that also use threat / sanction / force / criticism terms (one
   GDELT query per category, every term listed in `queries`), GDELT's total
   monitored articles, and average tone (`timelinetone`, weighted by the
-  per-bucket article counts). A failed call leaves its column null for
-  every day; a day GDELT did not return is null in every column; both are
-  listed in `data_gaps`. Partial days (GDELT answered 2026-10-17 in
-  15-minute buckets for 3 days and hourly buckets for 7) are flagged
-  `partial`, judged from the first category series that answered when the
-  base call failed, and today's unfinished UTC day is flagged
-  `in_progress`. A
-  failed call is retried once.
+  per-bucket article counts). A failed call, or one only an expired cached
+  copy answered, leaves its column null for every day (`column_status`
+  per call, `stale_age_seconds` per expired column); a day GDELT did not
+  return is null in every column, and a day one series lacks is null in
+  that column; all are listed in `data_gaps`. Partial days (GDELT answered
+  2026-10-17 in 15-minute buckets for 3 days and hourly buckets for 7) are
+  flagged `partial` per volume column (`partial_columns`,
+  `coverage_by_column`), and today's unfinished UTC day is flagged
+  `in_progress`. Failed and expired columns get one retry pass, which
+  stops at the first retry that fails again. Countries resolve from the
+  22-country table by name, ISO3 or ISO2 code; other names are searched
+  verbatim, and other 2- and 3-letter codes are refused.
 - `intel_situations`: country pairs ("between": a headline naming two or
   more countries) and single countries ("inside": a headline naming one)
   ranked over a recent RSS window by most covered, most hostile (headline
   keyword heuristic, `classifier.classify_hostility`) or biggest change.
   Change is defined in the response: current minus prior window, counted
   only over feeds whose retained history reaches back past the prior
-  window's start; the feeds that do not are named.
+  window's start; the feeds that do not are named. With no such feed,
+  change fields are null and `change_measured` is false, and a change
+  sort ranks by coverage (`sort_applied`); a change figure resting on
+  under half of the window's items is named a thin sample.
 - `intel_top_stories`: story clusters in the window carried by at least
   `min_outlets` distinct outlets, plus attention: the countries and
-  organizations whose headline mentions grew most against the prior window.
+  organizations whose headline mentions grew most against the prior window
+  (empty with `attention_change_measured: false` when no feed spans both
+  windows).
 - `intel_news_clusters` clusters gain `outlets` and `outlet_count`
   (distinct publishers among all members; sister feeds such as BBC World
   and BBC Mundo count once). Existing keys are unchanged.
 - CLI: `intel hostility COUNTRY [OTHER]`, `intel situations`,
   `intel top-stories`. Nulls render as `n/a`, never 0; partial days are
-  marked `*` and today `~`.
+  marked `*` (and each count from a partial column), today `~`, and
+  expired columns are named with their age; unmeasured change and
+  attention print as not measured.
 - Collector: `situations` and `top_stories` (57 sources).
 
 ### Changed
@@ -527,9 +538,17 @@ source here, and no proxy is substituted for any of these measures.
 - Live GDELT calls are spaced at least 5 s apart by the fetcher
   (`_SOURCE_RATE_LIMITS["gdelt"]`), for every GDELT caller: GDELT's 429
   body asks for "one every 5 seconds" (measured 2026-10-17). Cache hits are
-  not delayed. The limiter is per process, so the MCP server and the
-  collector do not share it, and the fetcher's own retries inside one call
-  are not spaced by it.
+  not delayed. The floor holds across the processes that share one cache
+  DB (collector, MCP servers, dashboard, CLI): every request that passes
+  the fetcher's GDELT floor also reserves a slot in a `source_floor` table
+  under `BEGIN IMMEDIATE` (`shared_floor.py`); a reservation that cannot
+  be made is logged and the request keeps the in-process floor. A 429 from
+  any source with a floor is retried no sooner than that floor
+  (`get_json`; it was 1 s, then 2 s). Processes on different cache DB
+  paths still do not coordinate. The AOI sweep makes one GDELT call per
+  AOI, so the floor bounds it: against a mocked GDELT, 45 AOIs took 220 s
+  of the collector's 240 s `aoi_digest` budget and 50 AOIs timed out
+  after 48 calls (measured 2026-10-17, every other AOI domain stubbed).
 
 ### Fixed
 - RSS outage read as a slow news day (ROADMAP Phase 24.5):
@@ -576,6 +595,38 @@ source here, and no proxy is substituted for any of these measures.
   have no headline keywords, so the search could never match; the section
   now says "mentions not searched" instead of reporting zero.
   `intel dossier` prints `News: not measured` and the gaps in that case.
+- Review fixes for the news signals (independent review, 2026-10-17):
+  - The hostility timeline showed an expired cached GDELT copy (days old
+    when no collector evicts it) as current counts, with no marker. Such a
+    column is now null, named in `data_gaps` with its age and in
+    `column_status`, and the response is `degraded` with
+    `reason: gdelt_stale`.
+  - A day with no buckets in the series that judged completeness read as
+    complete (`partial: false`), and a category series covering half a day
+    sat unflagged next to full-day counts. Partial days are now judged per
+    column; a half-day count gets no `hostile_share`.
+  - With no comparable feed, situations reported change 0 and ratio 1.0
+    ("no change"), and the CLI printed `+0`; attention read as "nothing
+    grew". Both are now null or empty and marked not measured.
+  - A 429 inside one GDELT call was retried after 1 s and 2 s, and the
+    timeline's retry pass asked again for every failed column; see the
+    GDELT spacing entry under Changed.
+  - Dossier headline matching was a substring test ("Tirana" counted as
+    Iran, "Indiana" as India) and hid its cap: it now matches whole words,
+    removes four compound names first, and reports `matching_items`,
+    `mention_count_capped`, `items_searched` and `searched_span`.
+  - A near-total RSS outage (118 of 119 feeds down) read as normal:
+    `fetch_news_feed` now marks a read where under half of the feeds
+    answered live `degraded` with `reason: partial_feeds_failed`, and
+    `intel_trending_keywords` passes the feed counts and marker through;
+    situations, top stories and the dossier rank or count over the feeds
+    that answered and say so.
+  - Clustering ran on the event loop the collector and the MCP server
+    share; unknown codes such as "GBR" were sent to GDELT as text; a limit
+    of 0 or -1 returned nothing or dropped a result, and `min_articles: 0`
+    divided by zero; feed links of any scheme (`javascript:`, `data:`)
+    were passed on and titles had no length cap (now http(s) only, titles
+    capped at 500 characters).
 
 ### Fixed: vessel snapshot waterway matching
 - `intel_vessel_snapshot` counted every NGA warning at all nine waterways,

@@ -400,9 +400,9 @@ Keyless: FRED graph CSV and the ECB Data Portal. Every point carries its observa
 ### News Signals (3)
 | Tool | Description |
 |------|-------------|
-| `intel_hostility_timeline` | Per-day GDELT coverage of a country or a pair: article count, articles using threat / sanction / force / criticism terms (GDELT keyword match, terms listed in the response), average tone. A failed call or a day GDELT did not return is null and listed in `data_gaps`, never zero |
-| `intel_situations` | Situations between countries (headlines naming two or more) and inside a country (headlines naming one), ranked by most covered, most hostile (headline keyword heuristic) or biggest change against the prior window; the response defines each measure and names the feeds excluded from change figures |
-| `intel_top_stories` | Stories carried by at least `min_outlets` distinct outlets (sister feeds of one publisher count once), plus the countries and organizations whose headline mentions grew most |
+| `intel_hostility_timeline` | Per-day GDELT coverage of a country or a pair: article count, articles using threat / sanction / force / criticism terms (GDELT keyword match, terms listed in the response), average tone. A failed call, an expired cached copy, or a day GDELT did not return is null and listed in `data_gaps` (`column_status` per call), never zero; partial days are flagged per column |
+| `intel_situations` | Situations between countries (headlines naming two or more) and inside a country (headlines naming one), ranked by most covered, most hostile (headline keyword heuristic) or biggest change against the prior window; the response defines each measure and names the feeds excluded from change figures. With no comparable feed, change is null and `change_measured` false |
+| `intel_top_stories` | Stories carried by at least `min_outlets` distinct outlets (sister feeds of one publisher count once), plus the countries and organizations whose headline mentions grew most (`attention_change_measured` false when nothing could be compared) |
 
 ### Intelligence Analysis (8)
 | Tool | Description |

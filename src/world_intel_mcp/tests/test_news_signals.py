@@ -458,9 +458,10 @@ async def test_hostility_timeline_spaces_live_calls_and_not_cache_hits(
 async def test_gdelt_search_and_timeline_share_one_rate_limit(
     fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Every GDELT caller goes through the fetcher's per-source floor, so an
-    # intel_gdelt_search call and the timeline's calls cannot burst
-    # together (GDELT's 429 text: "one every 5 seconds").
+    # Every GDELT caller goes through the fetcher's per-source floor, so in
+    # one process an intel_gdelt_search call and the timeline's calls cannot
+    # burst together (GDELT's 429 text: "one every 5 seconds"). Across
+    # processes the floor holds through shared_floor (test_gdelt_floor.py).
     waits: list[float] = []
 
     async def _record(delay, *args, **kwargs) -> None:
@@ -989,3 +990,589 @@ def test_cli_top_stories_json_output_is_raw(_cli_env, monkeypatch: pytest.Monkey
     result = _invoke("--json-output", "top-stories")
     assert result.exit_code == 0
     assert '"degraded": true' in result.output
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (cloud review of 3c0ebff, 2026-10-17): expired GDELT copies,
+# per-column partial days, unmeasured change, retry spacing, odd inputs.
+# ---------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402
+import time  # noqa: E402
+from collections import Counter  # noqa: E402
+
+from world_intel_mcp.analysis import clustering  # noqa: E402
+
+_COLUMNS = ("articles", "threat", "sanction", "force", "criticism", "tone")
+_GDELT_URL = r".*api\.gdeltproject\.org.*"
+
+
+def _expire_gdelt_copies(fetcher, age_s: float) -> int:
+    """Turn every cached GDELT timeline into an expired copy fetched
+    ``age_s`` ago: what the cache holds when no collector evicts it."""
+    now = time.time()
+    conn = sqlite3.connect(str(fetcher.cache.db_path))
+    try:
+        cur = conn.execute(
+            "UPDATE cache SET expires_at = ?, created_at = ? WHERE key LIKE ?",
+            (now - 1, now - age_s, "news_signals:gdelt:%"),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def _column(request: httpx.Request) -> str:
+    if request.url.params["mode"] == "timelinetone":
+        return "tone"
+    return _category_of(request.url.params["query"])
+
+
+def _volraw_dropping(title: str, values: list[int], drop) -> dict:
+    """The live volume shape without the buckets whose stamp ``drop`` picks."""
+    payload = _volraw(title, values)
+    series = payload["timeline"][0]
+    series["data"] = [p for p in series["data"] if not drop(p["date"])]
+    return payload
+
+
+@respx.mock
+async def test_hostility_timeline_expired_copies_are_never_shown_as_current(
+    fetcher, _fast
+) -> None:
+    # Review H1: every live call fails, so the fetcher serves each column's
+    # expired cached copy (marked _stale). The timeline used to return those
+    # copies as current counts with no gap, marker or degraded flag.
+    route, _ = _gdelt_router()
+    down = {"on": False}
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503) if down["on"] else route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    first = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert first["column_status"] == {c: "ok" for c in _COLUMNS}
+    assert first["stale_age_seconds"] == {}
+    assert _expire_gdelt_copies(fetcher, age_s=72 * 3600) == 6
+    down["on"] = True
+
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert r["degraded"] is True
+    assert r["reason"] == "gdelt_stale"
+    assert "expired cached copy" in r["error"]
+    assert r["days"] == []
+    assert r["column_status"] == {c: "stale" for c in _COLUMNS}
+    assert sorted(r["stale_age_seconds"]) == sorted(_COLUMNS)
+    assert all(abs(a - 72 * 3600) < 120 for a in r["stale_age_seconds"].values())
+    for col in _COLUMNS:
+        assert any(
+            g.startswith(f"{col}:") and "expired cached copy (72.0 h old)" in g
+            for g in r["data_gaps"]
+        ), col
+
+
+@respx.mock
+async def test_hostility_timeline_one_expired_column_is_null_and_named(fetcher, _fast) -> None:
+    route, _ = _gdelt_router()
+    force_down = {"on": False}
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        if force_down["on"] and _column(request) == "force":
+            return httpx.Response(503)
+        return route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    _expire_gdelt_copies(fetcher, age_s=26 * 3600)
+    force_down["on"] = True
+
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert r["degraded"] is True
+    assert r["reason"] == "gdelt_stale"
+    assert "error" not in r
+    assert r["column_status"] == dict({c: "ok" for c in _COLUMNS}, force="stale")
+    assert list(r["stale_age_seconds"]) == ["force"]
+    for d in r["days"]:
+        assert d["hostile"]["force"] is None
+        assert d["hostile_share"]["force"] is None
+        assert d["articles"] == _DAY_ARTICLES[d["date"]]
+        assert d["hostile"]["sanction"] == _DAY_SANCTION[d["date"]]
+    assert any(
+        g.startswith("force:") and "expired cached copy (26.0 h old)" in g for g in r["data_gaps"]
+    )
+
+
+@respx.mock
+async def test_hostility_timeline_retry_pass_replaces_an_expired_copy(fetcher, _fast) -> None:
+    # The initial force call falls back to its expired copy; the retry pass
+    # asks again and the fresh answer (different values) replaces it.
+    route, _ = _gdelt_router()
+    second = {"on": False, "force_429s": 3}
+    fresh_force = [v * 3 for v in _DERIVED["force"]]
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        if second["on"] and _column(request) == "force":
+            if second["force_429s"] > 0:
+                second["force_429s"] -= 1
+                return httpx.Response(429, text=_RATE_LIMIT_BODY)
+            return httpx.Response(200, json=_volraw(request.url.params["query"], fresh_force))
+        return route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    _expire_gdelt_copies(fetcher, age_s=26 * 3600)
+    second["on"] = True
+
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert "degraded" not in r
+    assert r["column_status"]["force"] == "ok"
+    assert r["stale_age_seconds"] == {}
+    d16 = next(d for d in r["days"] if d["date"] == "2026-10-16")
+    assert d16["hostile"]["force"] == sum(fresh_force[14:38])
+
+
+@respx.mock
+async def test_hostility_timeline_partial_category_column_is_flagged_per_column(
+    fetcher, _fast
+) -> None:
+    # Review M1 (C): the base series covers all of 10-16 but the force
+    # series returned only 00-11Z; the half-day force count sat next to
+    # full-day counts with partial False.
+    route, _ = _gdelt_router()
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        if _column(request) == "force":
+            return httpx.Response(200, json=_volraw_dropping(
+                request.url.params["query"], _DERIVED["force"],
+                lambda d: d.startswith("20261016") and int(d[9:11]) >= 12,
+            ))
+        return route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    days = {d["date"]: d for d in r["days"]}
+    d16 = days["2026-10-16"]
+    assert d16["hostile"]["force"] == sum(_DERIVED["force"][14:26])
+    assert d16["partial"] is True
+    assert d16["partial_columns"] == ["force"]
+    assert d16["hours_missing"] == [f"{h:02d}" for h in range(12, 24)]
+    assert d16["coverage_by_column"]["force"] == {
+        "buckets_returned": 12, "hours_covered": 12, "partial": True,
+    }
+    assert d16["coverage_by_column"]["articles"] == {
+        "buckets_returned": 24, "hours_covered": 24, "partial": False,
+    }
+    # A half-day count over a full-day count is not a share.
+    assert d16["hostile_share"]["force"] is None
+    assert d16["hostile_share"]["sanction"] == round(79 / 732, 4)
+    assert days["2026-10-17"]["partial"] is False
+    assert days["2026-10-17"]["partial_columns"] == []
+    # 10-15 starts at 10:00 in every series: partial everywhere, and the
+    # shares compare like with like.
+    assert days["2026-10-15"]["partial_columns"] == ["articles", "threat", "sanction", "force", "criticism"]
+    assert days["2026-10-15"]["hostile_share"]["force"] is not None
+
+
+@respx.mock
+async def test_hostility_timeline_day_missing_from_the_judging_series_is_not_complete(
+    fetcher, _fast
+) -> None:
+    # Review M1 (A): with the base call failed, the threat series judges
+    # partial days, and it has no buckets for 10-16. That day read partial
+    # False with hours_covered 0 (surviving mutant M22), and the other
+    # columns' counts carried no gap.
+    route, _ = _gdelt_router(fail={"articles"})
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        if _column(request) == "threat":
+            return httpx.Response(200, json=_volraw_dropping(
+                request.url.params["query"], _DERIVED["threat"],
+                lambda d: d.startswith("20261016"),
+            ))
+        return route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    d16 = next(d for d in r["days"] if d["date"] == "2026-10-16")
+    assert d16["hostile"]["threat"] is None
+    assert d16["hostile"]["sanction"] == _DAY_SANCTION["2026-10-16"]
+    assert d16["partial"] is True
+    assert d16["partial_columns"] == ["threat"]
+    assert d16["coverage_by_column"]["threat"] == {
+        "buckets_returned": 0, "hours_covered": 0, "partial": True,
+    }
+    assert d16["coverage_by_column"]["sanction"]["partial"] is False
+    assert any(
+        g.startswith("threat:") and "2026-10-16" in g and "not zero" in g for g in r["data_gaps"]
+    )
+
+
+@respx.mock
+async def test_hostility_timeline_failed_base_still_names_days_no_series_returned(
+    fetcher, _fast
+) -> None:
+    # The "no buckets" gap used to be computed from the base series only,
+    # so with the base call failed, unreturned days went unnamed.
+    route, _ = _gdelt_router(fail={"articles"})
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=route)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=5, now=_NOW_GDELT)
+    days = {d["date"]: d for d in r["days"]}
+    assert days["2026-10-13"]["hostile"] == {c: None for c in ns.GDELT_HOSTILITY_TERMS}
+    assert days["2026-10-13"]["partial"] is True
+    assert any("no buckets for 2 of 5" in g for g in r["data_gaps"])
+
+
+@respx.mock
+async def test_hostility_timeline_retry_requests_are_spaced_by_the_floor(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review M3: attempts inside one call went 1 s and 2 s apart, and the
+    # timeline's retry pass added three more such requests per failed
+    # column. Every GDELT request now follows the previous one by at least
+    # GDELT's 5 s floor (sleeps recorded, not slept).
+    events: list[tuple[str, float]] = []
+
+    async def _record(delay, *args, **kwargs) -> None:
+        events.append(("sleep", delay))
+
+    monkeypatch.setattr(asyncio_mod, "sleep", _record)
+    route, calls = _gdelt_router(fail={"sanction"})
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        events.append(("request", 0.0))
+        return route(request)
+
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=_answer)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert Counter(c for c, _ in calls)["sanction"] == 6
+    assert r["column_status"]["sanction"] == "failed"
+    gaps: list[float] = []
+    waited: float | None = None
+    for kind, delay in events:
+        if kind == "request":
+            if waited is not None:
+                gaps.append(waited)
+            waited = 0.0
+        elif waited is not None:
+            waited += delay
+    assert len(gaps) == 10
+    assert min(gaps) > 4.5, gaps
+
+
+@respx.mock
+async def test_hostility_timeline_retry_pass_stops_when_a_retry_fails_again(
+    fetcher, _fast
+) -> None:
+    route, calls = _gdelt_router(fail={"sanction", "force"})
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=route)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    counts = Counter(c for c, _ in calls)
+    # sanction: three attempts, then three more on the retry pass, which
+    # then stops: GDELT is still refusing, so force is not asked again.
+    assert counts["sanction"] == 6
+    assert counts["force"] == 3
+    assert r["column_status"]["force"] == "failed"
+    assert any("retry pass stopped" in g and "force" in g for g in r["data_gaps"])
+
+
+def test_country_resolution_maps_two_letter_codes() -> None:
+    assert ns._resolve_country("IR") == ("Iran", "IRN")
+    assert ns._resolve_country("ua") == ("Ukraine", "UKR")
+
+
+@respx.mock
+async def test_hostility_timeline_refuses_codes_it_cannot_name(fetcher, _fast) -> None:
+    # Review L2: "GBR" or "FRA" used to be sent to GDELT as literal text,
+    # which reads as low coverage; "UK" is too short for GDELT.
+    route, calls = _gdelt_router()
+    respx.get(url__regex=_GDELT_URL).mock(side_effect=route)
+    for code in ("GBR", "UK", "fra"):
+        r = await ns.fetch_hostility_timeline(fetcher, code, now=_NOW_GDELT)
+        assert f"'{code}' looks like a country code" in r["error"]
+        assert r["days"] == []
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "DE", now=_NOW_GDELT)
+    assert "'DE' looks like a country code" in r["error"]
+    assert calls == []
+
+
+_SHALLOW_ITEMS = [
+    # Every feed keeps about 10 h of history, so none reaches back to a
+    # 24 h prior window's start: nothing can be compared.
+    _item("Russia launches missile strikes on Kyiv as Ukraine war grinds on", "BBC World", 2),
+    _item("Russia and Ukraine trade prisoners", "BBC World", 10),
+    _item("Russian drone attack hits Ukrainian grid", "Al Jazeera", 1),
+    _item("Mexico unveils new budget plan", "Al Jazeera", 9),
+    _item("Mexico budget vote delayed", "NPR World", 3),
+]
+
+
+async def test_situations_change_is_not_measured_when_no_feed_is_comparable(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review M2: with no comparable feed, change read 0 and change_ratio 1.0
+    # ("no change"), and the CLI printed +0.
+    _patch_feed(monkeypatch, _feed(_SHALLOW_ITEMS))
+    r = await ns.fetch_situations(fetcher, min_articles=1, now=_NOW)
+    assert r["coverage"]["feeds_comparable"] == 0
+    assert r["change_measured"] is False
+    rus_ukr = next(s for s in r["situations"] if s["key"] == "RUS-UKR")
+    assert rus_ukr["articles"] == 3
+    assert rus_ukr["change_measured"] is False
+    for key in ("current_comparable", "prior", "change", "change_ratio"):
+        assert rus_ukr[key] is None, key
+    assert any(g.startswith("change not measured") for g in r["data_gaps"])
+
+    by_change = await ns.fetch_situations(fetcher, sort="change", min_articles=1, now=_NOW)
+    assert by_change["sort"] == "change"
+    assert by_change["sort_applied"] == "covered"
+    assert [s["key"] for s in by_change["situations"]] == ["RUS-UKR", "MEX"]
+    assert any("ranked by coverage instead" in g for g in by_change["data_gaps"])
+
+
+async def test_situations_measured_change_says_so_and_flags_a_thin_sample(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_feed(monkeypatch, _feed(_SITUATION_ITEMS))
+    r = await ns.fetch_situations(fetcher, sort="change", min_articles=1, now=_NOW)
+    assert r["change_measured"] is True
+    assert r["sort_applied"] == "change"
+    assert all(s["change_measured"] is True for s in r["situations"])
+    # 4 of the 6 current-window items come from comparable feeds.
+    assert not any("thin sample" in g for g in r["data_gaps"])
+
+    thin = _SITUATION_ITEMS + [
+        _item(f"Russia and Ukraine story {i}", "NPR World", 1 + i / 10) for i in range(6)
+    ]
+    _patch_feed(monkeypatch, _feed(thin))
+    r = await ns.fetch_situations(fetcher, min_articles=1, now=_NOW)
+    assert any("4 of 12 current-window items" in g and "thin sample" in g for g in r["data_gaps"])
+
+
+async def test_situations_item_exactly_at_the_prior_start_is_in_neither_window(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review mutant M16: windows are (start, end], so an item stamped
+    # exactly at the prior window's start belongs to neither window; it
+    # still shows that its feed's history reaches back that far.
+    items = [
+        _item("Mexico unveils new budget plan", "Al Jazeera", 5),
+        _item("Mexico budget vote delayed", "Al Jazeera", 48),
+    ]
+    _patch_feed(monkeypatch, _feed(items))
+    r = await ns.fetch_situations(fetcher, min_articles=1, now=_NOW)
+    mex = next(s for s in r["situations"] if s["key"] == "MEX")
+    assert (mex["current_comparable"], mex["prior"], mex["change"]) == (1, 0, 1)
+    assert r["coverage"]["feeds_comparable"] == 1
+    assert r["coverage"]["items_prior_window"] == 0
+
+
+async def test_top_stories_attention_is_not_measured_when_no_feed_is_comparable(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review M2: an empty attention list read as "nothing grew".
+    _patch_feed(monkeypatch, _feed(_SHALLOW_ITEMS))
+    r = await ns.fetch_top_stories(fetcher, now=_NOW)
+    assert r["attention"] == []
+    assert r["attention_change_measured"] is False
+    assert any(g.startswith("attention not measured") for g in r["data_gaps"])
+
+    _patch_feed(monkeypatch, _feed(_top_items()))
+    measured = await ns.fetch_top_stories(fetcher, now=_NOW)
+    assert measured["attention_change_measured"] is True
+    assert measured["attention"][0]["name"] == "Yemen"
+
+
+async def test_situations_and_top_stories_proceed_on_a_partial_feed_outage(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review M5: a partial outage now carries degraded/reason; it is not a
+    # total outage, so rankings are built and the marker passed on.
+    marker = {"degraded": True, "reason": "partial_feeds_failed", "feeds_ok": 1,
+              "feeds_attempted": 3, "feeds_failed": ["CFR", "DW News"]}
+    _patch_feed(monkeypatch, _feed(_SITUATION_ITEMS, **marker))
+    r = await ns.fetch_situations(fetcher, min_articles=1, now=_NOW)
+    assert r["situations"]
+    assert "error" not in r
+    assert (r["degraded"], r["reason"]) == (True, "partial_feeds_failed")
+    assert any(g.startswith("only 1 of 3 RSS feeds answered live") for g in r["data_gaps"])
+
+    _patch_feed(monkeypatch, _feed(_top_items(), **marker))
+    t = await ns.fetch_top_stories(fetcher, now=_NOW)
+    assert t["count"] == 1
+    assert (t["degraded"], t["reason"]) == (True, "partial_feeds_failed")
+    assert any(g.startswith("only 1 of 3 RSS feeds answered live") for g in t["data_gaps"])
+
+
+async def test_situations_and_top_stories_clamp_limits_to_one(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L3: limit -1 dropped the last result and 0 returned nothing;
+    # min_articles 0 divided by zero on a situation seen only in the prior
+    # window.
+    prior_only = _item("Iraq and Syria close their border", "BBC World", 30)
+    _patch_feed(monkeypatch, _feed(_SITUATION_ITEMS + [prior_only]))
+    for bad in (0, -1):
+        r = await ns.fetch_situations(fetcher, limit=bad, min_articles=1, now=_NOW)
+        assert [s["key"] for s in r["situations"]] == ["RUS-UKR"]
+        assert r["limit"] == 1
+    r = await ns.fetch_situations(fetcher, min_articles=0, now=_NOW)
+    assert r["min_articles"] == 1
+    assert "IRQ-SYR" not in {s["key"] for s in r["situations"]}
+
+    _patch_feed(monkeypatch, _feed(_top_items()))
+    t = await ns.fetch_top_stories(fetcher, limit=0, attention_limit=-1, min_outlets=1, now=_NOW)
+    assert t["count"] == 1
+    assert len(t["attention"]) == 1
+    assert (t["limit"], t["attention_limit"]) == (1, 1)
+
+
+def _blocking_clusterer(monkeypatch: pytest.MonkeyPatch, module) -> None:
+    real = module.cluster_articles
+
+    def _slow(*args, **kwargs):
+        time.sleep(0.3)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "cluster_articles", _slow)
+
+
+async def _ticks_during(coro) -> tuple[int, object]:
+    """How often a 10 ms ticker ran while ``coro`` was awaited."""
+    ticks = 0
+    done = asyncio_mod.Event()
+
+    async def _ticker() -> None:
+        nonlocal ticks
+        while not done.is_set():
+            await asyncio_mod.sleep(0.01)
+            ticks += 1
+
+    task = asyncio_mod.create_task(_ticker())
+    try:
+        result = await coro
+    finally:
+        done.set()
+        await task
+    return ticks, result
+
+
+async def test_top_stories_and_clusters_cluster_off_the_event_loop(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L1: clustering 3,500 titles took 6.4 s on the event loop the
+    # collector and the MCP server share.
+    _patch_feed(monkeypatch, _feed(_top_items()))
+    _blocking_clusterer(monkeypatch, ns)
+    ticks, r = await _ticks_during(ns.fetch_top_stories(fetcher, now=_NOW))
+    assert r["count"] == 1
+    assert ticks >= 10, ticks
+
+    _blocking_clusterer(monkeypatch, clustering)
+    ticks, c = await _ticks_during(clustering.fetch_news_clusters(fetcher))
+    assert c["cluster_count"] >= 1
+    assert ticks >= 10, ticks
+
+
+def test_cli_hostility_marks_partial_and_stale_columns(
+    _cli_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "parties": [{"name": "Iran"}, {"name": "Israel"}],
+        "days_requested": 1,
+        "date_resolution": "hour",
+        "column_status": dict({c: "ok" for c in _COLUMNS}, criticism="stale"),
+        "stale_age_seconds": {"criticism": 93600.0},
+        "days": [
+            {"date": "2026-10-16", "articles": 732, "partial": True, "partial_columns": ["force"],
+             "tone": -2.6654,
+             "hostile": {"threat": 140, "sanction": 79, "force": 120, "criticism": None}},
+        ],
+        "data_gaps": [],
+    }
+    monkeypatch.setattr(ns, "fetch_hostility_timeline", _fake(payload))
+    result = _invoke("hostility", "Iran", "Israel", "-d", "1")
+    assert result.exit_code == 0
+    row = next(line for line in result.output.splitlines() if "2026-10-16" in line)
+    assert row.split() == ["2026-10-16", "*", "732", "140", "79", "120*", "n/a", "-2.6654"]
+    assert "criticism is an expired cached copy (26.0 h old)" in result.output
+
+
+def test_cli_situations_prints_unmeasured_change_as_not_measured(
+    _cli_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "window": {"current": {"start": "2026-10-16T16:00:00Z", "end": "2026-10-17T16:00:00Z"}},
+        "change_measured": False,
+        "situations": [
+            {"kind": "between", "countries": [{"name": "Russia"}, {"name": "Ukraine"}],
+             "articles": 3, "hostile_articles": 2, "change": None, "change_measured": False,
+             "outlet_count": 2, "sample_headlines": [{"title": "Russia launches missile strikes"}]},
+        ],
+        "data_gaps": [],
+    }
+    monkeypatch.setattr(ns, "fetch_situations", _fake(payload))
+    result = _invoke("situations")
+    assert result.exit_code == 0
+    assert "Change not measured" in result.output
+    assert "+0" not in result.output
+
+
+def test_cli_top_stories_prints_unmeasured_attention(
+    _cli_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {"stories": [], "attention": [], "attention_change_measured": False,
+               "data_gaps": []}
+    monkeypatch.setattr(ns, "fetch_top_stories", _fake(payload))
+    result = _invoke("top-stories")
+    assert result.exit_code == 0
+    assert "Attention: not measured" in result.output
+
+
+async def test_hostility_timeline_failed_retry_keeps_the_expired_copy_status(
+    fetcher, monkeypatch: pytest.MonkeyPatch, _fast
+) -> None:
+    # The force call finds only an expired copy and its retry finds nothing
+    # (the copy evicted in between): the column stays "stale" with the
+    # copy's age instead of turning into a plain failure.
+    calls: Counter = Counter()
+
+    async def _timeline(fetcher, query, mode, days):
+        col = "tone" if mode == "timelinetone" else _category_of(query)
+        calls[col] += 1
+        if col == "force":
+            if calls[col] == 1:
+                return dict(_volraw(query, _DERIVED["force"]), _stale=True, _stale_age_seconds=7200.0)
+            return None
+        if col == "tone":
+            return _tone(query)
+        if col == "articles":
+            return _volraw(query, [v for v, _ in _BASE])
+        if col == "sanction":
+            return _volraw(query, _SANCTION)
+        return _volraw(query, _DERIVED[col])
+
+    monkeypatch.setattr(ns, "_gdelt_timeline", _timeline)
+    r = await ns.fetch_hostility_timeline(fetcher, "Iran", "Israel", days=3, now=_NOW_GDELT)
+    assert calls["force"] == 2
+    assert r["column_status"]["force"] == "stale"
+    assert r["stale_age_seconds"] == {"force": 7200.0}
+    assert all(d["hostile"]["force"] is None for d in r["days"])
+    assert any(
+        g.startswith("force:") and "expired cached copy (2.0 h old)" in g for g in r["data_gaps"]
+    )
+
+
+async def test_situations_half_comparable_items_is_not_a_thin_sample(
+    fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The thin-sample note's edge: 4 comparable of 8 current-window items is
+    # half, not under half.
+    items = _SITUATION_ITEMS + [
+        _item(f"Russia and Ukraine story {i}", "NPR World", 1 + i / 10) for i in range(2)
+    ]
+    _patch_feed(monkeypatch, _feed(items))
+    r = await ns.fetch_situations(fetcher, min_articles=1, now=_NOW)
+    assert r["coverage"]["items_current_window"] == 8
+    assert r["coverage"]["items_current_window_comparable"] == 4
+    assert not any("thin sample" in g for g in r["data_gaps"])
