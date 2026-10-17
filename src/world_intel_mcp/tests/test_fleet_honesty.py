@@ -394,7 +394,9 @@ async def test_a_complete_posture_is_cached_with_no_gaps(
 
 
 def _baseline_keys(baseline: TemporalBaseline) -> list[str]:
-    return [row[0] for row in baseline._conn.execute("SELECT key FROM baselines")]
+    # The connection opens on first use, so a surge that recorded nothing
+    # may never have opened it.
+    return [row[0] for row in baseline._get_conn().execute("SELECT key FROM baselines")]
 
 
 @pytest.mark.asyncio
