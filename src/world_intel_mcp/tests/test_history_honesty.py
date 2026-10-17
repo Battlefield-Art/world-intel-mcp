@@ -676,3 +676,190 @@ async def test_collector_records_a_source_that_raised_a_base_exception(tmp_path,
         s.close()
     assert (cap["status"], cap["reason"], cap["record_count"]) == ("error", "source aborted", None)
     assert cap["duration_s"] is not None
+
+
+# ---------------------------------------------------------------------------
+# ASCII-only observation dates; a stable stale reason with the age apart
+# ---------------------------------------------------------------------------
+
+_FULLWIDTH_2026 = "２０２６"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _FULLWIDTH_2026,
+        _FULLWIDTH_2026 + "-10",
+        "2026-1０",  # one fullwidth digit in the month
+        "٢٠٢٦",  # 2026 in Arabic-Indic digits
+        _FULLWIDTH_2026 + "-10-17T00:00:00Z",
+    ],
+)
+def test_observed_at_must_use_ascii_digits(text) -> None:
+    assert history.normalize_observed_at(text) is None
+
+
+def test_a_point_dated_in_fullwidth_digits_is_skipped_and_counted(store, monkeypatch) -> None:
+    monkeypatch.setattr(history, "_EXTRACTORS", dict(history._EXTRACTORS))
+    monkeypatch.setattr(history, "_EXPECTED", dict(history._EXPECTED))
+    history.register_extractor("test_feed", lambda payload: [
+        Observation("level", 1.0, observed_at=_FULLWIDTH_2026 + "-10"),
+        Observation("level", 2.0, observed_at="2026-10"),
+    ])
+    _record(store, "test_feed", T0, {"rows": [1]})
+    (cap,) = store.capture_history("test_feed")["captures"]
+    assert (cap["observations_extracted"], cap["observations_stored"]) == (2, 1)
+    assert cap["extract_error"] == "1 invalid point(s) skipped"
+    (point,) = store.series_history("test_feed:level")["observations"]
+    assert (point["observed_at"], point["value"]) == ("2026-10", 2.0)
+
+
+def test_stale_reason_is_stable_and_the_age_is_a_field(store) -> None:
+    serves = tuple(StaleServe("polymarket", f"k{i}", age) for i, age in enumerate((30.0, 812.5)))
+    store.record_cycle([
+        SourceOutcome("prediction_markets", T0, 1.0, {"markets": [1]}, stale_serves=serves),
+        SourceOutcome("gas_prices", T0, 1.0, {"prices": [1], "_stale": True,
+                                              "_stale_age_seconds": 64.5}),
+        SourceOutcome("cyclones", T0, 1.0, {"cyclones": [1], "_stale": True}),
+    ], now=T0)
+    _replay(store, "wildfires", T0, FIRES, age=812.0)
+    _replay(store, "wildfires", T0 + 300, FIRES, age=1112.0)
+    _record(store, "wildfires", T0 + 600, FIRES)
+
+    def _fields(source):
+        return [(c["reason"], c["stale_age_s"], c["stale_fetches"])
+                for c in store.capture_history(source)["captures"]]
+
+    assert _fields("wildfires") == [
+        (None, None, None),  # live
+        ("served stale cache", 1112.0, 1),
+        ("served stale cache", 812.0, 1),
+    ]
+    assert _fields("prediction_markets") == [("served stale cache", 812.5, 2)]
+    # Seen only through the payload's marker: the fetch count is unknown.
+    assert _fields("gas_prices") == [("served stale cache", 64.5, None)]
+    assert _fields("cyclones") == [("served stale cache", None, None)]
+
+
+def test_stale_reasons_with_points_stay_one_reason(store) -> None:
+    _replay(store, "market_quotes", T0, _quotes(1.0), age=10.0)
+    _replay(store, "market_quotes", T0 + 300, _quotes(1.0), age=310.0)
+    reasons = {c["reason"] for c in store.capture_history("market_quotes")["captures"]}
+    assert reasons == {
+        "served stale cache; partial: 1 of 7 expected series; observations not stored: "
+        "a stale-cache replay is not a new observation"
+    }
+
+
+def test_health_reports_the_stale_copy_age_apart_from_the_reason(store) -> None:
+    now = T0 + 10_000
+    _record(store, "wildfires", now - 5000, FIRES)
+    _replay(store, "wildfires", now - 10, FIRES, age=4990.0)
+    health = store.collection_health(["wildfires"], now=now)
+    row = health["sources"][0]
+    assert row["last_reason"] == "served stale cache"
+    assert (row["last_stale_age_s"], row["last_stale_fetches"]) == (4990.0, 1)
+    assert "last_stale_age_s" in health["fields_explained"]
+    _record(store, "wildfires", now - 5, FIRES)
+    row = store.collection_health(["wildfires"], now=now)["sources"][0]
+    assert "last_stale_age_s" not in row and "last_stale_fetches" not in row
+
+
+def test_cli_shows_the_stale_age_beside_the_stable_reason(cli_db, monkeypatch) -> None:
+    monkeypatch.setenv("COLUMNS", "260")
+    serves = tuple(StaleServe("polymarket", f"k{i}", age) for i, age in enumerate((30.0, 812.5)))
+    s = HistoryStore(cli_db)
+    _replay(s, "wildfires", T0, FIRES, age=812.0)
+    s.record_cycle([SourceOutcome("prediction_markets", T0, 1.0, {"markets": [1]},
+                                  stale_serves=serves)], now=T0)
+    s.close()
+    out = _invoke("history", "captures", "wildfires").output
+    assert "served stale cache (age 812.0 s)" in out
+    out = _invoke("history", "captures", "prediction_markets").output
+    assert "served stale cache (2 fetches, oldest 812.5 s)" in out
+    out = _invoke("history", "captures", "wildfires", "--capture-id", "1").output
+    assert "Reason: served stale cache (age 812.0 s)" in out
+
+
+# The run-log table as de73264 created it, before the stale columns.
+_CAPTURES_BEFORE_STALE_COLUMNS = """
+CREATE TABLE history_captures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    collected_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'degraded', 'error')),
+    duration_s REAL,
+    record_count INTEGER,
+    error TEXT,
+    payload_hash TEXT,
+    changed INTEGER,
+    observations_extracted INTEGER,
+    observations_stored INTEGER,
+    extract_error TEXT
+);
+"""
+
+
+def _capture_columns(db) -> list[str]:
+    conn = sqlite3.connect(str(db))
+    try:
+        return [row[1] for row in conn.execute("PRAGMA table_info(history_captures)")]
+    finally:
+        conn.close()
+
+
+def test_an_existing_run_log_gains_the_stale_columns_in_place(tmp_path) -> None:
+    db = tmp_path / "before.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(_CAPTURES_BEFORE_STALE_COLUMNS)
+    with conn:
+        conn.execute(
+            "INSERT INTO history_captures (source, collected_at, status, error) "
+            "VALUES ('gas_prices', ?, 'degraded', 'served stale cache (age 812.0 s)')",
+            (T0,),
+        )
+    conn.close()
+    for _ in range(2):  # opening again is a no-op
+        HistoryStore(db).close()
+    columns = _capture_columns(db)
+    assert columns.count("stale_age_s") == 1 and columns.count("stale_fetches") == 1
+
+    s = HistoryStore(db)
+    try:
+        _replay(s, "gas_prices", T0 + 300, {"prices": [1]}, age=99.0)
+        new, old = s.capture_history("gas_prices")["captures"]
+        row = s.collection_health(["gas_prices"], now=T0 + 400)["sources"][0]
+    finally:
+        s.close()
+    assert (old["reason"], old["stale_age_s"], old["stale_fetches"]) == (
+        "served stale cache (age 812.0 s)", None, None
+    )
+    assert (new["reason"], new["stale_age_s"], new["stale_fetches"]) == (
+        "served stale cache", 99.0, 1
+    )
+    # The old row's reason still marks it a stale replay.
+    assert (row["state"], row["consecutive_failures"], row["last_success_at"]) == ("stale", 2, None)
+
+
+def test_migration_tolerates_a_column_another_process_just_added(tmp_path) -> None:
+    db = tmp_path / "race.db"
+    HistoryStore(db).close()
+    conn = sqlite3.connect(str(db))
+
+    class _ReadBeforeTheOtherAlter:
+        """The table_info read happened before another process's ALTER."""
+
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info"):
+                return iter(())
+            return conn.execute(sql, *args)
+
+    try:
+        history._add_missing_capture_columns(_ReadBeforeTheOtherAlter())
+        empty = sqlite3.connect(str(tmp_path / "empty.db"))
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            history._add_missing_capture_columns(empty)
+        empty.close()
+    finally:
+        conn.close()
+    assert _capture_columns(db).count("stale_age_s") == 1

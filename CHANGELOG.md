@@ -10,8 +10,12 @@
   records. An empty payload is degraded, because a quiet period and a
   silent upstream failure look the same.
 - A run that any upstream fetch answered from an expired cached copy is a
-  stale-cache replay: degraded, with the reason `served stale cache` and
-  the copy's age. The collector reads this from a per-task log the fetcher
+  stale-cache replay: degraded, with the reason `served stale cache`. The
+  reason is the same text on every replay, so replays group; the copy's
+  age and the number of stale fetches are the capture fields
+  `stale_age_s` and `stale_fetches` (a run log created before them gains
+  the columns in place when opened, and the CLI shows them beside the
+  reason). The collector reads this from a per-task log the fetcher
   keeps (`fetcher.recording_stale_serves()`, opened once per source task),
   because most source modules rebuild their payload and drop the fetcher's
   `_stale` marker. A replay's observations are counted but not stored: a
@@ -46,8 +50,8 @@
   `expected=N` declares how many points a complete payload yields. The
   Yahoo quote sources declare one per default symbol, so a run where some
   symbols did not answer is degraded as `partial: X of N expected series`.
-  Observation dates must name a real calendar period (`2026-02-30` and
-  `0000` are rejected).
+  Observation dates must name a real calendar period in ASCII digits
+  (`2026-02-30`, `0000` and fullwidth digits are rejected).
 - MCP tools `intel_collection_health`, `intel_capture_history`,
   `intel_series_history` and `intel_revisions`, and the CLI group
   `intel history health|captures|series|revisions`. History accrues only

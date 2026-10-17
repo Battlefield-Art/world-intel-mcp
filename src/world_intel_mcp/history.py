@@ -14,10 +14,13 @@ settled on, fallback path included):
   because a quiet period and a silent upstream failure look the same.
   A run that was served an expired cached copy for any upstream fetch is
   a stale-cache replay: ``degraded`` with a reason starting ``served
-  stale cache`` (with the copy's age). The collector reads that from the
-  fetcher's per-task log (``fetcher.recording_stale_serves``), because
-  most source modules rebuild their dict and drop the fetcher's
-  ``_stale`` marker; a top-level ``_stale`` marker counts too.
+  stale cache``, the same text on every replay so replays group; the
+  copy's age and the number of stale fetches are the capture's
+  ``stale_age_s`` and ``stale_fetches``. The collector reads that from
+  the fetcher's per-task log (``fetcher.recording_stale_serves``),
+  because most source modules rebuild their dict and drop the fetcher's
+  ``_stale`` marker; a top-level ``_stale`` marker counts too. A run log
+  created before those two columns gains them in place when opened.
 - ``history_payloads``: the payload body as zlib-compressed JSON, stored
   once per ``(source, payload_hash)``. The hash ignores the top-level
   fetch-time stamps in ``VOLATILE_KEYS`` (they change on every call while
@@ -60,7 +63,8 @@ Registering an extractor (the public API)::
 The store prefixes each ``series_key`` with the source name
 (``my_source:rate``), so extractors cannot collide. ``observed_at`` must be
 ``YYYY``, ``YYYY-MM``, ``YYYY-MM-DD`` or a timezone-aware ISO 8601
-instant (use ``normalize_observed_at`` to convert, with ``assume_utc=True``
+instant, in ASCII digits and naming a real calendar date or period
+(use ``normalize_observed_at`` to convert, with ``assume_utc=True``
 only when the publisher documents UTC); a point with an unparseable date
 or a non-finite value is skipped and counted in the capture's
 ``extract_error``. Register at import time of your source module: the
@@ -96,6 +100,11 @@ Gaps / not covered:
   the store; only what the collector sees from the first recorded cycle on.
 - ``published_at`` is NULL for every built-in extractor: none of their
   payloads names a release time.
+- A built-in extractor skips a row whose date it cannot read (not ASCII
+  ISO 8601, or no such calendar date) without counting it; that shows
+  only when every row is skipped, which reads ``degraded``. A point with
+  such a date that an extractor does return is counted in
+  ``extract_error``.
 - ``record_count`` is a size hint (the payload's longest top-level list,
   else its integer ``count``), not a semantic count; payloads shaped as
   nested dicts read NULL.
@@ -260,12 +269,14 @@ def normalize_observed_at(value: Any, *, assume_utc: bool = False) -> str | None
     when they name a real calendar period (year 0001 on, month 01-12, a
     day that exists). An ISO 8601 instant becomes ``YYYY-MM-DDTHH:MM:SSZ``
     in UTC. A naive instant (no offset) is only accepted with
-    ``assume_utc=True``.
+    ``assume_utc=True``. Only ASCII text is read: ``\\d`` and ``int()``
+    also accept fullwidth and other Unicode digits, and a period stored in
+    those would match no date query.
     """
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip()
-    if not text:
+    if not text or not text.isascii():
         return None
     period = _DATE_PERIOD.fullmatch(text)
     if period:
@@ -408,6 +419,8 @@ class _Classified:
     observations: list[Observation] = field(default_factory=list)
     extract_error: str | None = None
     extracted: int | None = None
+    stale_age_s: float | None = None
+    stale_fetches: int | None = None
 
 
 def record_count(payload: Any) -> int | None:
@@ -460,9 +473,13 @@ def _extract(source: str, payload: Any) -> tuple[list[Observation], str | None, 
     return valid, note, len(raw)
 
 
-def _stale_reason(outcome: SourceOutcome) -> str | None:
-    """``served stale cache ...`` when any upstream fetch of this run was
-    answered from an expired cached copy, else None."""
+def _stale_replay(outcome: SourceOutcome) -> tuple[int | None, float | None] | None:
+    """(upstream fetches answered from expired cache, oldest copy age in
+    seconds) when this run was a stale-cache replay, else None.
+
+    The fetch count is None when only the payload's ``_stale`` marker shows
+    the replay; the age is None when no serve or marker reported one.
+    """
     serves = list(outcome.stale_serves or ())
     payload = outcome.payload
     marked = isinstance(payload, dict) and bool(payload.get("_stale"))
@@ -472,11 +489,7 @@ def _stale_reason(outcome: SourceOutcome) -> str | None:
     if marked:
         ages.append(_finite(payload.get("_stale_age_seconds")))
     known = [age for age in ages if age is not None]
-    if len(serves) > 1:
-        return f"{STALE_REASON} for {len(serves)} upstream fetches" + (
-            f" (oldest {max(known)} s)" if known else ""
-        )
-    return f"{STALE_REASON} (age {max(known)} s)" if known else STALE_REASON
+    return (len(serves) or None), (max(known) if known else None)
 
 
 def classify(outcome: SourceOutcome) -> _Classified:
@@ -485,7 +498,9 @@ def classify(outcome: SourceOutcome) -> _Classified:
     ``error`` when the run produced no usable payload. ``degraded`` when it
     was a stale-cache replay, or live but marked degraded, empty, partial,
     or without the measures its extractor expects. Otherwise ``ok``. A
-    stale-cache replay keeps its extracted count but no observations.
+    stale-cache replay keeps its extracted count but no observations. The
+    reason holds no per-run numbers for a replay (its copy age and fetch
+    count are fields), so successive replays share one reason.
     """
     if outcome.error is not None:
         return _Classified("error", outcome.error[:500], None)
@@ -498,9 +513,9 @@ def classify(outcome: SourceOutcome) -> _Classified:
     count = record_count(payload)
     observations, extract_error, extracted = _extract(outcome.source, payload)
     notes = []
-    stale = _stale_reason(outcome)
-    if stale:
-        notes.append(stale)
+    stale = _stale_replay(outcome)
+    if stale is not None:
+        notes.append(STALE_REASON)
     if isinstance(payload, dict) and (
         payload.get("degraded") is True or payload.get("status") == "degraded"
     ):
@@ -517,12 +532,14 @@ def classify(outcome: SourceOutcome) -> _Classified:
         ))
     elif extracted is not None and expected is not None and len(observations) < expected:
         notes.append(f"partial: {len(observations)} of {expected} expected series")
-    if stale and observations:
+    if stale is not None and observations:
         notes.append("observations not stored: a stale-cache replay is not a new observation")
         observations = []
     reason = "; ".join(notes)[:500] if notes else None
+    stale_fetches, stale_age_s = stale if stale is not None else (None, None)
     return _Classified(
-        "degraded" if notes else "ok", reason, count, observations, extract_error, extracted
+        "degraded" if notes else "ok", reason, count, observations, extract_error, extracted,
+        stale_age_s=stale_age_s, stale_fetches=stale_fetches,
     )
 
 
@@ -727,6 +744,32 @@ def _outline(payload: Any) -> Any:
     return _shape(payload)
 
 
+# Run-log columns added after the first schema, each with the statement
+# that adds it to an existing table in place.
+_ADDED_CAPTURE_COLUMNS = (
+    ("stale_age_s", "ALTER TABLE history_captures ADD COLUMN stale_age_s REAL"),
+    ("stale_fetches", "ALTER TABLE history_captures ADD COLUMN stale_fetches INTEGER"),
+)
+
+
+def _add_missing_capture_columns(conn: Any) -> None:
+    """Bring a run log created by an earlier schema up to date, in place.
+
+    Safe to run on every open. A second process can add a column between
+    this one's table_info read and its ALTER; that "duplicate column"
+    error means the work is done, any other error is raised.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(history_captures)")}
+    for name, statement in _ADDED_CAPTURE_COLUMNS:
+        if name in present:
+            continue
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
+
+
 class HistoryStore:
     """Capture log, payload bodies and observations in the cache DB."""
 
@@ -752,7 +795,9 @@ class HistoryStore:
                 changed INTEGER,
                 observations_extracted INTEGER,
                 observations_stored INTEGER,
-                extract_error TEXT
+                extract_error TEXT,
+                stale_age_s REAL,
+                stale_fetches INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_history_captures_source
                 ON history_captures(source, collected_at);
@@ -789,6 +834,7 @@ class HistoryStore:
                 ON history_observations(collected_at);
             """
         )
+        _add_missing_capture_columns(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -857,10 +903,12 @@ class HistoryStore:
                 capture_id = conn.execute(
                     "INSERT INTO history_captures (source, collected_at, status, duration_s, "
                     "record_count, error, payload_hash, changed, observations_extracted, "
-                    "extract_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "extract_error, stale_age_s, stale_fetches) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (outcome.source, outcome.collected_at, c.status,
                      None if outcome.duration_s is None else round(outcome.duration_s, 3),
-                     c.record_count, c.reason, digest, changed, c.extracted, c.extract_error),
+                     c.record_count, c.reason, digest, changed, c.extracted, c.extract_error,
+                     c.stale_age_s, c.stale_fetches),
                 ).lastrowid
                 stored = self._store_observations(capture_id, outcome, c.observations)
                 observations_stored += stored
@@ -978,8 +1026,9 @@ class HistoryStore:
             cadence = overrides.get(name, default_cadence)
             overdue_after = OVERDUE_MULTIPLE * cadence
             last = conn.execute(
-                "SELECT collected_at, status, error, extract_error FROM history_captures "
-                "WHERE source = ? ORDER BY collected_at DESC, id DESC LIMIT 1",
+                "SELECT collected_at, status, error, extract_error, stale_age_s, stale_fetches "
+                "FROM history_captures WHERE source = ? ORDER BY collected_at DESC, id DESC "
+                "LIMIT 1",
                 (name,),
             ).fetchone()
             entry: dict[str, Any] = {
@@ -996,7 +1045,11 @@ class HistoryStore:
                     entry["unrecorded_attempts"] = unrecorded
                 rows.append(entry)
                 continue
-            last_at, last_status, last_reason, last_extract_error = last
+            (last_at, last_status, last_reason, last_extract_error,
+             last_stale_age, last_stale_fetches) = last
+            last_is_stale = last_status != "error" and (last_reason or "").startswith(
+                STALE_REASON
+            )
             attempts = conn.execute(
                 "SELECT COUNT(*) FROM history_captures WHERE source = ?", (name,)
             ).fetchone()[0]
@@ -1034,7 +1087,7 @@ class HistoryStore:
                 state = "not_attempted_recently"
             elif last_status == "error":
                 state = "failing"
-            elif (last_reason or "").startswith(STALE_REASON):
+            elif last_is_stale:
                 state = "stale"
             else:
                 state = last_status
@@ -1053,6 +1106,9 @@ class HistoryStore:
                 overdue=overdue,
                 attempt_overdue=attempt_overdue,
             )
+            if last_is_stale:
+                entry["last_stale_age_s"] = last_stale_age
+                entry["last_stale_fetches"] = last_stale_fetches
             unrecorded = _unrecorded_attempts(failures, name, last_at)
             if unrecorded:
                 entry["unrecorded_attempts"] = unrecorded
@@ -1157,6 +1213,12 @@ class HistoryStore:
                 "last live capture",
                 "unrecorded_attempts": "cycles after this source's last recorded capture "
                 "whose history write failed",
+                "last_stale_age_s": "present when the last capture was a stale-cache "
+                "replay: age in seconds of the oldest expired copy it served (null when "
+                "none was reported)",
+                "last_stale_fetches": "present when the last capture was a stale-cache "
+                "replay: how many upstream fetches the fetcher answered from expired "
+                "cache (null when only the payload's _stale marker showed the replay)",
             },
         }
 
@@ -1168,7 +1230,7 @@ class HistoryStore:
         columns = (
             "c.id, c.collected_at, c.status, c.duration_s, c.record_count, c.error, "
             "c.payload_hash, c.changed, c.observations_extracted, c.observations_stored, "
-            "c.extract_error, p.body IS NOT NULL"
+            "c.extract_error, c.stale_age_s, c.stale_fetches, p.body IS NOT NULL"
         )
         join = (
             "FROM history_captures c LEFT JOIN history_payloads p "
@@ -1253,7 +1315,7 @@ class HistoryStore:
     @staticmethod
     def _capture_row(row: tuple) -> dict:
         (cid, collected_at, status, duration, count, error, digest, changed,
-         extracted, stored, extract_error, body_retained) = row
+         extracted, stored, extract_error, stale_age_s, stale_fetches, body_retained) = row
         return {
             "capture_id": cid,
             "collected_at": _iso(collected_at),
@@ -1271,6 +1333,8 @@ class HistoryStore:
             "observations_extracted": extracted,
             "observations_stored": stored,
             "extract_error": extract_error,
+            "stale_age_s": stale_age_s,
+            "stale_fetches": stale_fetches,
         }
 
     def series_history(

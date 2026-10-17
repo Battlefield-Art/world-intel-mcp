@@ -45,7 +45,8 @@ TOOLS: list[Tool] = [
         description=(
             "A source's earlier collector captures, newest first: status (ok / degraded / "
             "error with reason; a run answered from expired cache is degraded with "
-            "reason 'served stale cache'), duration, record count, payload hash and "
+            "reason 'served stale cache' and the copy's age in stale_age_s), duration, "
+            "record count, payload hash and "
             "whether it changed from the previous capture. Pass capture_id to replay one "
             "stored payload (over the replay cap, an outline of its top-level keys). "
             + _ACCRUAL
