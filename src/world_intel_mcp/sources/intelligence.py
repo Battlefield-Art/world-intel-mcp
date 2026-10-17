@@ -1542,13 +1542,54 @@ _NAVAL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# A warning concerns a waterway when a position stated in its text lies
+# within this distance of the waterway's reference point in
+# STRATEGIC_WATERWAYS. 300 km is a chosen radius, not a measured boundary:
+# it spans each canal end to end and a strait's approaches, but one point
+# models the long GIUK Gap and Strait of Malacca only near that point.
+_WATERWAY_PROXIMITY_KM = 300.0
+
+# NAVAREAs a waterway lies in, used only for warnings that state no
+# position. Only areas the NGA feed emits as single-NAVAREA codes can place
+# such a warning (code 4 is NAVAREA IV, code 12 is NAVAREA XII; see
+# maritime.NGA_AREA_CODES), and of the nine waterways only the Panama Canal
+# lies in either. NGA's own limits (IHO WWNWS13/3/2/IV-XII, 27 July 2021)
+# run the IV/XII boundary across the isthmus between 09-08-41N 078-44-03W
+# and 08-21-53N 081-39-33W, so the canal's Caribbean end is in IV and its
+# Pacific end in XII. IV lies west of 035W in the Atlantic and XII between
+# the Americas and the date line, so the other eight waterways are in
+# neither.
+_WATERWAY_NAVAREAS: dict[str, tuple[str, ...]] = {
+    "Panama Canal": ("IV", "XII"),
+}
+
+_VESSEL_MATCHING_RULE = (
+    "A warning is credited to a waterway when any position stated in its "
+    "text lies within proximity_km of the waterway's reference point. A "
+    "warning that states no position is credited by NAVAREA only when its "
+    "area code names a single NAVAREA (4 is NAVAREA IV, 12 is NAVAREA XII) "
+    "that contains the waterway (waterway_navareas). HYDROLANT (A), HYDROPAC "
+    "(P) and HYDROARC (C) each span several NAVAREAs (area_codes), so a "
+    "positionless warning in those series is credited to no waterway, nor "
+    "is one whose only stated positions are malformed; naval ones are "
+    "listed in unplaced_naval_warnings. status counts the naval-keyword "
+    "warnings credited to the waterway; total_nearby counts credited "
+    "warnings of any topic, split by match in nearby_by_match."
+)
+
 
 async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     """Naval activity snapshot at strategic waterways using NGA warnings.
 
-    Uses NGA MSI (existing fetch_nav_warnings) filtered for naval/vessel
-    keywords near STRATEGIC_WATERWAYS from config.
-    Scores each waterway: clear/advisory/elevated/critical.
+    Uses NGA MSI (maritime.fetch_nav_warnings) filtered for naval/vessel
+    keywords. Each warning is credited only to the STRATEGIC_WATERWAYS it
+    concerns: a stated position within _WATERWAY_PROXIMITY_KM, or, for a
+    warning that states no position, a single-NAVAREA area code that
+    contains the waterway. The response states the rule (matching_rule).
+    Before 2026-10-17 every warning counted at all nine waterways, so three
+    naval warnings anywhere on Earth marked Panama and Hormuz critical alike.
+    Scores each waterway: clear/advisory/elevated/critical, or unknown when
+    the warning feed itself is unavailable.
 
     Note: Real-time AIS requires paid API.  This uses NGA MSI as a
     free proxy for naval activity indicators.
@@ -1557,44 +1598,101 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
 
     Returns:
-        Dict with waterways list, source, and timestamp.
+        Dict with waterways list (each with total_nearby, the warnings of
+        any topic credited to it, and how each was matched), the matching
+        rule, naval warnings no rule could place, the feed's newest issue
+        date, data_gaps, source, and timestamp.
     """
     now = datetime.now(timezone.utc)
 
     from . import maritime
 
     nav_data = await maritime.fetch_nav_warnings(fetcher)
-    all_warnings = nav_data.get("warnings", [])
+    all_warnings = nav_data.get("warnings", []) or []
+    feed_error = nav_data.get("error")
 
-    waterways: list[dict] = []
+    credited: dict[str, dict] = {
+        ww["name"]: {"naval": [], "nearby": {"proximity": 0, "navarea": 0}}
+        for ww in STRATEGIC_WATERWAYS
+    }
+    unplaced_naval: list[dict] = []
+    naval_total = 0
+    truncated = 0
 
-    for ww in STRATEGIC_WATERWAYS:
-        ww_lat = ww["lat"]
-        ww_lon = ww["lon"]
+    for warning in all_warnings:
+        text = warning.get("text") or ""
+        is_naval = bool(_NAVAL_KEYWORDS.search(text))
+        naval_total += is_naval
+        if len(text) > maritime._MAX_TEXT_LENGTH and text.endswith("..."):
+            truncated += 1
+        positions = maritime.extract_positions(text)
 
-        naval_warnings: list[dict] = []
-        total_nearby = 0
+        matches: list[tuple[str, str, float | None]] = []
+        if positions:
+            for ww in STRATEGIC_WATERWAYS:
+                distance = min(
+                    _haversine_km(ww["lat"], ww["lon"], lat, lon)
+                    for lat, lon in positions
+                )
+                if distance <= _WATERWAY_PROXIMITY_KM:
+                    matches.append((ww["name"], "proximity", round(distance, 1)))
+        else:
+            area = maritime.NGA_AREA_CODES.get(str(warning.get("navarea") or "").upper())
+            unplaced_reason = None
+            if maritime.mentions_position(text):
+                # Its only stated positions are malformed; crediting it by
+                # NAVAREA would place it at a waterway it does not concern.
+                unplaced_reason = "position_unreadable"
+            elif area is None:
+                unplaced_reason = "unknown_area_code"
+            elif not area["single_navarea"]:
+                unplaced_reason = "multi_navarea_series"
+            else:
+                navarea = area["navareas"][0]
+                for ww in STRATEGIC_WATERWAYS:
+                    if navarea in _WATERWAY_NAVAREAS.get(ww["name"], ()):
+                        matches.append((ww["name"], "navarea", None))
+            if unplaced_reason and is_naval:
+                unplaced_naval.append(
+                    {
+                        "id": warning.get("id"),
+                        "navarea": warning.get("navarea"),
+                        "series": area["series"] if area else None,
+                        "issue_date": warning.get("issue_date"),
+                        "reason": unplaced_reason,
+                        "text_snippet": text[:200],
+                    }
+                )
 
-        for warning in all_warnings:
-            text = warning.get("text", "")
-            # Simple proximity: check if warning text mentions coordinates
-            # near the waterway (NGA warnings have lat/lon in text parsed elsewhere)
-            # Use navarea as rough filter and keyword matching
-            if _NAVAL_KEYWORDS.search(text):
-                naval_warnings.append(
+        for name, basis, distance in matches:
+            entry = credited[name]
+            entry["nearby"][basis] += 1
+            if is_naval:
+                entry["naval"].append(
                     {
                         "id": warning.get("id"),
                         "text_snippet": text[:200],
                         "navarea": warning.get("navarea"),
+                        "issue_date": warning.get("issue_date"),
+                        "match": basis,
+                        "distance_km": distance,
                     }
                 )
 
-            # Count all warnings in the general vicinity (any topic)
-            total_nearby += 1
+    waterways: list[dict] = []
 
+    for ww in STRATEGIC_WATERWAYS:
+        entry = credited[ww["name"]]
+        # Nearest stated positions first, then NAVAREA-only matches.
+        naval_warnings = sorted(
+            entry["naval"],
+            key=lambda d: (d["match"] != "proximity", d["distance_km"] or 0.0),
+        )
         naval_count = len(naval_warnings)
 
-        if naval_count >= 3:
+        if feed_error:
+            status = "unknown"
+        elif naval_count >= 3:
             status = "critical"
         elif naval_count >= 2:
             status = "elevated"
@@ -1606,22 +1704,64 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         waterways.append(
             {
                 "name": ww["name"],
-                "lat": ww_lat,
-                "lon": ww_lon,
+                "lat": ww["lat"],
+                "lon": ww["lon"],
                 "throughput": ww.get("throughput"),
                 "naval_warnings": naval_count,
                 "status": status,
                 "warning_details": naval_warnings[:5],
+                "total_nearby": sum(entry["nearby"].values()),
+                "nearby_by_match": dict(entry["nearby"]),
+                "naval_by_match": {
+                    basis: sum(1 for d in naval_warnings if d["match"] == basis)
+                    for basis in ("proximity", "navarea")
+                },
             }
         )
 
-    return {
+    data_gaps = [f"NGA feed: {gap}" for gap in nav_data.get("data_gaps") or []]
+    if feed_error and not data_gaps:
+        data_gaps.append(f"NGA feed: {feed_error}")
+    if unplaced_naval:
+        data_gaps.append(
+            f"{len(unplaced_naval)} naval warning(s) state no readable position "
+            "and no single-NAVAREA area code, so no waterway is credited with "
+            "them (unplaced_naval_warnings): "
+            + ", ".join(f"{w['id']} ({w['reason']})" for w in unplaced_naval)
+        )
+    if truncated:
+        data_gaps.append(
+            f"{truncated} warning text(s) were cut at {maritime._MAX_TEXT_LENGTH} "
+            "characters; positions after the cut are not read"
+        )
+
+    response = {
         "waterways": waterways,
         "count": len(waterways),
         "total_nav_warnings": len(all_warnings),
+        "total_naval_warnings": naval_total,
+        "unplaced_naval_warnings": unplaced_naval,
+        "matching_rule": {
+            "proximity_km": _WATERWAY_PROXIMITY_KM,
+            "rule": _VESSEL_MATCHING_RULE,
+            "waterway_navareas": {k: list(v) for k, v in _WATERWAY_NAVAREAS.items()},
+            "area_codes": maritime.area_codes_view(),
+        },
+        "newest_issue_date": nav_data.get("newest_issue_date"),
+        "newest_issue_age_days": nav_data.get("newest_issue_age_days"),
+        "stale_after_days": nav_data.get("stale_after_days"),
+        "data_gaps": data_gaps,
         "source": "nga-msi-vessel-snapshot",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if feed_error:
+        # Every waterway used to read "clear" when NGA was down.
+        response["error"] = f"NGA navigational warnings unavailable: {feed_error}"
+        response["degraded"] = True
+        response["reason"] = nav_data.get("reason") or "nav_warnings_unavailable"
+    elif nav_data.get("degraded"):
+        response["degraded"] = True
+    return response
 
 
 # ---------------------------------------------------------------------------
