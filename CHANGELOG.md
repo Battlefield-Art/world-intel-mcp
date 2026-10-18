@@ -37,12 +37,48 @@
 - Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
   the cache: `$XDG_CACHE_HOME/world-intel-mcp/temporal.db` and
   `$XDG_CACHE_HOME/world-intel-mcp/keyword_spikes.db`. With it unset, they
-  remain in `~/.cache/world-intel-mcp/`. Users who set `XDG_CACHE_HOME`
-  can keep existing baselines by moving these two files from
-  `~/.cache/world-intel-mcp/` to `$XDG_CACHE_HOME/world-intel-mcp/`.
-  Importing the package no longer opens databases; they open on first use.
+  remain in `~/.cache/world-intel-mcp/`. Existing baselines are not moved:
+  with `XDG_CACHE_HOME` set, the two files already in
+  `~/.cache/world-intel-mcp/` stay there unread and new, empty baselines
+  start under `$XDG_CACHE_HOME/world-intel-mcp/`. To keep their history,
+  move both files there yourself before the next run. Nothing points at
+  the old files at runtime; `intel_weekly_trends` reports the new baseline
+  as created by that call, then as short of history.
+- The cache's default path (`~/.cache/world-intel-mcp/cache.db` when
+  neither `WORLD_INTEL_CACHE_DB` nor `XDG_CACHE_HOME` is set) is resolved
+  when the cache opens, not at import, so it agrees with the baselines if
+  `HOME` changes in between.
+- When the cache cannot open at its configured or default path, it now
+  falls back to a per-user directory, `world-intel-mcp-<uid>` under the
+  system temp directory, created with mode 0700, instead of a shared
+  `world-intel-mcp` directory there. It refuses that directory with an
+  error naming the reason if it is a symlink or not a directory, is owned
+  by another user, gives group or other users access, or holds a symlink
+  at `cache.db` or its `-wal`, `-shm` or `-journal` file. A fallback cache
+  left in the old shared directory is not read or moved. On Windows the
+  fallback keeps its old name and is not checked.
+- Importing the package no longer opens databases. The shared cache,
+  circuit breaker, AOI store, vector store and fetcher behind the MCP
+  tools are built on first use, under a lock, as one set: concurrent first
+  uses get the same objects, and a first use that fails binds nothing and
+  closes the databases it had opened, so the next use starts over.
+- `intel_weekly_trends` no longer reports a failed input as zero. When the
+  baseline database is missing or unreadable, `trend_count` is `null` and
+  `error` says why; when anomaly detection fails, `current_anomaly_count`
+  is `null`. A new `data_gaps` list names each failed input, carries
+  anomaly detection's own gaps, and flags a baseline created by the same
+  call or with no metric at the 5 observations volatility needs. Reading
+  the baselines no longer creates an empty database file.
+- The dashboard's Trends panel shows a count that could not be computed as
+  a dimmed `?` instead of 0, stays visible when weekly trends report an
+  error or time out, and lists the error and every data gap.
 - Apply per-source request spacing to every HTTP retry, including JSON,
   text, XML and binary fetches.
+- Known open: each retry now waits out its source's spacing and the
+  breaker is still checked only before the first attempt, so a full outage
+  of a rate-limited source takes longer than before to fall back to its
+  stale copy. The registry tests' temp-cache premise still depends on test
+  order.
 
 ### Fixed: database handles close on every exit path
 - The collector (`run_once` and the daemon), standalone report generation

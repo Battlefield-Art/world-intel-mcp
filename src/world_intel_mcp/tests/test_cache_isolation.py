@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from world_intel_mcp.analysis import spikes, temporal
+from world_intel_mcp.cache import Cache
 
 
 def test_all_module_imports_open_no_databases(tmp_path: Path) -> None:
@@ -92,6 +93,28 @@ def test_baseline_path_resolved_on_first_use(
     finally:
         if baseline._conn is not None:
             baseline._conn.close()
+
+
+def test_cache_default_path_follows_home_set_after_import(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """With neither override set, the cache lands under the HOME in force
+    when it is built, beside the baselines, not the HOME of import time."""
+    monkeypatch.delenv("WORLD_INTEL_CACHE_DB", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    home = tmp_path / "home-set-after-import"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    expected = home / ".cache" / "world-intel-mcp"
+
+    cache = Cache()
+    try:
+        assert cache.db_path == expected / "cache.db"
+        assert cache.db_path.is_file()
+        assert Path(temporal._default_db_path()).parent == expected
+        assert Path(spikes._default_db_path()).parent == expected
+    finally:
+        cache.close()
 
 
 @pytest.mark.parametrize("module,cls", [
