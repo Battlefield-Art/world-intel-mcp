@@ -803,8 +803,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "FIRMS detections are satellite heat signatures, not mapped fire "
             "perimeters; one large fire produces many detections.",
             "Without NASA_FIRMS_API_KEY the fire tool returns an error. With a "
-            "key set, a failed fetch can still come back as empty regions. "
-            "Report either as missing data, not zero fires.",
+            "key set, a region FIRMS did not answer is named in failed_regions "
+            "and carries its own error (its count of 0 is not a measurement), "
+            "and every region failing is an error. Report either as missing "
+            "data, not zero fires.",
             "Climate anomalies are measured against the prior year, not a "
             "long-term normal.",
         ),
@@ -1149,12 +1151,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "The first change check records a baseline and claims nothing "
             "entered or left.",
-            "Most domains that fail are listed in data_gaps and left out of "
-            "the diff, but earthquakes, and wildfires when NASA_FIRMS_API_KEY "
-            "is set, can come back empty from a failed fetch with no data_gaps "
-            "entry, which reads as everything leaving. A whole domain "
-            "departing at once is unconfirmed: check failing_sources in "
-            "intel://guide/source-health and say it could not be confirmed.",
+            "A domain that fails is listed in data_gaps and left out of the "
+            "diff; a wildfire region FIRMS did not answer is listed as partial "
+            "coverage. Never read a failed domain as everything leaving. A "
+            "whole domain departing at once with no data_gaps entry is still "
+            "unconfirmed: check failing_sources in intel://guide/source-health "
+            "and say it could not be confirmed.",
             "Each intel_aoi_changes call compares with the snapshot saved by "
             "the call before it (yours or a collector AOI sweep) and then "
             "replaces that snapshot.",
@@ -1193,11 +1195,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "Every intel_aoi_changes call saves a new snapshot. Call it once: a "
             "retried call compares with the snapshot the first call just saved "
             "and reports that nothing changed.",
-            "Earthquakes, and wildfires when NASA_FIRMS_API_KEY is set, can "
-            "return empty from a failed fetch with no data_gaps entry, so a "
-            "whole domain departing at once may be an outage: check "
-            "failing_sources in intel://guide/source-health and report it as "
-            "unconfirmed.",
+            "A domain that fails, earthquakes and wildfires included, is "
+            "listed in data_gaps and left out of the changes; a wildfire "
+            "region FIRMS did not answer is listed as partial coverage. A "
+            "whole domain departing at once with no data_gaps entry is still "
+            "unconfirmed: check failing_sources in intel://guide/source-health "
+            "and report it as unconfirmed.",
             "News for an AOI is found by place name near its centre, so a "
             "nearby place with the same name can leak in.",
         ),

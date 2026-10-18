@@ -469,12 +469,13 @@ source here, and no proxy is substituted for any of these measures.
   dropped a city that a large quake had reached. The step now says so
   and to compare each city's position with every step-1 event before
   dropping it. The code is unchanged.
-- aoi-watch-setup said every failed domain is listed in `data_gaps` and
-  left out of the diff. Earthquakes, and wildfires when
-  `NASA_FIRMS_API_KEY` is set, return empty with no error when their
-  fetch fails, so the diff reports everything departing with no gap. Both
-  AOI prompts now say so, call a whole domain departing at once
-  unconfirmed, and point to `failing_sources`. The code is unchanged.
+- aoi-watch-setup, aoi-review and wildfire-situation describe failed
+  fetches as the code now reports them: a total earthquake or wildfire
+  outage is an error that the AOI brief and changes list in `data_gaps`
+  and leave out of the diff, and a FIRMS region that did not answer is
+  named in `failed_regions` (partial coverage in an AOI). Both AOI
+  prompts still call a whole domain departing at once with no gap
+  unconfirmed and point to `failing_sources`.
 - conflict-trend told the model to check the latest UCDP `date_start`
   before reading a thin window as calm, but when the pinned release
   (gedevents/25.1) ends before the window the tool returns count 0 with
