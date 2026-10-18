@@ -351,7 +351,8 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "ACLED events in {country} over both windows. It needs "
                 "ACLED_EMAIL and ACLED_PASSWORD; without them it returns an "
                 "error naming them. limit caps the result: a count equal to the "
-                "limit means the list was cut off, so say so",
+                "limit means the list may have been cut off, so say so or call "
+                "again with a higher limit",
                 args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
             ),
             Step(
@@ -359,7 +360,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "protests and riots in {country} (also ACLED, same credentials), "
                 "kept apart from armed violence. Nearby duplicates are merged: "
                 "count plus deduplicated is what was fetched, and when that "
-                "equals the limit the list was cut off",
+                "equals the limit the list may have been cut off",
                 args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
             ),
         ),
@@ -629,7 +630,8 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_earthquakes",
                 "the events, newest first and at most 50 by default, so a "
-                "count of 50 means older ones were cut off",
+                "count of 50 means older ones may have been cut off; call again "
+                "with a higher limit to check",
                 args=(("min_magnitude", "{min_magnitude}"), ("hours", "{hours}")),
             ),
             Step(
@@ -1147,11 +1149,14 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         limits=(
             "If total_entities is 0, the list could not be read. That is a "
-            "failed search, not a clean result.",
+            "failed search, not a clean result. Otherwise total_entities "
+            "counts the entries read before the search stopped, not the size "
+            "of the list.",
             "Only the primary name of each entry is searched, not its "
             "aliases, so a listed party under another spelling will not match.",
             "Results stop at the limit (default 50): a count equal to the "
-            "limit means more names matched.",
+            "limit means more names may have matched, so search again with a "
+            "higher limit before saying how many did.",
             "Matching is by substring on names. A name match is not an "
             "identity match, and this is not a compliance screening service. "
             "Never answer that a party is not sanctioned.",

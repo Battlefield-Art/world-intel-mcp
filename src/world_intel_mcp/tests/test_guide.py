@@ -1694,3 +1694,37 @@ def test_guide_says_backfilled_history_predates_collection(registered) -> None:
     assert set(named) <= registered
     assert "current vintage" in bullet
     assert "revisions made before the backfill do not show" in " ".join(bullet.split())
+
+
+@pytest.mark.asyncio
+async def test_limit_wording_allows_a_list_that_ends_exactly_at_the_limit() -> None:
+    """A count equal to the limit is what an exact fit also returns, and
+    total_entities stops counting where the search stopped."""
+    from world_intel_mcp.sources import sanctions
+
+    class _ThreeAcme(_DownFetcher):
+        async def get_text(self, *args, **kwargs):
+            return "\n".join(
+                f'{i},"ACME {i}","Entity","SDGT","","","","","","","",""' for i in range(1, 4)
+            ) + '\n4,"ZENITH","Entity","SDGT","","","","","","","",""'
+
+    exact = await sanctions.fetch_sanctions_search(_ThreeAcme(), query="acme", limit=3)
+    more = await sanctions.fetch_sanctions_search(_ThreeAcme(), query="acme", limit=4)
+    # Three matches exist; limit 3 returns 3 though nothing more matched,
+    # and reads 3 of the 4 entries before it stops.
+    assert (exact["count"], exact["total_entities"]) == (3, 3)
+    assert (more["count"], more["total_entities"]) == (3, 4)
+
+    def flat(name: str) -> str:
+        return " ".join(_text(name).split())
+
+    sanctions_text = flat("sanctions-screen")
+    assert "a count equal to the limit means more names matched" not in sanctions_text
+    assert "a count equal to the limit means more names may have matched" in sanctions_text
+    assert "total_entities counts the entries read before the search stopped" in sanctions_text
+    conflict_text = flat("conflict-trend")
+    assert "the list was cut off" not in conflict_text
+    assert conflict_text.count("the list may have been cut off") == 2
+    quake_text = flat("earthquake-exposure")
+    assert "older ones were cut off" not in quake_text
+    assert "older ones may have been cut off" in quake_text

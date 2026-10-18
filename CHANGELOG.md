@@ -344,6 +344,12 @@ source here, and no proxy is substituted for any of these measures.
   or ECB publisher history. The limit now names the backfill, the three
   tools that read it, and that its values are the publisher's current
   vintage.
+- sanctions-screen said a count equal to the limit means more names
+  matched, and conflict-trend and earthquake-exposure said the same of
+  their lists, but a list that ends exactly at the limit returns the same
+  count. They now say the list may have been cut off and to call again
+  with a higher limit, and sanctions-screen says `total_entities` counts
+  the entries read before the search stopped, not the size of the list.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
