@@ -71,7 +71,8 @@ async def test_fetch_fleet_report(
         return {
             "waterways": [
                 {"name": "Suez Canal", "status": "elevated", "warning_count": 2},
-            ]
+            ],
+            "feed_stale": False,
         }
 
     async def _surges(f) -> dict:
@@ -121,9 +122,9 @@ async def test_fetch_fleet_report(
 async def test_fetch_fleet_report_survives_component_failures(
     fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every dynamic component raising still yields a well-formed report.
-    Observation (flagged in review, not fixed): the report carries no
-    degraded marker, so three dead components read as a quiet fleet."""
+    """Every dynamic component raising still yields a well-formed report,
+    and it says it has no inputs: readiness UNKNOWN with a null score and
+    an error, not LOW_ACTIVITY with a score of 0 (a quiet fleet)."""
 
     async def _boom(f) -> dict:
         raise RuntimeError("component down")
@@ -134,13 +135,16 @@ async def test_fetch_fleet_report_survives_component_failures(
 
     result = await fetch_fleet_report(fetcher)
 
-    assert result["readiness_level"] == "LOW_ACTIVITY"
-    assert result["readiness_score"] == 0
+    assert result["readiness_level"] == "UNKNOWN"
+    assert result["readiness_score"] is None
     assert result["theater_summary"] == []
     assert result["waterway_summary"] == []
     assert result["active_surges"] == []
     assert result["total_tracked_aircraft"] == 0
-    assert "error" not in result  # current (dishonest-quiet) behavior
+    assert result["error"] == (
+        "All fleet report components unavailable: "
+        "military_surge, theater_posture, vessel_snapshot"
+    )
 
 
 @pytest.mark.asyncio
@@ -189,8 +193,9 @@ async def test_fetch_fleet_report_all_components_down_is_an_error(
 ) -> None:
     """Regression (silent-empty class): with every component raising,
     _safe returned {} for each and the report read LOW_ACTIVITY with no
-    marker. The zeroed structure stays; error / reason /
-    unavailable_components / data_gaps say the report has no inputs."""
+    marker. The zeroed lists stay; readiness is UNKNOWN with a null
+    score, and error / reason / unavailable_components / data_gaps say
+    the report has no inputs."""
 
     async def _boom(f) -> dict:
         raise RuntimeError("component down")
@@ -209,12 +214,14 @@ async def test_fetch_fleet_report_all_components_down_is_an_error(
     assert result["degraded"] is True
     assert result["unavailable_components"] == list(_COMPONENTS)
     assert result["data_gaps"] == [
-        f"{name}: unavailable (RuntimeError: component down); "
-        "readiness_score is computed without it"
+        f"{name}: unavailable (RuntimeError: component down)"
         for name in _COMPONENTS
+    ] + [
+        "readiness_level is UNKNOWN and readiness_score is null: no component "
+        "was available to score"
     ]
-    assert result["readiness_level"] == "LOW_ACTIVITY"
-    assert result["readiness_score"] == 0
+    assert result["readiness_level"] == "UNKNOWN"
+    assert result["readiness_score"] is None
 
 
 @pytest.mark.asyncio
@@ -228,7 +235,8 @@ async def test_fetch_fleet_report_partial_failure_is_named_not_fatal(
         return {
             "waterways": [
                 {"name": "Strait of Hormuz", "status": "critical", "naval_warnings": 3}
-            ]
+            ],
+            "feed_stale": False,
         }
 
     async def _surges(f) -> dict:
@@ -248,8 +256,9 @@ async def test_fetch_fleet_report_partial_failure_is_named_not_fatal(
     assert result["degraded"] is True
     assert result["unavailable_components"] == ["theater_posture"]
     assert result["data_gaps"] == [
-        "theater_posture: unavailable (TimeoutError: opensky timed out); "
-        "readiness_score is computed without it"
+        "theater_posture: unavailable (TimeoutError: opensky timed out)",
+        "readiness_level and readiness_score are lower bounds: they leave out "
+        "theater_posture, so the score can reach at most 60 of 90",
     ]
     # Critical waterway 30 + one surge 15; no aircraft term without posture.
     assert result["readiness_score"] == 45
@@ -283,8 +292,9 @@ async def test_fetch_fleet_report_names_an_nga_outage_from_the_real_snapshot(
     assert result["unavailable_components"] == ["vessel_snapshot"]
     assert result["data_gaps"] == [
         "vessel_snapshot: unavailable (NGA navigational warnings unavailable: "
-        "NGA MSI API unavailable (no live or cached data)); readiness_score is "
-        "computed without it"
+        "NGA MSI API unavailable (no live or cached data))",
+        "readiness_level and readiness_score are lower bounds: they leave out "
+        "vessel_snapshot, so the score can reach at most 60 of 90",
     ]
     assert result["waterway_count"] == 9
     assert {ww["status"] for ww in result["waterway_summary"]} == {"unknown"}
@@ -306,6 +316,7 @@ async def test_fetch_fleet_report_carries_component_data_gaps(
         return {
             "waterways": [{"name": "Suez Canal", "status": "clear", "naval_warnings": 0}],
             "degraded": True,
+            "feed_stale": False,
             "data_gaps": [stale],
         }
 

@@ -85,9 +85,10 @@ def test_live_fed_hike_pair_matches_with_reasons() -> None:
     r = score_pair(K_HIKE_25_OCT, P_HIKE_25_OCT, now=NOW)
     assert r["rejected"] is False
     assert r["side"] == "aligned"
-    # dice 0.75 (9 shared words of 13 / 11) x date factor for 0.4 days of
-    # a 3-day tolerance (1 - 0.5 * 0.4 / 3 = 0.9338) = 0.700.
-    assert r["confidence"] == pytest.approx(0.700, abs=0.002)
+    # dice 14/18 = 0.778 (7 shared title words of 9 Kalshi / 9 Polymarket)
+    # x date factor for 0.4125 days of a 3-day tolerance
+    # (1 - 0.5 * 0.4125 / 3 = 0.93125) = 0.724.
+    assert r["confidence"] == pytest.approx(0.724, abs=0.002)
     assert any("quantities agree ['25']" in x for x in r["reasons"])
     assert any("end dates 0.4 days apart" in x for x in r["reasons"])
 

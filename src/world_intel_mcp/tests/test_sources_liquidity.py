@@ -437,9 +437,15 @@ async def test_board_rows_values_and_sorting(fetcher: Fetcher) -> None:
     assert rows["eurosystem_total_assets"]["period_end"] == "2026-10-11"
     assert rows["us_m2"]["period_end"] == "2026-08-31"
     assert all(r["measure"] == "amount_outstanding" for r in rows.values())
+    # biggest_move ranks the absolute change in billions of each row's
+    # currency (millions / 1,000), not the percentage change.
+    billions = [
+        abs(r["change"]) / (1000 if r["units"].endswith(" millions") else 1) for r in out["indicators"]
+    ]
+    assert billions == sorted(billions, reverse=True)
     moves = [abs(r["change_pct"]) for r in out["indicators"]]
-    assert moves == sorted(moves, reverse=True)
-    assert out["indicators"][0]["indicator"] == "reverse_repo"
+    assert moves == [0.5379, 0.1781, 0.077, 0.1737, 0.1197, 0.0658, 0.0133, 91.6736, 0.0045]
+    assert out["indicators"][0]["indicator"] == "us_m2"
 
     newest = await liquidity.fetch_liquidity_board(fetcher, sort="newest")
     ends = [r["period_end"] for r in newest["indicators"]]
@@ -455,7 +461,7 @@ async def test_board_component_outage_drops_net_liquidity_instead_of_zeroing(fet
     assert "net_liquidity" not in names and "treasury_general_account" not in names
     assert "eurosystem_total_assets" not in names
     missing = {u["indicator"] for u in out["unavailable"]}
-    assert {"treasury_general_account", "net_liquidity", "Eurosystem total assets"} <= missing
+    assert {"treasury_general_account", "net_liquidity", "eurosystem_total_assets"} <= missing
     assert any("never computed with a zero term" in u["error"] for u in out["unavailable"])
     assert "error" not in out  # the rest of the board is real
 
@@ -467,7 +473,8 @@ async def test_board_total_outage_is_an_error(fetcher: Fetcher) -> None:
     respx.get(_ECB_ILM_URL).mock(return_value=httpx.Response(503))
     out = await liquidity.fetch_liquidity_board(fetcher)
     assert out["error"] == "liquidity board unavailable: every source failed"
-    assert out["indicators"] == [] and len(out["unavailable"]) == 7
+    # 4 FRED rows, net liquidity, euro area M1, M2 and M3 (one row each), Eurosystem total assets.
+    assert out["indicators"] == [] and len(out["unavailable"]) == 9
 
 
 @respx.mock
@@ -524,7 +531,8 @@ async def test_net_liquidity_method_states_wednesday_levels_conversion_and_rrp_a
     rrp = method["components"]["RRPONTSYD"]
     assert (rrp["observed"], rrp["units"]) == ("daily, business days", "USD billions")
     assert rrp["conversion"] == "none: already USD billions"
-    assert "never a later day" in rrp["alignment"] and "within 5 days" in rrp["alignment"]
+    assert "never a later day" in rrp["alignment"]
+    assert "when blank on or after 2013-09-23, Tuesday only; no fallback before that date." in rrp["alignment"]
     # The statement matches the arithmetic: raw WDTGAL millions / 1,000 and
     # the raw same-Wednesday RRP billions, unconverted.
     point = out["points"][0]

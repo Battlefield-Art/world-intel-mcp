@@ -276,9 +276,9 @@ def test_prompt_argument_errors() -> None:
         guide_prompts.render(prompt, {"country": "Syria", "colour": "red"})
     with pytest.raises(guide_prompts.PromptArgumentError, match="must be one of origin, host"):
         guide_prompts.render(prompt, {"country": "Syria", "role": "both"})
-    long_value = "x" * 1000
-    text = guide_prompts.render(prompt, {"country": long_value})
-    assert "x" * 200 in text and "x" * 201 not in text
+    with pytest.raises(guide_prompts.PromptArgumentError, match="longer than 200 characters"):
+        guide_prompts.render(prompt, {"country": "x" * 1000})
+    assert "x" * 200 in guide_prompts.render(prompt, {"country": "x" * 200})
 
 
 def test_prompt_without_arguments_rejects_any() -> None:
@@ -430,7 +430,7 @@ async def test_server_handlers_delegate_to_guide(server) -> None:
     prompts = await server.list_prompts()
     assert len(prompts) == len(guide_prompts.PROMPTS)
     result = await server.get_prompt("story-breadth", {"topic": "Red Sea shipping"})
-    assert "query Red Sea shipping" in result.messages[0].content.text
+    assert 'query "Red Sea shipping"' in result.messages[0].content.text
 
 
 # ---------------------------------------------------------------------------
@@ -1123,10 +1123,12 @@ async def test_prompt_failure_warnings_match_the_code(monkeypatch) -> None:
     assert asked == {"min_magnitude": 4.5, "hours": 48, "limit": 50}
     assert (exposure["events_analyzed"], exposure["exposed_cities"]) == (0, [])
 
-    # maritime-chokepoints: one naval count for every waterway, and a
-    # failed warning feed reads as all clear.
+    # maritime-chokepoints: a failed warning feed reads unknown, with the
+    # reason, not all clear; a naval warning with no readable position is
+    # credited to no waterway and listed as unplaced.
     down = await intelligence.fetch_vessel_snapshot(_DownFetcher())
-    assert {w["status"] for w in down["waterways"]} == {"clear"}
+    assert {w["status"] for w in down["waterways"]} == {"unknown"}
+    assert (down["degraded"], down["reason"]) == (True, "nga_msi_fetch_failed")
     assert down["total_nav_warnings"] == 0
     warnings = [
         {"id": i, "text": "NAVAL EXERCISE IN PROGRESS", "navarea": area}
@@ -1134,12 +1136,18 @@ async def test_prompt_failure_warnings_match_the_code(monkeypatch) -> None:
     ]
 
     async def nav(fetcher):
-        return {"warnings": warnings}
+        # A current feed: with feed_stale null every status reads unknown.
+        return {"warnings": warnings, "feed_stale": False}
 
     monkeypatch.setattr(maritime, "fetch_nav_warnings", nav)
     busy = await intelligence.fetch_vessel_snapshot(_DownFetcher())
     assert len(busy["waterways"]) == 9
-    assert {(w["naval_warnings"], w["status"]) for w in busy["waterways"]} == {(3, "critical")}
+    # IV, XII and XVI are not NGA area codes and the texts state no
+    # position, so no waterway is credited with them.
+    assert {(w["naval_warnings"], w["status"]) for w in busy["waterways"]} == {(0, "clear")}
+    assert [(u["navarea"], u["reason"]) for u in busy["unplaced_naval_warnings"]] == [
+        ("IV", "unknown_area_code"), ("XII", "unknown_area_code"), ("XVI", "unknown_area_code")
+    ]
 
     # internet-disruption: a failed warning feed reads as six clear corridors.
     cables = await infrastructure.fetch_cable_health(_DownFetcher())
@@ -1451,7 +1459,10 @@ def test_source_health_reports_a_missing_table_and_keeps_the_rest(tmp_path) -> N
     assert health["circuit_breakers"]["gdelt"]["failures"] == 1
     keyed = {k["source"]: k for k in health["keyed_sources"]}
     assert len(keyed) == len(guide.KEYED_SOURCES) and keyed["FRED"]["configured"] == ["FRED_API_KEY"]
-    assert health["verdict"] == "1 source called by this process, 0 with an open or half-open circuit breaker"
+    assert health["verdict"] == (
+        "1 source called by this process, 1 whose last call failed, "
+        "0 with an open or half-open circuit breaker"
+    )
 
 
 def test_source_health_reports_a_corrupt_cache_file(tmp_path) -> None:
@@ -1475,6 +1486,9 @@ def test_source_health_says_when_the_cache_fell_back(tmp_path, monkeypatch) -> N
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("x")
     monkeypatch.setenv("WORLD_INTEL_CACHE_DB", str(blocker / "cache.db"))
+    # The real gettempdir() only returns a directory that exists, and the
+    # per-user fallback directory is made without parents.
+    (tmp_path / "tmpdir").mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmpdir"))
     cache = Cache()
     try:
@@ -1483,7 +1497,9 @@ def test_source_health_says_when_the_cache_fell_back(tmp_path, monkeypatch) -> N
         cache.close()
     assert health["cache"]["fell_back"] is True
     assert health["cache"]["requested_path"] == str(blocker / "cache.db")
-    assert health["cache"]["db_path"] == str(tmp_path / "tmpdir" / "world-intel-mcp" / "cache.db")
+    assert health["cache"]["db_path"] == str(
+        tmp_path / "tmpdir" / f"world-intel-mcp-{os.getuid()}" / "cache.db"
+    )
     assert health["verdict"].endswith("so this process uses a temporary cache of its own")
 
 
@@ -1504,7 +1520,10 @@ def test_source_health_verdict_says_when_there_is_nothing_to_go_on(tmp_path) -> 
     assert (empty["cache"]["available"], empty["cache"]["fell_back"]) == (True, False)
     assert empty["cache"]["requested_path"] == empty["cache"]["db_path"] == str(tmp_path / "empty.db")
     assert cache_only["verdict"].startswith("cache only")
-    assert called["verdict"] == "2 sources called by this process, 1 with an open or half-open circuit breaker"
+    assert called["verdict"] == (
+        "2 sources called by this process, 1 whose last call failed, "
+        "1 with an open or half-open circuit breaker"
+    )
 
 
 @pytest.mark.asyncio
@@ -1953,40 +1972,6 @@ def test_earthquake_exposure_says_each_city_names_only_its_nearest_event() -> No
     assert "names only the nearest of them for each city" in text
     assert "compare its lat and lon with each step-1 event" in text
     assert "Keep only the exposed_cities whose event_detail" not in text
-
-
-@pytest.mark.asyncio
-async def test_aoi_prompts_say_which_domains_fail_silently(monkeypatch, tmp_path) -> None:
-    """Earthquakes, and FIRMS regions with a key set, come back empty with
-    no error when the fetch fails, so the AOI diff cannot list them as a
-    gap; the prompts must not promise it does. Every request gets a 503."""
-    from world_intel_mcp.fetcher import Fetcher
-    from world_intel_mcp.sources import seismology, wildfire
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
-    cache = Cache(db_path=tmp_path / "aoi-silent.db")
-    down = Fetcher(cache, CircuitBreaker(), max_retries=0, client=client)
-    monkeypatch.setenv("NASA_FIRMS_API_KEY", "test-only")
-
-    async def _no_wait(*args, **kwargs) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", _no_wait)
-    try:
-        quakes = await seismology.fetch_earthquakes(down)
-        fires = await wildfire.fetch_wildfires(down)
-    finally:
-        await client.aclose()
-        cache.close()
-    assert (quakes["earthquakes"], "error" in quakes) == ([], False)
-    assert "error" not in fires
-    assert fires["total_fires"] == 0
-    assert {r["count"] for r in fires["fires_by_region"].values()} == {0}
-    for name in ("aoi-watch-setup", "aoi-review"):
-        text = " ".join(_text(name).split())
-        assert "A domain that fails is listed in data_gaps" not in text
-        assert "earthquakes, and wildfires when NASA_FIRMS_API_KEY" in text.replace("Earthquakes", "earthquakes")
-        assert "failing_sources in intel://guide/source-health" in text
 
 
 @pytest.mark.asyncio

@@ -216,5 +216,10 @@ async def test_weekly_trends_missing_database_degrades_gracefully(
     monkeypatch.setattr(intelligence, "fetch_temporal_anomalies", _make_fake({}))
     result = await fetch_weekly_trends(fetcher)
     assert result["trends"] == []
-    assert result["trend_count"] == 0
+    # A missing baseline database is unknown, not zero trends: the count is
+    # None and the error names the path that was not there.
+    assert result["trend_count"] is None
+    assert result["error"] == (
+        f"Temporal baselines unavailable: no temporal baseline database at {tmp_path / 'does_not_exist.db'}"
+    )
     assert result["current_anomalies"] == []

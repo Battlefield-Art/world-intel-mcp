@@ -601,7 +601,10 @@ async def test_escalation_military_outage_is_zero_filled_not_an_empty_sky(
     edge: _Edge,
 ) -> None:
     """adsb.lol and its OpenSky fallback both down: military.py answers
-    ``source: "none"`` with an empty list, which is an outage."""
+    ``source: "none"`` with an empty list, which is an outage. That answer
+    now carries military.py's own error, so the gap names it; the generic
+    _MILITARY_NO_SOURCE text is for a ``source: "none"`` answer without
+    one."""
     aoi.define_aoi(edge.store, "Pittsburgh", *_PGH)
     result, requests = await _escalate(
         edge,
@@ -614,7 +617,8 @@ async def test_escalation_military_outage_is_zero_filled_not_an_empty_sky(
 
     assert (len(requests["adsb"]), len(requests["opensky"])) == (1, 1)
     assert result["data_gaps"] == [
-        f"Military flights: {aoi._MILITARY_NO_SOURCE}",
+        "Military flights: No military flight source available (adsb.lol and "
+        "OpenSky both failed)",
         # quake + battle + fire in cell (40, -80): 3 x (1 + sqrt 3) = 8.2.
         "Convergence: computed without full military flights data; 8.2 is a "
         "lower bound (the missing events could only raise it).",
@@ -1193,9 +1197,9 @@ def test_scoping_an_answer_without_its_list_is_unknown(answer: dict) -> None:
 @pytest.mark.parametrize(
     ("answer", "error"),
     [
-        # military.py's shape today when both sources fail.
+        # military.py's shape before it marked the outage (no error key).
         ({"aircraft": [], "count": 0, "source": "none"}, _MILITARY_DOWN),
-        # The same shape with an outage marker added.
+        # The same shape with an outage marker added, as military.py answers now.
         (
             {"aircraft": [], "count": 0, "source": "none", "error": "both sources failed"},
             "both sources failed",
@@ -1295,4 +1299,7 @@ def test_cli_escalation_marks_zero_filled_and_lower_bound_components(
     )
     assert "military not measured (fetch failed; scored as 0)" in out
     assert "convergence 8.0 (lower bound)" in out
-    assert f"Military flights: {aoi._MILITARY_NO_SOURCE}" in out
+    assert (
+        "Military flights: No military flight source available (adsb.lol and "
+        "OpenSky both failed)" in out
+    )

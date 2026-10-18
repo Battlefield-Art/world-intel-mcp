@@ -86,6 +86,14 @@ def cycle(store, when, *outcomes):
     return store.record_cycle(list(outcomes), now=at(when))
 
 
+@pytest.fixture(autouse=True)
+def _one_symbol_quotes_are_whole(monkeypatch):
+    # These fixtures use one-symbol quote payloads as the plain "changed"
+    # source; the partial-series rule (1 of 7 expected) has its own tests in
+    # test_history_honesty.py.
+    monkeypatch.delitem(history._EXPECTED, "market_quotes", raising=False)
+
+
 def kp(*rows):
     return {"kp_recent": [{"time": t, "kp": v} for t, v in rows], "alerts": []}
 
@@ -248,7 +256,7 @@ def test_collected_view_distinguishes_every_source_state(store, db) -> None:
     assert gas["day_state"] == "degraded"
     assert gas["payload_changes"] == {"changed": 0, "unchanged": 1, "first": 1, "not_stored": 0}
     assert [r["reason"] for r in gas["reasons"]] == [
-        "served stale cache (age 1112.0 s)", "served stale cache (age 812.0 s)"
+        "served stale cache"
     ]
 
     quotes = rows["market_quotes"]
@@ -352,7 +360,10 @@ def test_empty_store_missing_tables_and_missing_file(tmp_path) -> None:
     result = day_timeline(empty, "2026-10-17", roster=["space_weather"], now=LATER)
     assert result["collector"]["context"] == "empty_run_log"
     assert by_source(result)["space_weather"]["day_state"] == "never_run"
-    assert result["data_gaps"] == []
+    assert result["data_gaps"] == [
+        "The run log in this database has no capture: no collector cycle is recorded here yet, "
+        "so whether the collector or any source ran on 2026-10-17 cannot be read."
+    ]
 
     bare = tmp_path / "bare.db"
     sqlite3.connect(bare).close()
@@ -490,6 +501,9 @@ def test_day_past_payload_retention_names_the_pruned_bodies(store, db) -> None:
     assert (rows["election_calendar"]["captures_with_body_retained"],
             rows["election_calendar"]["captures_with_body_pruned"]) == (1, 0)
     assert result["data_gaps"] == [
+        "The run log holds no capture before 2026-10-01T12:00:00Z, its oldest: this day before "
+        "then is not covered (this database was not recording yet, or older captures were "
+        "pruned), so counts, states and the longest gap cover only 2026-10-01T12:00:00Z onward.",
         "Payload bodies of 1 of this day's captures were pruned (bodies are kept 7 days after "
         "the payload was last seen); intel_capture_history can replay only captures whose body "
         "is retained (1 of 2)."
@@ -550,10 +564,11 @@ def test_day_straddling_the_run_log_cutoff(store, db, monkeypatch) -> None:
     rows = by_source(result)
     assert rows["space_weather"]["day_state"] == "changed"
     assert rows["cyclones"]["day_state"] == "unknown_past_retention"
-    # Before the cutoff the day is unknown, so the gap starts at the cutoff.
+    # Before the first retained capture the day is unrecorded, not a stretch
+    # without captures, so the gap starts at the first retained capture.
     c = result["collector"]
     assert (c["longest_gap_from"], c["longest_gap_to"], c["longest_gap_s"]) == (
-        "2026-10-11T12:00:00Z", "2026-10-11T20:00:00Z", 28_800.0
+        "2026-10-11T20:00:00Z", "2026-10-12T00:00:00Z", 14_400.0
     )
     assert result["data_gaps"][0].startswith(
         "Captures before 2026-10-11T12:00:00Z (the 2-day run-log cutoff) are pruned"
@@ -916,11 +931,11 @@ def test_cli_flags_partial_failure_and_unknown_observation_counts(cli_db, monkey
         s.close()
     text = _invoke("history", "day", day).output
     lines = {line.split()[0]: line for line in text.splitlines() if line.strip()}
-    assert "unchanged, 23 failed" in lines["wildfires"]
+    assert "degraded, 23 failed" in lines["wildfires"]
     # Its extractor raised on the one answer: the count is unknown, not none.
     assert "?" in lines["wildfires"].split()
     assert "timeout (45.0s) (x23)" in lines["wildfires"]
-    assert "extraction: extractor raised: ValueError: rows changed shape (x1)" in lines["cyclones"]
+    assert "extractor raised: ValueError: rows changed shape (x1)" in lines["cyclones"]
     assert "Gap: History extractors raised on 2 capture(s) that day (cyclones 1, wildfires 1)" in text
 
 

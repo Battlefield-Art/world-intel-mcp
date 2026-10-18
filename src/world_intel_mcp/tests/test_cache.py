@@ -1,5 +1,6 @@
 """Tests for SQLite TTL cache."""
 
+import os
 import tempfile
 import time
 from collections.abc import Iterator
@@ -96,7 +97,9 @@ def test_default_path_falls_back_when_unavailable(
 
     cache = Cache()
     try:
-        expected = Path(tempfile.gettempdir()) / "world-intel-mcp" / "cache.db"
+        # The fallback directory is per user (world-intel-mcp-<uid>), so
+        # another local user cannot plant or read it in a shared temp dir.
+        expected = Path(tempfile.gettempdir()) / f"world-intel-mcp-{os.getuid()}" / "cache.db"
         assert cache.db_path == expected
         cache.set("fallback", "ok", ttl_seconds=60)
         assert cache.get("fallback") == "ok"

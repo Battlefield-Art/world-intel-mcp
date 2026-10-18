@@ -399,7 +399,9 @@ async def test_ecb_backfill_loads_every_series_of_the_key(fetcher, store) -> Non
 async def test_ecb_weeks_are_dated_by_the_sunday_that_ends_them(fetcher, store) -> None:
     route = respx.get(_ILM_URL).mock(return_value=httpx.Response(200, json=_ILM))
     out = await hb.backfill_ecb(fetcher, store, [_ILM_KEY], "2026-09-01", now=NOW)
-    assert "startPeriod=2026-09-01" in str(route.calls.last.request.url)
+    # The ECB applies startPeriod to a week's first day, so the request asks
+    # from 6 days earlier and the window is cut on observed_at (the Sunday).
+    assert "startPeriod=2026-08-26" in str(route.calls.last.request.url)
     s = _series(out, _ILM_KEY)
     assert s["series_key"] == "backfill:ecb:ILM.W.U2.C.T000000.Z5.Z01"
     rows = _rows(store, "SELECT observed_at, value FROM history_observations ORDER BY observed_at")
@@ -416,7 +418,7 @@ async def test_ecb_weeks_are_dated_by_the_sunday_that_ends_them(fetcher, store) 
     "response, reason",
     [
         (httpx.Response(404, text=_ECB_404), "no series matches the key"),
-        (httpx.Response(200, text=""), "no observations on or after"),
+        (httpx.Response(200, text=""), "unexpected payload (empty body, no start requested)"),
         (httpx.Response(200, text="{not json"), "not in the expected SDMX-JSON shape"),
         (httpx.Response(500, text="oops"), "upstream fetch failed"),
     ],

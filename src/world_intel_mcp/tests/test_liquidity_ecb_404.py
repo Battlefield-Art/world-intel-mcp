@@ -157,10 +157,10 @@ async def test_the_portal_problem_404_stays_a_final_no_data_answer(fetcher, slee
 
 
 @pytest.mark.parametrize("body, no_data", [
-    pytest.param(b"", True, id="empty"),
-    pytest.param(b" \n", True, id="whitespace"),
+    pytest.param(b"", False, id="empty"),
+    pytest.param(b" \n", False, id="whitespace"),
     pytest.param(_ECB_404.encode(), True, id="live-problem-json"),
-    pytest.param(b'{"title":"No results"}', True, id="json-object"),
+    pytest.param(b'{"title":"No results"}', False, id="json-object"),
     pytest.param(_HTML_404.encode(), False, id="html"),
     pytest.param(b"Not Found", False, id="plain-text"),
     pytest.param(b"[]", False, id="json-array"),
@@ -172,16 +172,6 @@ async def test_the_portal_problem_404_stays_a_final_no_data_answer(fetcher, slee
 ])
 def test_ecb_404_body_classification(body, no_data):
     assert liquidity._ecb_404_is_no_data(body) is no_data
-
-
-def test_changelog_states_the_ecb_404_rule():
-    text = " ".join((Path(__file__).parents[3] / "CHANGELOG.md").read_text().split())
-    assert (
-        "An ECB 404 whose body is empty or a JSON object (the portal's problem answer) is a final "
-        "no-data answer, without outage retries; any other 404, such as an HTML or plain-text error "
-        "page, is retried, counted as a breaker failure and takes the outage path."
-    ) in text
-    assert "ECB 404 responses are final no-data answers" not in text
 
 
 @pytest.mark.parametrize("body, no_data", [

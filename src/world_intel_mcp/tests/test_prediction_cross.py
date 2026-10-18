@@ -82,10 +82,13 @@ async def test_compare_matches_live_fed_pairs_and_rejects_near_misses(fetcher: F
     out = await fetch_prediction_compare(fetcher, series="KXFEDDECISION")
 
     pairs = [(m["kalshi"]["id"], m["polymarket"]["id"]) for m in out["matched"]]
-    # Largest absolute gap first: C25 0.01 (last trade) - 0.0035 (Polymarket
-    # midpoint of 0.003/0.004) = 0.0065; H25 0.135 - 0.135 = 0.
-    assert pairs == [("KXFEDDECISION-26OCT-C25", "2589811"), ("KXFEDDECISION-26OCT-H25", "2589813")]
-    assert [m["price_gap"] for m in out["matched"]] == [0.0065, 0.0]
+    # Comparable pairs first, then largest absolute gap: H25 is two-sided on
+    # both venues, 0.135 - 0.135 = 0; C25 is flagged (its Kalshi price is a
+    # last trade on a one-sided book), 0.01 - 0.0035 (Polymarket midpoint of
+    # 0.003/0.004) = 0.0065.
+    assert pairs == [("KXFEDDECISION-26OCT-H25", "2589813"), ("KXFEDDECISION-26OCT-C25", "2589811")]
+    assert [m["price_gap"] for m in out["matched"]] == [0.0, 0.0065]
+    assert [m["comparable"] for m in out["matched"]] == [True, False]
     assert all(m["match_confidence"] >= 0.6 and m["reasons"] for m in out["matched"])
     assert out["matched_count"] == 2
     assert out["unmatched_kalshi"] == 3 and out["unmatched_polymarket"] == 3

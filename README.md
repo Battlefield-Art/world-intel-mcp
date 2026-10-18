@@ -839,7 +839,7 @@ Everything else uses free, unauthenticated public APIs.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 1037 tests (1055 total, 18 live-network smoke tests deselected by default)
+pytest                       # 2,781 tests (2,801 total, 20 live-network smoke tests deselected by default)
 pytest --cov=world_intel_mcp # with coverage
 pytest tests/test_forex.py -v # single module
 ```

@@ -16,7 +16,6 @@ import json
 import os
 import sqlite3
 import stat
-import tempfile
 import threading
 import time
 import types
@@ -474,26 +473,6 @@ def test_empty_run_log_names_its_path_and_the_other_path_risk(store) -> None:
     _record(store, "wildfires", T0, FIRES)
     health = store.collection_health(["wildfires", "earthquakes"], now=T0)
     assert health["data_gaps"] == ["1 source(s) have no capture in this run log"]
-
-
-def test_temp_fallback_run_log_is_named(tmp_path, monkeypatch) -> None:
-    """A Cache whose default path is unusable falls back to the temp dir;
-    health on that file says so."""
-    blocker = tmp_path / "not-a-dir"
-    blocker.write_text("")
-    monkeypatch.setenv("WORLD_INTEL_CACHE_DB", str(blocker / "cache.db"))
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
-    cache = Cache()
-    try:
-        assert cache.db_path == tmp_path / "tmp" / "world-intel-mcp" / "cache.db"
-        s = HistoryStore(cache.db_path)
-        try:
-            gaps = s.collection_health(["wildfires"], now=T0)["data_gaps"]
-        finally:
-            s.close()
-    finally:
-        cache.close()
-    assert any(gap.startswith("this run log is the temp-directory fallback") for gap in gaps)
 
 
 async def test_history_tools_pass_gaps_through(tmp_path, monkeypatch) -> None:

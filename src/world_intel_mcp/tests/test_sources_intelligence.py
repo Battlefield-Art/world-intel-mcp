@@ -1023,11 +1023,12 @@ async def test_fetch_military_surge_quiet_posture(
 async def test_fetch_vessel_snapshot_naval_keywords(
     fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Suspected bug (documented, not fixed): the loop matches naval
-    keywords against ALL warnings with no proximity/navarea filter, so
-    every one of the 9 waterways receives the identical naval count and
-    status — 3 naval warnings anywhere on Earth mark Panama and Hormuz
-    'critical' alike."""
+    """Regression: naval keywords were matched against every warning with
+    no position or area filter, so 3 naval warnings anywhere on Earth
+    marked all nine waterways 'critical' alike. These state no position,
+    so no waterway is credited with them (a positionless warning is never
+    credited by its area code); the three naval ones are still classified
+    as naval and listed as unplaced, and BUOY UNLIT is not."""
     warnings = [
         {"id": "2026-1", "text": "NAVAL EXERCISES IN AREA", "navarea": "IV"},
         {"id": "2026-2", "text": "SUBMARINE OPERATIONS", "navarea": "XI"},
@@ -1035,7 +1036,9 @@ async def test_fetch_vessel_snapshot_naval_keywords(
         {"id": "2026-4", "text": "BUOY UNLIT", "navarea": "IV"},
     ]
     monkeypatch.setattr(
-        maritime, "fetch_nav_warnings", _async_return({"warnings": warnings})
+        maritime,
+        "fetch_nav_warnings",
+        _async_return({"warnings": warnings, "feed_stale": False}),
     )
 
     result = await intelligence.fetch_vessel_snapshot(fetcher)
@@ -1043,20 +1046,32 @@ async def test_fetch_vessel_snapshot_naval_keywords(
     assert result["source"] == "nga-msi-vessel-snapshot"
     assert result["count"] == 9
     assert result["total_nav_warnings"] == 4
+    assert result["total_naval_warnings"] == 3  # keyword matches; BUOY UNLIT excluded
+    assert [(w["id"], w["reason"]) for w in result["unplaced_naval_warnings"]] == [
+        ("2026-1", "unknown_area_code"),
+        ("2026-2", "unknown_area_code"),
+        ("2026-3", "unknown_area_code"),
+    ]
 
     names = {w["name"] for w in result["waterways"]}
     assert "Strait of Hormuz" in names
     for ww in result["waterways"]:
-        assert ww["naval_warnings"] == 3  # keyword matches; BUOY UNLIT excluded
-        assert ww["status"] == "critical"  # >= 3 naval warnings
-        assert len(ww["warning_details"]) == 3
+        assert ww["naval_warnings"] == 0
+        assert ww["status"] == "clear"
+        assert ww["warning_details"] == []
 
 
 @pytest.mark.asyncio
 async def test_fetch_vessel_snapshot_clear(
     fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(maritime, "fetch_nav_warnings", _async_return({"warnings": []}))
+    """A current feed (feed_stale False) with no naval warnings near any
+    waterway reads clear; an empty or undated feed reads unknown instead
+    (test_maritime_honesty_r3.py)."""
+    monkeypatch.setattr(
+        maritime, "fetch_nav_warnings",
+        _async_return({"warnings": [], "feed_stale": False}),
+    )
 
     result = await intelligence.fetch_vessel_snapshot(fetcher)
     assert all(ww["status"] == "clear" for ww in result["waterways"])
@@ -1125,15 +1140,16 @@ _NGA_LIVE = [
         "ARE ADVISED TO EXERCISE EXTREME CAUTION.\n",
         "181218Z MAR 2022", "NAVAREA III 118/22 181124Z MAR 22.",
     ),
-    # States no position; NAVAREA XII contains the canal's Pacific end.
+    # States no position; NAVAREA XII contains the canal's Pacific end, but
+    # a positionless warning is credited to no waterway by its area code.
     _nga_record(
         2023, 249, "12", "83",
         "EASTERN NORTH PACIFIC.\nCANCEL NAVAREA XII 243/23 AND THIS MSG,\n"
         "SEARCH SUSPENDED.\n",
         "280353Z APR 2023", "JRCC HONOLULU 0/23 280342Z APR 23.",
     ),
-    # Its only position, 154-84.0W, is malformed (84 minutes): no NAVAREA
-    # credit either, since it does state a place (south of Hawaii).
+    # Its only position, 154-84.0W, is malformed (84 minutes): credited to
+    # no waterway.
     _nga_record(
         2023, 243, "12", "83",
         "EASTERN NORTH PACIFIC.\nMAN OVERBOARD IN VICINITY 10-52.0N 154-84.0W\n"
@@ -1186,19 +1202,20 @@ async def test_fetch_vessel_snapshot_credits_only_the_waterways_a_live_warning_c
     # Neither naval-keyword warning is near a waterway.
     for ww in result["waterways"]:
         assert ww["naval_warnings"] == 0
-        assert ww["status"] == "clear"
+        assert ww["status"] == "stale"
+        assert ww["status_as_of"] == "2024-05-10T05:59:00Z"
         assert ww["warning_details"] == []
-        assert ww["naval_by_match"] == {"proximity": 0, "navarea": 0}
+        assert ww["naval_by_match"] == {"proximity": 0}
     assert result["total_naval_warnings"] == 2
 
     assert {name: ww["total_nearby"] for name, ww in by_name.items()} == {
         "Strait of Hormuz": 1, "Strait of Malacca": 0, "Suez Canal": 0,
-        "Panama Canal": 3, "Bab-el-Mandeb": 0, "Taiwan Strait": 1,
+        "Panama Canal": 2, "Bab-el-Mandeb": 0, "Taiwan Strait": 1,
         "Strait of Gibraltar": 0, "GIUK Gap": 0, "Bosphorus": 0,
     }
-    # Two by stated position, one (the positionless cancellation) by NAVAREA.
-    assert by_name["Panama Canal"]["nearby_by_match"] == {"proximity": 2, "navarea": 1}
-    assert by_name["Strait of Hormuz"]["nearby_by_match"] == {"proximity": 1, "navarea": 0}
+    # Both by stated position; the positionless cancellation is credited nowhere.
+    assert by_name["Panama Canal"]["nearby_by_match"] == {"proximity": 2}
+    assert by_name["Strait of Hormuz"]["nearby_by_match"] == {"proximity": 1}
 
     assert result["unplaced_naval_warnings"] == [
         {
@@ -1213,7 +1230,7 @@ async def test_fetch_vessel_snapshot_credits_only_the_waterways_a_live_warning_c
 
     rule = result["matching_rule"]
     assert rule["proximity_km"] == 300.0
-    assert rule["waterway_navareas"] == {"Panama Canal": ["IV", "XII"]}
+    assert "waterway_navareas" not in rule
     assert rule["area_codes"] == maritime.area_codes_view()
     assert "proximity_km" in rule["rule"]
 
@@ -1226,9 +1243,11 @@ async def test_fetch_vessel_snapshot_credits_only_the_waterways_a_live_warning_c
         "NGA feed: newest active warning was issued 2024-05-10T05:59:00Z, "
     )
     assert result["data_gaps"][1:] == [
-        "1 naval warning(s) state no readable position and no single-NAVAREA "
-        "area code, so no waterway is credited with them "
-        "(unplaced_naval_warnings): 2022-789 (multi_navarea_series)"
+        "every waterway reads stale, not a threat level: naval_warnings counts "
+        "warnings from a feed last updated 2024-05-10T05:59:00Z (status_as_of)",
+        "1 naval warning(s) state no readable position, so no waterway is "
+        "credited with them (unplaced_naval_warnings): A:2022-789 "
+        "(multi_navarea_series)",
     ]
 
 
@@ -1271,7 +1290,7 @@ async def test_fetch_vessel_snapshot_naval_status_counts_only_nearby_warnings(
             "RED SEA.\nYEMEN.\nDNC 10.\nWARSHIP OPERATIONS 12-40.00N 043-20.00E.\n",
             stamp, "NAVAREA IX 4/26",
         ),
-        # No position, single-NAVAREA code 4: credited to Panama by NAVAREA.
+        # No position, code 4 (NAVAREA IV, also issued under XVIII): credited nowhere.
         _nga_record(
             2026, 905, "4", "24",
             "WESTERN NORTH ATLANTIC.\nNAVAL OPERATIONS IN PROGRESS.\n",
@@ -1294,7 +1313,7 @@ async def test_fetch_vessel_snapshot_naval_status_counts_only_nearby_warnings(
     hormuz = by_name["Strait of Hormuz"]
     assert hormuz["naval_warnings"] == 3
     assert hormuz["status"] == "critical"
-    assert hormuz["naval_by_match"] == {"proximity": 3, "navarea": 0}
+    assert hormuz["naval_by_match"] == {"proximity": 3}
     assert [(d["id"], d["match"], d["distance_km"]) for d in hormuz["warning_details"]] == [
         ("2026-901", "proximity", 11.4),
         ("2026-903", "proximity", 98.0),
@@ -1304,17 +1323,18 @@ async def test_fetch_vessel_snapshot_naval_status_counts_only_nearby_warnings(
     assert by_name["Bab-el-Mandeb"]["warning_details"][0]["distance_km"] == 9.6
 
     panama = by_name["Panama Canal"]
-    assert panama["status"] == "advisory"
-    assert panama["naval_by_match"] == {"proximity": 0, "navarea": 1}
-    assert panama["warning_details"][0]["id"] == "2026-905"
-    assert panama["warning_details"][0]["match"] == "navarea"
-    assert panama["warning_details"][0]["distance_km"] is None
+    assert panama["status"] == "clear"
+    assert panama["naval_by_match"] == {"proximity": 0}
+    assert panama["warning_details"] == []
+    assert panama["naval_warnings"] == 0
+    assert panama["total_nearby"] == 0
 
     others = set(_WATERWAY_NAMES) - {"Strait of Hormuz", "Bab-el-Mandeb", "Panama Canal"}
     assert {by_name[name]["status"] for name in others} == {"clear"}
 
     assert [(w["id"], w["reason"], w["series"]) for w in result["unplaced_naval_warnings"]] == [
-        ("2026-906", "position_unreadable", "NAVAREA XII")
+        ("2026-905", "multi_navarea_series", "NAVAREA IV"),
+        ("2026-906", "position_unreadable", "NAVAREA XII"),
     ]
     assert result["total_naval_warnings"] == 6
     assert result["newest_issue_age_days"] == pytest.approx(2 / 24, abs=0.1)
@@ -1363,7 +1383,9 @@ async def test_fetch_vessel_snapshot_roman_numeral_navarea_is_not_an_nga_code(
         {"id": "2026-5", "text": "X" * 500 + "...", "navarea": "A"},
     ]
     monkeypatch.setattr(
-        maritime, "fetch_nav_warnings", _async_return({"warnings": warnings})
+        maritime,
+        "fetch_nav_warnings",
+        _async_return({"warnings": warnings, "feed_stale": False}),
     )
 
     result = await intelligence.fetch_vessel_snapshot(fetcher)
@@ -1380,10 +1402,10 @@ async def test_fetch_vessel_snapshot_roman_numeral_navarea_is_not_an_nga_code(
         ("2026-3", "unknown_area_code", None),
     ]
     assert result["data_gaps"] == [
-        "3 naval warning(s) state no readable position and no single-NAVAREA "
-        "area code, so no waterway is credited with them "
-        "(unplaced_naval_warnings): 2026-1 (unknown_area_code), "
-        "2026-2 (unknown_area_code), 2026-3 (unknown_area_code)",
+        "3 naval warning(s) state no readable position, so no waterway is "
+        "credited with them (unplaced_naval_warnings): IV:2026-1 "
+        "(unknown_area_code), XI:2026-2 (unknown_area_code), IX:2026-3 "
+        "(unknown_area_code)",
         "1 warning text(s) were cut at 500 characters; positions after the "
         "cut are not read",
     ]

@@ -61,7 +61,7 @@ def test_kalshi_renders_probabilities_gaps_and_units(monkeypatch: pytest.MonkeyP
     assert "Fed maintains rate" in result.output
     assert "64,959" in result.output
     assert "[red]Loongs[/red]" in result.output  # remote text rendered literally
-    assert "Data gap:" in result.output and "more exist" in result.output
+    assert "Gap:" in result.output and "more exist" in result.output
     assert "dollars per $1 payout" in result.output
 
 
@@ -107,7 +107,8 @@ def test_prediction_compare_renders_pairs_and_counts(monkeypatch: pytest.MonkeyP
     assert "Compared 5 Kalshi / 5 Polymarket markets: 1 matched" in result.output
     assert "unmatched Kalshi 4, unmatched Polymarket 4" in result.output
     assert "0.72" in result.output and "+0.7pp" in result.output
-    assert "1.0%" in result.output and "0.3%" in result.output
+    # 0.0035 * 100 is 0.35000000000000003 in floating point: .1f gives 0.4.
+    assert "1.0%" in result.output and "0.4%" in result.output
 
 
 def test_prediction_compare_no_pairs_says_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,7 +148,7 @@ def test_prediction_settled_renders_scores_and_unscored_venue(monkeypatch: pytes
     assert "last price older than the staleness limit: 1" in result.output
     assert "not scored" in result.output
     assert "price history unavailable for every market" in result.output
-    assert "Data gap:" in result.output
+    assert "Gap:" in result.output
     assert "own sample of different markets" in result.output
 
 

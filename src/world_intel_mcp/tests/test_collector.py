@@ -13,8 +13,8 @@ from world_intel_mcp import collector
 
 
 def test_sources_count_matches_docs() -> None:
-    # CLAUDE.md says 55; measured here.
-    assert len(collector.SOURCES) == 55
+    # README.md says 61; measured here.
+    assert len(collector.SOURCES) == 61
 
 
 def test_source_names_unique() -> None:

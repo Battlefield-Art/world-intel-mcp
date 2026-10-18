@@ -696,7 +696,7 @@ suite, and a live MCP stdio session.
 | Tool parity | 160 / 160 | `TOOLS` and handlers are aligned at import time; README's per-tool reference is pinned to the registry by `test_readme_documents_every_registered_tool` |
 | Static datasets | 18 | Bases, ports, pipelines, nuclear, cables, datacenters, spaceports, minerals, exchanges, trade routes, cloud regions, financial centers |
 | RSS feeds | 119 | 24 categories |
-| Tests in repo | 991 | 973 non-smoke tests + 18 live smoke tests (measured 2026-10-12: `pytest -m 'not smoke'` -> 973 passed, 18 deselected); full suite requires `.[dev]` |
+| Tests in repo | 2,801 | 2,781 non-smoke tests + 20 live smoke tests (measured 2026-10-18: `pytest -m 'not smoke'` -> 2,781 passed, 20 deselected); full suite requires `.[dev]` |
 | Statement coverage | 92% | Measured 2026-10-12 full-suite `--cov` (92.02%); 91.65% on 2026-10-11; 91.18% on 2026-09-01, 59% the morning before. CI ratchet at 89 |
 | Primary remaining gaps | `cli.py` tests, coverage gate, `server.py` refactor | See Planned Phases 23-26 |
 

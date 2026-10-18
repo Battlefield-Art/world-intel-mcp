@@ -62,7 +62,8 @@ def _patch_components(monkeypatch, posture, vessels, surge) -> None:
 
 
 _HORMUZ_CRITICAL = {
-    "waterways": [{"name": "Strait of Hormuz", "status": "critical", "naval_warnings": 3}]
+    "waterways": [{"name": "Strait of Hormuz", "status": "critical", "naval_warnings": 3}],
+    "feed_stale": False,
 }
 _PERSIAN_GULF_SURGE = {
     "surges": [{"region": "persian_gulf", "aircraft_count": 9, "baseline": 3, "ratio": 3.0}]
@@ -183,7 +184,7 @@ async def test_theaters_without_a_flight_source_are_left_out_not_zero(
     _patch_components(
         monkeypatch,
         _returning(posture),
-        _returning({"waterways": []}),
+        _returning({"waterways": [], "feed_stale": False}),
         _returning({"surges": [], "unchecked_regions": ["arctic"], "degraded": True,
                     "data_gaps": ["arctic unchecked"]}),
     )

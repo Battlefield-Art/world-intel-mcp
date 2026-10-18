@@ -423,7 +423,8 @@ async def _fake_wildfires(fetcher, region=None):
 async def _fake_domestic_flights(fetcher):
     return {
         "total_aircraft": 2,
-        "sampled": [
+        # fetch_domestic_flights returns its sample under "positions".
+        "positions": [
             {"lat": _NEAR_LAT, "lon": _NEAR_LON, "callsign": "UAL1", "origin": "USA"},
             {"lat": _FAR_LAT, "lon": _FAR_LON, "callsign": "UAL2", "origin": "USA"},
         ],

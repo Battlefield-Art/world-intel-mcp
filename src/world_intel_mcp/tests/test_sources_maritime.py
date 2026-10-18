@@ -145,8 +145,9 @@ async def test_fetch_nav_warnings_dict_payload_single_warning(
 async def test_fetch_nav_warnings_api_down(
     fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Observation (flagged in review, not fixed): an NGA outage returns
-    warnings=[] with no error key — shape-identical to calm seas."""
+    """Regression: an NGA outage returned warnings=[] with no error key,
+    shape-identical to calm seas. The empty lists stay; error says the
+    feed is down."""
 
     async def _no_sleep(*args, **kwargs) -> None:
         return None
@@ -159,7 +160,7 @@ async def test_fetch_nav_warnings_api_down(
     assert result["warnings"] == []
     assert result["count"] == 0
     assert result["by_navarea"] == {}
-    assert "error" not in result  # current (dishonest-quiet) behavior
+    assert result["error"] == "NGA MSI API unavailable (no live or cached data)"
 
 
 def test_extract_coords() -> None:
@@ -323,6 +324,10 @@ async def test_fetch_nav_warnings_unrecognized_payload_is_an_error(
 @respx.mock
 @pytest.mark.asyncio
 async def test_fetch_nav_warnings_empty_list_is_not_an_outage(fetcher: Fetcher) -> None:
+    """An empty answer is not an outage (no error), but it is degraded: the
+    feed carried 386 active warnings on 2026-10-17, so an empty one cannot
+    be told from a feed fault, and how current it is cannot be checked
+    (feed_stale None)."""
     # The live API answers msgYear=2026 with exactly this.
     respx.get(url__regex=r".*msi\.nga\.mil.*").mock(
         return_value=httpx.Response(200, json={"broadcast-warn": []})
@@ -331,9 +336,14 @@ async def test_fetch_nav_warnings_empty_list_is_not_an_outage(fetcher: Fetcher) 
     result = await fetch_nav_warnings(fetcher)
 
     assert "error" not in result
-    assert "degraded" not in result
+    assert result["degraded"] is True
     assert result["count"] == 0
-    assert result["data_gaps"] == []
+    assert result["data_gaps"] == [
+        "NGA returned no active warnings (the feed normally carries hundreds), "
+        "so a quiet sea cannot be told from a feed fault and how current the "
+        "list is cannot be checked"
+    ]
+    assert result["feed_stale"] is None
     assert result["newest_issue_date"] is None
     assert result["newest_issue_age_days"] is None
 
@@ -498,7 +508,7 @@ def test_nga_area_codes_cover_the_live_code_table() -> None:
 
     assert codes["4"]["navareas"] == ("IV",)
     assert codes["12"]["navareas"] == ("XII",)
-    assert [c for c in codes if codes[c]["single_navarea"]] == ["4", "12"]
+    assert [c for c in codes if codes[c]["single_navarea"]] == ["12"]
     assert codes["C"]["unlisted_navareas"] == ("XVII", "XVIII", "XIX", "XX", "XXI")
 
     listed: set[str] = set()

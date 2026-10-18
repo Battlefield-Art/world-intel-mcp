@@ -324,14 +324,17 @@ def test_independent_series_give_no_fdr_significant_result(store) -> None:
 
 def test_random_walks_correlate_in_levels_but_not_in_changes(store) -> None:
     """Independent random walks are the textbook spurious correlation. Seeds
-    1000/1001: |r| = 0.87 in levels (q ~ 1e-59), nothing in changes. Over 20
-    seed pairs (measured: 14 with an FDR-significant level lag, 1 with an
-    FDR-significant change lag, the nominal 5% rate) the default protects.
-    The AR(1) diagnostic flags the level result: its effective n is ~1."""
+    1000/1001: |r| = 0.87 in levels (q ~ 1e-59 with periods treated as
+    independent), nothing in changes. Over 20 seed pairs (measured: 14 with a
+    level lag at q <= 0.05 but none at q_ar1 <= 0.05, 1 with a significant
+    change lag, the nominal 5% rate) the default transform protects, and in
+    levels the AR(1) adjustment does: seeds 1000/1001 have an effective n of
+    0.9, so p_ar1 is 1 (no evidence)."""
     _write(store, {"rwa": _days(_walk(1000, 200)), "rwb": _days(_walk(1001, 200))})
     levels = _run(store, ["rwa", "rwb"], transform="levels")
     best = levels["pairs"][0]["strongest"][0]
-    assert abs(best["r"]) > 0.8 and best["significant"] is True
+    assert abs(best["r"]) > 0.8 and best["significant_if_independent"] is True
+    assert best["significant"] is False and best["p_ar1"] == 1.0
     assert best["n_effective_ar1"] < 0.1 * best["n"]
     assert best["p_ar1"] is None or best["p_ar1"] > 100 * best["p"]
     assert all(s["lag1_autocorrelation"] > 0.9 for s in levels["series"])
@@ -339,13 +342,16 @@ def test_random_walks_correlate_in_levels_but_not_in_changes(store) -> None:
     assert changes["significant_tests"] == 0
     assert abs(changes["pairs"][0]["strongest"][0]["r"]) < 0.2
 
-    level_hits = change_hits = 0
+    level_hits = level_hits_if_independent = change_hits = 0
     for s in range(1, 20):
         _write(store, {f"a{s}": _days(_walk(1000 + 2 * s, 200)),
                        f"b{s}": _days(_walk(1001 + 2 * s, 200))}, at=T0 + s)
-        level_hits += _run(store, [f"a{s}", f"b{s}"], transform="levels")["significant_tests"] > 0
+        level = _run(store, [f"a{s}", f"b{s}"], transform="levels")
+        level_hits += level["significant_tests"] > 0
+        level_hits_if_independent += level["significant_tests_if_independent"] > 0
         change_hits += _run(store, [f"a{s}", f"b{s}"])["significant_tests"] > 0
-    assert level_hits >= 12
+    assert level_hits_if_independent >= 12
+    assert level_hits == 0
     assert change_hits <= 2
 
 

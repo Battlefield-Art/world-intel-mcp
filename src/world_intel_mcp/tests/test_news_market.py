@@ -483,7 +483,9 @@ def test_measure_country_first_bar_has_no_prior():
 def test_trailing_zscore_flat_series_is_none():
     flat = [(1789435800 + i * 86400, 100.0) for i in range(14)]
     bars = _bars("FLAT", _chart("FLAT", flat))
-    assert nm.trailing_zscore(bars, bars.dates[-1], 0.01) == (None, 13)
+    # 14 flat bars give 12 returns before the session (the session's own
+    # return is not in its baseline); enough for a z-score, but sd is 0.
+    assert nm.trailing_zscore(bars, bars.dates[-1], 0.01) == (None, 12)
 
 
 def test_benchmark_for():
@@ -510,7 +512,7 @@ def test_ambiguous_company_excluded_with_reason():
     assert mapped == [] and unmapped == []
     assert excluded[0]["entity"]["name"] == "Shell"
     assert excluded[0]["reason"].startswith("'shell' is also an artillery round")
-    assert "and no article from a energy feed" in excluded[0]["reason"]
+    assert "and no article from an energy feed" in excluded[0]["reason"]
     # "25 bp" is basis points; a finance feed does not make it the company
     _, _, bp = nm.classify_companies("Fed cuts rates by 25 bp", {"finance"})
     assert bp[0]["entity"]["name"] == "Bp"
@@ -565,7 +567,7 @@ def test_unambiguous_and_unlisted_companies():
         "Lockheed Martin and OpenAI sign deal; Google and Alphabet shares rise", set())
     assert [m["ticker"] for m in mapped] == ["LMT", "GOOGL"]  # one row per ticker
     assert unmapped == [{"entity": {"type": "company", "name": "Openai", "sector": "ai"},
-                         "reason": "no public listing in the entity table (private or unlisted)"}]
+                         "reason": "no ticker in the entity table"}]
     assert excluded == []
 
 
@@ -764,7 +766,7 @@ async def test_composite_story_time_problems_are_gaps(fast_fetcher, monkeypatch)
     assert rows["AAPL"]["status"] == "data_gap"
     assert rows["AAPL"]["gap"] == (
         "story timestamp 2026-10-17T21:18:34Z is later than the collection time "
-        "2026-10-17T16:00:00Z (feed timestamp error)")
+        "2026-10-17T16:00:00Z (a timestamp error in the feed or in its parsing)")
     assert rows["LMT"]["status"] == "data_gap"
     assert rows["LMT"]["gap"] == "no parseable published time in the cluster"
 
@@ -831,7 +833,14 @@ async def test_composite_benchmark_cut_by_symbol_budget(fast_fetcher, monkeypatc
     assert row["benchmark"] == "^FTSE"
     assert row["status"] == "data_gap"
     assert row["gap"] == "no daily bars for benchmark ^FTSE (symbol budget)"
-    assert out["data_gaps"] == ["symbol budget 1 reached; not fetched: ^FTSE"]
+    # The fixture's trading period is the US one, so the London listing's
+    # close (21:00) is also flagged as nonstandard.
+    assert out["data_gaps"] == [
+        "symbol budget 1 reached; not fetched: ^FTSE",
+        "ACME.L: Yahoo's current regular close, 21:00 Europe/London, differs from the standard "
+        "16:30 for that zone; it is applied to every day in range, so a story published between "
+        "the two times may map to the wrong session",
+    ]
 
 
 @pytest.mark.asyncio

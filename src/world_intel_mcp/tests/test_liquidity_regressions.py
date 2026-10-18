@@ -12,7 +12,7 @@ import respx
 
 from world_intel_mcp.sources import liquidity
 from world_intel_mcp.tests.test_sources_liquidity import (
-    _BSI, _FRED, _FRED_URL, _ECB_BSI_URL, _ECB_ILM_URL,
+    _BSI, _ECB_404, _FRED, _FRED_URL, _ECB_BSI_URL, _ECB_ILM_URL,
     _fixed_clock_and_no_throttle, _fred_router, _mock_all, fetcher,
 )
 
@@ -78,8 +78,10 @@ def test_alignment_documentation_states_cutoff_and_tuesday():
     assert "Net liquidity therefore starts at 2003-02-12" not in changelog
 
 
+# Only the portal's own no-series 404 (the captured problem body) is a
+# no-data answer; any other 404 takes the outage path (test_liquidity_ecb_404.py).
 @pytest.mark.parametrize("status, body, message", [
-    (404, b'{"title":"No results"}', "no series matches the key"),
+    pytest.param(404, _ECB_404.encode(), "no series matches the key", id="404-portal-no-series"),
     (200, b"", "no observations on or after 2026-10-01"),
 ])
 @respx.mock
@@ -317,7 +319,9 @@ async def test_ecb_invalid_json_is_a_series_error(fetcher):
 async def test_ecb_no_data_transport_metrics(fetcher, monkeypatch, status, metric):
     fetcher.max_retries = 2
     monkeypatch.setattr("world_intel_mcp.fetcher.asyncio.sleep", AsyncMock())
-    route = respx.get(_ECB_BSI_URL).respond(status, content=b"")
+    # 404: the portal's no-series problem body; 200: an empty body (an
+    # unexpected payload, but the transport worked, so no retry or breaker failure).
+    route = respx.get(_ECB_BSI_URL).respond(status, content=_ECB_404.encode() if status == 404 else b"")
     for _ in range(4):
         await liquidity.fetch_ecb_series(fetcher, key=liquidity._ECB_MONEY_KEY)
     if metric == "attempts":

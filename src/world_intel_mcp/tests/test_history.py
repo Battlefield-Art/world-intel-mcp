@@ -93,7 +93,8 @@ def test_payload_without_observation_date_stores_null_not_collected_at(store) ->
     (obs,) = result["observations"]
     assert obs["observed_at"] is None
     assert obs["collected_at"] == "2025-10-09T08:53:20Z"
-    assert obs["value"] == 6_123.5 and obs["unit"] == "USD"
+    # An index level is in index points; its currency goes in the label.
+    assert obs["value"] == 6_123.5 and obs["unit"] == "index points"
     assert any("no observed_at" in gap for gap in result["data_gaps"])
     listing = store.series_history()["series"]
     assert listing[0]["points_without_observed_at"] == 1
@@ -135,9 +136,10 @@ def test_empty_payload_is_degraded_not_ok(store) -> None:
 def test_stale_and_marked_degraded_payloads(store) -> None:
     _record(store, "gas_prices", T0, {"prices": [1], "_stale": True, "_stale_age_seconds": 812.0})
     _record(store, "cyclones", T0, {"cyclones": [1], "degraded": True})
-    assert store.capture_history("gas_prices")["captures"][0]["reason"] == (
-        "served stale cache (age 812.0 s)"
-    )
+    # The reason is stable across replays; the copy age is its own field.
+    (gas,) = store.capture_history("gas_prices")["captures"]
+    assert gas["reason"] == "served stale cache"
+    assert gas["stale_age_s"] == 812.0
     assert store.capture_history("cyclones")["captures"][0]["status"] == "degraded"
 
 
@@ -403,7 +405,9 @@ def test_raising_extractor_keeps_capture_and_reports(store, monkeypatch) -> None
     history.register_extractor("test_feed", lambda payload: payload["missing"])
     _record(store, "test_feed", T0, {"rows": [1]})
     (cap,) = store.capture_history("test_feed")["captures"]
-    assert cap["status"] == "ok"
+    # The capture and its payload are kept, but a raising extractor makes it
+    # degraded, not ok, with the extractor error as its reason.
+    assert cap["status"] == "degraded"
     assert cap["extract_error"].startswith("extractor raised: KeyError")
     health = store.collection_health(["test_feed"], now=T0)
     assert health["sources"][0]["last_extract_error"].startswith("extractor raised")
@@ -430,7 +434,7 @@ def test_builtin_extractors() -> None:
     commodities = {"commodities": [{"symbol": "GC=F", "name": "Gold", "price": 2_400.0}]}
     (gold,) = history._EXTRACTORS["commodity_quotes"](commodities)
     assert (gold.series_key, gold.label, gold.observed_at, gold.unit) == (
-        "GC=F:price", "Gold", None, None
+        "GC=F:price", "Gold", None, "USD per troy ounce"
     )
 
 
@@ -689,7 +693,9 @@ def _invoke(*args):
 
 
 def test_cli_history_registry() -> None:
-    assert set(cli.history_group.commands) == {"health", "captures", "series", "revisions"}
+    assert set(cli.history_group.commands) == {
+        "health", "captures", "series", "revisions", "connections", "day", "backfill"
+    }
 
 
 def test_cli_history_health_table_and_json(cli_db) -> None:

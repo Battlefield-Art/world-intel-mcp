@@ -800,8 +800,9 @@ async def test_escalation_flat_news_week_is_a_measured_zero(
     "place, reason",
     [
         (
+            # An error that already names reverse geocoding is not prefixed again.
             {"error": "Reverse geocoding unavailable: Nominatim down", "place": None},
-            "Reverse geocoding failed: Reverse geocoding unavailable: Nominatim down",
+            "Reverse geocoding unavailable: Nominatim down",
         ),
         (
             {"place": None, "terms": [], "note": _UNNAMED},
@@ -995,7 +996,7 @@ async def test_escalation_convergence_without_wildfires_and_no_cell_is_null(
     assert result["data_gaps"] == [
         "Wildfires: NASA_FIRMS_API_KEY not set",
         "Convergence: not scored; no convergent cell among earthquakes, "
-        "military_flights, conflict_events, but wildfires answered only partly "
+        "military flights, conflict events, but wildfires answered only partly "
         "or not at all, so quiet cannot be told from missing.",
     ]
     # conflict 1 x 0.5 = 0.5 of the 92 points measured:

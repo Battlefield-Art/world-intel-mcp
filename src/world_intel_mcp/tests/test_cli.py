@@ -138,12 +138,21 @@ def test_command_registry() -> None:
         "aoi",
         "news-reaction",
         "history",
+        "guide",
+        "liquidity",
+        "net-liquidity",
+        "money-supply",
+        "fed-liquidity",
+        "ecb-series",
+        "kalshi",
+        "prediction-compare",
+        "prediction-settled",
     } <= names
     # webcams_cmd has no explicit name=, but click >= 8.1 strips the
     # `_cmd` suffix when deriving default command names, so the
     # user-facing name still comes out right.
     assert "webcams" in names
-    assert len(names) == 58
+    assert len(names) == 72
 
 
 # ---------------------------------------------------------------------------
