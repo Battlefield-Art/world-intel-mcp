@@ -566,10 +566,9 @@ identifying User-Agent:
 
 Not exposed yet: CBP sector and field-office (area of responsibility) and
 by-state detail, and CBP years before FY2023 (robots-disallowed path).
-Open (shared fetcher): redirects are followed, and the download size caps
-apply only after the body is read; the fix is for both tools to request
-with `Fetcher.get_bytes(..., follow_redirects=False)` once the fetcher
-offers it.
+Both tools request with `Fetcher.get_bytes(..., follow_redirects=False)`
+and a per-request cap checked as the body streams in; a redirect or a body
+past its cap reads as a failed refresh that names the Location or the cap.
 
 ---
 
