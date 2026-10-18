@@ -71,8 +71,8 @@ only when the publisher documents UTC); a point with an unparseable date
 or a non-finite value is skipped and counted in the capture's
 ``extract_error``. Register at import time of your source module: the
 collector imports a source's module before it records that source's
-capture. A registered extractor that finds nothing in a non-error payload
-marks the capture ``degraded``; pass ``expected=N`` when a
+capture. A registered extractor that finds nothing in a non-error payload,
+or raises, marks the capture ``degraded``; pass ``expected=N`` when a
 complete payload yields N points (one per requested symbol), and a
 capture with fewer is ``degraded`` as partial.
 
@@ -365,7 +365,56 @@ def _extract_central_bank_rates(payload: dict) -> list[Observation]:
     return points
 
 
-def _quote_extractor(list_key: str, label_key: str, unit_key: str | None):
+# Exchange quotation units of the commodity futures the collector reads
+# (the commodity payload carries no currency). The currency half was
+# checked against Yahoo's chart meta on 2026-10-17 (USD for COMEX and
+# NYMEX, USX = US cents for the CBOT grains); the per-unit half is each
+# contract's quotation unit.
+COMMODITY_UNITS = {
+    "GC=F": "USD per troy ounce",
+    "SI=F": "USD per troy ounce",
+    "CL=F": "USD per barrel",
+    "BZ=F": "USD per barrel",
+    "NG=F": "USD per MMBtu",
+    "ZC=F": "US cents per bushel",
+    "ZW=F": "US cents per bushel",
+    "ZS=F": "US cents per bushel",
+}
+# Yahoo reports an index level with its constituents' currency; the level
+# itself is in index points, so the currency goes in the label.
+_INDEX_UNIT = "index points"
+
+
+def _market_quote_unit(quote: dict) -> str | None:
+    symbol = str(quote.get("symbol") or "")
+    if symbol in _DEFAULT_INDEX_SYMBOLS:
+        return _INDEX_UNIT
+    if symbol.startswith("^"):
+        return None  # a Yahoo index or rate whose unit this table does not know
+    return quote.get("currency")
+
+
+def _market_quote_label(quote: dict) -> str:
+    symbol = str(quote.get("symbol") or "")
+    currency = quote.get("currency")
+    if symbol in _DEFAULT_INDEX_SYMBOLS and isinstance(currency, str) and currency:
+        return f"{symbol} ({currency})"
+    return symbol
+
+
+def _commodity_unit(quote: dict) -> str | None:
+    return COMMODITY_UNITS.get(str(quote.get("symbol") or ""))
+
+
+def _commodity_label(quote: dict) -> str:
+    return quote.get("name") or str(quote.get("symbol") or "")
+
+
+def _quote_extractor(
+    list_key: str,
+    unit_of: Callable[[dict], str | None],
+    label_of: Callable[[dict], str],
+):
     def _extract(payload: dict) -> list[Observation]:
         """Yahoo quotes. The source module keeps price and change only, not
         the quote time, so observed_at is NULL (unknown), not collected_at."""
@@ -377,8 +426,7 @@ def _quote_extractor(list_key: str, label_key: str, unit_key: str | None):
                 continue
             points.append(
                 Observation(f"{symbol}:price", price, observed_at=None,
-                            unit=quote.get(unit_key) if unit_key else None,
-                            label=quote.get(label_key) or symbol)
+                            unit=unit_of(quote), label=label_of(quote) or symbol)
             )
         return points
 
@@ -387,11 +435,11 @@ def _quote_extractor(list_key: str, label_key: str, unit_key: str | None):
 
 # The collector runs both with their defaults: one point per symbol.
 register_extractor(
-    "market_quotes", _quote_extractor("quotes", "symbol", "currency"),
+    "market_quotes", _quote_extractor("quotes", _market_quote_unit, _market_quote_label),
     expected=len(_DEFAULT_INDEX_SYMBOLS),
 )
 register_extractor(
-    "commodity_quotes", _quote_extractor("commodities", "name", None),
+    "commodity_quotes", _quote_extractor("commodities", _commodity_unit, _commodity_label),
     expected=len(_COMMODITY_SYMBOLS),
 )
 
@@ -504,7 +552,8 @@ def classify(outcome: SourceOutcome) -> _Classified:
 
     ``error`` when the run produced no usable payload. ``degraded`` when it
     was a stale-cache replay, or live but marked degraded, empty, partial,
-    or without the measures its extractor expects. Otherwise ``ok``. A
+    without the measures its extractor expects, or its extractor raised
+    (the payload is kept; the error is the reason). Otherwise ``ok``. A
     stale-cache replay keeps its extracted count but no observations. The
     reason holds no per-run numbers for a replay (its copy age and fetch
     count are fields), so successive replays share one reason.
@@ -528,7 +577,9 @@ def classify(outcome: SourceOutcome) -> _Classified:
     ):
         notes.append("payload marked degraded")
     expected = _EXPECTED.get(outcome.source)
-    if count == 0:
+    if extract_error and extract_error.startswith(_RAISED):
+        notes.append(extract_error[:150])  # in full in extract_error
+    elif count == 0:
         notes.append(
             "payload has no records: a quiet period and a silent upstream "
             "failure look the same here"
@@ -1300,7 +1351,8 @@ class HistoryStore:
                 "ok": "last capture was live and complete: records, every upstream fetch "
                 "answered, no degradation marker",
                 "degraded": "last capture was live but degraded: marked degraded, empty, "
-                "partial (fewer series than expected), or its extractor found nothing",
+                "partial (fewer series than expected), or its extractor found nothing or "
+                "raised",
                 "stale": "last capture replayed an expired cached copy because an upstream "
                 "fetch failed; that is not a success, so overdue counts from the last live "
                 "capture",

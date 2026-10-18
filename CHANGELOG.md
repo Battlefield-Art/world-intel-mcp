@@ -21,7 +21,8 @@
   `_stale` marker. A replay's observations are counted but not stored: a
   stale replay is not a new observation. A live capture that is degraded
   for another reason (empty, partial, marked degraded) still stores the
-  points it has.
+  points it has. A capture whose extractor raised is degraded too, with
+  the error as its reason; its payload is kept.
 - Payload bodies are kept once per distinct payload as compressed JSON
   (top-level fetch-time stamps and the stale markers are ignored when
   hashing, so a fresh and a stale copy of the same data read unchanged).
@@ -45,7 +46,10 @@
   payload names a release time) and `collected_at`. Built-in extractors:
   NOAA Kp, USGS per-event magnitude, FRED-sourced central bank rates
   (curated rows are skipped), Yahoo index and commodity quotes (null
-  `observed_at`: the payload carries no quote time).
+  `observed_at`: the payload carries no quote time). An index level's unit
+  is `index points`, with the quote currency in its label (`^GSPC (USD)`);
+  a commodity future's unit is its exchange quotation unit (`USD per troy
+  ounce`, `US cents per bushel`).
   `history.register_extractor()` is the public API for new sources; its
   `expected=N` declares how many points a complete payload yields. The
   Yahoo quote sources declare one per default symbol, so a run where some

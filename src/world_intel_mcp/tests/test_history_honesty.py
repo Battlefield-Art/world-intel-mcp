@@ -1021,3 +1021,86 @@ def test_a_file_that_is_not_a_database_raises_and_leaks_no_connection(tmp_path, 
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         conn.execute("SELECT 1")
     assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
+
+
+# ---------------------------------------------------------------------------
+# M4: a raising extractor degrades the capture. L2: quote units.
+# ---------------------------------------------------------------------------
+
+
+def test_a_raising_extractor_degrades_the_capture_and_keeps_it(store, monkeypatch) -> None:
+    monkeypatch.setattr(history, "_EXTRACTORS", dict(history._EXTRACTORS))
+    monkeypatch.setattr(history, "_EXPECTED", dict(history._EXPECTED))
+    history.register_extractor("test_feed", lambda payload: payload["missing"])
+    _record(store, "test_feed", T0, {"rows": [1]})
+    (cap,) = store.capture_history("test_feed")["captures"]
+    assert cap["status"] == "degraded"
+    assert cap["reason"] == cap["extract_error"] == "extractor raised: KeyError: 'missing'"
+    assert (cap["record_count"], cap["observations_extracted"]) == (1, None)
+    replay = store.capture_history("test_feed", capture_id=cap["capture_id"])["capture"]
+    assert replay["payload"] == {"rows": [1]}
+    (row,) = store.collection_health(["test_feed"], now=T0)["sources"]
+    assert (row["state"], row["consecutive_failures"]) == ("degraded", 0)
+    assert (row["last_success_at"], row["last_ok_at"]) == (cap["collected_at"], None)
+    assert row["last_reason"] == row["last_extract_error"] == cap["reason"]
+
+    def _long(payload):
+        raise ValueError("x" * 300)
+
+    history.register_extractor("test_feed", _long, replace=True)
+    _record(store, "test_feed", T0 + 300, {"rows": [1]})
+    newest = store.capture_history("test_feed")["captures"][0]
+    assert newest["extract_error"] == "extractor raised: ValueError: " + "x" * 200
+    assert newest["reason"] == newest["extract_error"][:150]
+
+
+def test_a_raising_quote_extractor_is_not_called_partial(store, monkeypatch) -> None:
+    monkeypatch.setattr(history, "_EXTRACTORS", dict(history._EXTRACTORS))
+    monkeypatch.setattr(history, "_EXPECTED", dict(history._EXPECTED))
+
+    def _broken(payload):
+        raise TypeError("quotes moved")
+
+    history.register_extractor("market_quotes", _broken, replace=True, expected=7)
+    _record(store, "market_quotes", T0, _quotes(1.0, 2.0))
+    (cap,) = store.capture_history("market_quotes")["captures"]
+    assert (cap["status"], cap["reason"]) == ("degraded", "extractor raised: TypeError: quotes moved")
+
+
+def test_the_builtin_kp_extractor_raising_on_list_rows_degrades_the_capture(store) -> None:
+    """Upstream Kp rows that turn from objects into lists make the built-in
+    extractor raise; that capture is degraded, not a healthy ok."""
+    _record(store, "space_weather", T0, {"kp_recent": [["2026-10-16T21:00:00Z", 2.33]], "alerts": []})
+    (cap,) = store.capture_history("space_weather")["captures"]
+    assert (cap["status"], cap["reason"]) == (
+        "degraded", "extractor raised: AttributeError: 'list' object has no attribute 'get'"
+    )
+    assert (cap["extract_error"], cap["observations_extracted"]) == (cap["reason"], None)
+
+
+def test_quote_units_say_what_the_number_is() -> None:
+    assert set(history.COMMODITY_UNITS) == set(history._COMMODITY_SYMBOLS)
+    quotes = {"quotes": [
+        {"symbol": "^GSPC", "price": 6_123.5, "currency": "USD"},
+        {"symbol": "^N225", "price": 48_000.0, "currency": "JPY"},
+        {"symbol": "^HSI", "price": 26_000.0},
+        {"symbol": "^TNX", "price": 4.1, "currency": "USD"},
+        {"symbol": "AAPL", "price": 250.0, "currency": "USD"},
+    ]}
+    points = {p.series_key: (p.unit, p.label) for p in history._EXTRACTORS["market_quotes"](quotes)}
+    assert points == {
+        "^GSPC:price": ("index points", "^GSPC (USD)"),
+        "^N225:price": ("index points", "^N225 (JPY)"),
+        "^HSI:price": ("index points", "^HSI"),
+        "^TNX:price": (None, "^TNX"),
+        "AAPL:price": ("USD", "AAPL"),
+    }
+    commodities = {"commodities": [
+        {"symbol": "ZC=F", "name": "Corn", "price": 420.25},
+        {"symbol": "XX=F", "price": 1.0},
+    ]}
+    points = {
+        p.series_key: (p.unit, p.label)
+        for p in history._EXTRACTORS["commodity_quotes"](commodities)
+    }
+    assert points == {"ZC=F:price": ("US cents per bushel", "Corn"), "XX=F:price": (None, "XX=F")}
