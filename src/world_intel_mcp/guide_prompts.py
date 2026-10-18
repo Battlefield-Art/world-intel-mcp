@@ -715,9 +715,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "major cities within radius_km (default 200) of recent events. "
                 "It ignores the magnitude and hours above: it fetches its own "
                 "list of M4.5 and larger quakes from the last 48 hours, at most "
-                "50. Keep only the exposed_cities whose event_detail "
-                "(\"M<magnitude> <place>\") matches an event from step 1, and "
-                "check events_analyzed: 0 can mean its fetch failed",
+                "50, and names only the nearest of them for each city, so a "
+                "city's event_detail (\"M<magnitude> <place>\") can name a "
+                "smaller aftershock while a step-1 event is also within reach. "
+                "Before dropping a city, compare its lat and lon with each "
+                "step-1 event and keep it if any lies within radius_km; check "
+                "events_analyzed: 0 can mean its fetch failed",
                 args=(("event_types", ["earthquake"]),),
             ),
             Step(

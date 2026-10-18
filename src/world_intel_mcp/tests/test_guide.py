@@ -1931,3 +1931,22 @@ async def test_country_overview_says_the_dossier_elections_can_be_another_countr
     text = " ".join(_text("country-overview", {"country": "RUS"}).split())
     assert "keep only entries whose iso3 is RUS" in text
     assert "empty means the country is not covered" in text
+
+
+def test_earthquake_exposure_says_each_city_names_only_its_nearest_event() -> None:
+    """A smaller, nearer aftershock replaces the main shock in a city's
+    entry, so the step must not drop a city by event_detail alone."""
+    from world_intel_mcp.analysis.exposure import _find_exposed_cities
+
+    city = {"name": "Tokyo", "country": "Japan", "lat": 35.68, "lon": 139.69, "pop": 37_000_000}
+    events = [
+        {"type": "earthquake", "detail": "M6.5 100 km S of Tokyo", "lat": 34.78, "lon": 139.69},
+        {"type": "earthquake", "detail": "M4.7 50 km S of Tokyo", "lat": 35.23, "lon": 139.69},
+    ]
+    (entry,) = _find_exposed_cities(events, [city], 200.0)
+    assert entry["event_detail"].startswith("M4.7")
+    assert (entry["lat"], entry["lon"]) == (city["lat"], city["lon"])
+    text = " ".join(_text("earthquake-exposure").split())
+    assert "names only the nearest of them for each city" in text
+    assert "compare its lat and lon with each step-1 event" in text
+    assert "Keep only the exposed_cities whose event_detail" not in text

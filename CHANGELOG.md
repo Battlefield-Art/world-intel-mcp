@@ -392,6 +392,12 @@ source here, and no proxy is substituted for any of these measures.
 - country-overview now says the dossier's elections section reads the
   same hand-kept table: empty means not covered, and its match on part of
   a name can add another country's election (RUS gets Belarus's).
+- earthquake-exposure told the model to keep only the cities whose
+  `event_detail` names a step-1 quake, but `intel_population_exposure`
+  names only the nearest M4.5+ event per city, so a nearer aftershock
+  dropped a city that a large quake had reached. The step now says so
+  and to compare each city's position with every step-1 event before
+  dropping it. The code is unchanged.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
