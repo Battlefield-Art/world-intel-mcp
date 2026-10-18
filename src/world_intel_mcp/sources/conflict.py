@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from ..fetcher import Fetcher
+from .freshness import json_answer_freshness
 
 logger = logging.getLogger("world-intel-mcp.sources.conflict")
 
@@ -153,7 +154,10 @@ async def fetch_acled_events(
         limit: Maximum number of results.
 
     Returns:
-        Dict with events list, count, query params, source, and timestamp.
+        Dict with events list, count, query params, source, timestamp and
+        ``fetched_at`` (when ACLED answered; earlier than ``timestamp`` for
+        a cached answer). An expired cached copy served because ACLED did
+        not answer carries ``_stale`` and ``_stale_age_seconds``.
     """
     now = datetime.now(timezone.utc)
 
@@ -169,10 +173,13 @@ async def fetch_acled_events(
         params["country"] = country
 
     cache_country = country or "global"
+    # The limit is part of the key: a 15-event answer cached for one
+    # caller must not be served to another that asked for 100.
+    cache_key = f"conflict:acled:{cache_country}:{days}:{limit}"
     data = await acled_query(
         fetcher,
         params,
-        cache_key=f"conflict:acled:{cache_country}:{days}",
+        cache_key=cache_key,
         cache_ttl=900,
     )
     if data is None:
@@ -239,6 +246,7 @@ async def fetch_acled_events(
         "query": {"country": country, "days": days},
         "source": "acled",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **json_answer_freshness(fetcher, cache_key, data),
     }
 
 

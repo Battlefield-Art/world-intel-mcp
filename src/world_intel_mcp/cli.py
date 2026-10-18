@@ -2541,16 +2541,36 @@ def aoi_escalation(ctx: click.Context, name: str) -> None:
     )
     console.print(
         f"[bold]{escape(str(a.get('name', name)))}[/bold] escalation: "
-        f"{data.get('score', 0)}/100 ({level_str}, "
+        f"{data.get('score', 0)} on a 0-100 scale ({level_str}, "
         f"trend {escape(str(data.get('trend_signal', '')))})"
     )
+    if data.get("score_ceiling") is not None:
+        console.print(
+            f"[dim]Highest score reachable with the components measured: "
+            f"{data['score_ceiling']} (an AOI has no curated baseline)[/dim]"
+        )
+    if data.get("computed_from"):
+        console.print(
+            "[dim]Computed from: "
+            f"{escape(', '.join(str(c) for c in data['computed_from']))}[/dim]"
+        )
 
+    # A zero-filled component is a 0 only because its fetch failed; a
+    # lower bound could only rise with the data that is missing.
+    zero_filled = set(data.get("zero_filled_components") or [])
+    lower_bound = set(data.get("lower_bound_components") or [])
     table = Table(title="Components", box=box.SIMPLE_HEAVY)
     table.add_column("Component", style="bold")
     table.add_column("Points", justify="right")
     for comp, points in data.get("components", {}).items():
         if points is None:
             table.add_row(_cell(comp), "[dim]not measured[/dim]")
+        elif comp in zero_filled:
+            table.add_row(
+                _cell(comp), "[yellow]not measured (fetch failed; scored as 0)[/yellow]"
+            )
+        elif comp in lower_bound:
+            table.add_row(_cell(comp), f"{points:.1f} (lower bound)")
         else:
             table.add_row(_cell(comp), f"{points:.1f}")
     console.print(table)

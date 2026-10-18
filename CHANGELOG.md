@@ -5,39 +5,87 @@
 ### Added: AOI escalation news and convergence components
 - `intel_aoi_escalation` now scores the news and convergence components it
   used to report as null (ROADMAP Phase 23).
-- News: the rise in the area's share of all GDELT coverage over the last 7
-  days against the 7 days before, for the reverse-geocoded settlement and
-  county (the query the AOI brief already uses, sent as `timelinevolraw`).
-  Expected articles = prior share x current GDELT volume; change_pct =
-  100 x (current - expected) / max(expected, 20); component =
-  min(20, 0.2 x max(0, change_pct)). Shares rather than raw counts because
-  GDELT's own intake has multi-day outages (measured 2026-10-17 for
-  Pittsburgh: no data for 16 of 85 days), which raw counts would read as a
-  surge on recovery; a comparison where one week monitored under half the
-  other's volume is refused as a data gap. An area that cannot be
-  geocoded is not scored, rather than searched by the AOI's name.
+- News: the change in the area's share of all GDELT coverage, the 7 days
+  ending with GDELT's current daily step (still filling;
+  `current_step_elapsed` says how far) against the 7 days before, for the
+  reverse-geocoded settlement and county at the AOI's centre (the query
+  the AOI brief already uses, sent as `timelinevolraw`). Expected articles
+  = prior share x current GDELT volume; change_pct = 100 x (current -
+  expected) / max(expected, 20); component = min(20, 0.2 x max(0,
+  change_pct)). Shares rather than raw counts because GDELT's own intake
+  has multi-day outages (measured 2026-10-17 for Pittsburgh: no data for
+  16 of 85 days), which raw counts would read as a surge on recovery; a
+  comparison where one week monitored under half the other's volume is
+  refused as a data gap. An area that cannot be geocoded is not scored,
+  rather than searched by the AOI's name. An AOI reaching more than 50 km
+  from its centre, or a polygon or corridor whose centre cannot be
+  placed, gets a data gap saying the query covers only the centre's place.
 - Convergence: `analysis/convergence.py`, unmodified, over the
   earthquakes, military flights, ACLED events and wildfires inside the
   AOI's exact shape (circle, polygon or corridor, through the same
-  `filter_by_aoi` scoping as the brief). With an input missing, a
-  convergent cell is reported as a lower bound; no cell at all is null,
-  because quiet cannot be told from missing.
+  `filter_by_aoi` scoping as the brief). The 1-degree grid is laid at four
+  half-degree offsets and the strongest cell is used, so a cluster
+  spanning under half a degree in latitude and in longitude is never
+  split on a degree line (one spanning 0.5 to 1 degree still can be).
+  With an input failed or partial, a convergent cell is reported as a
+  lower bound; no cell at all is null, because quiet cannot be told from
+  missing.
+- An input that did not answer counts as missing, never as quiet: a USGS
+  or FIRMS outage, a military answer from neither adsb.lol nor OpenSky
+  (`source: "none"`), and an expired cached copy served in place of a
+  fresh answer (USGS, ACLED, GDELT, FIRMS), which is refused with the
+  copy's age named in `data_gaps`. A global sample that reached its cap
+  (USGS newest 50, ACLED 100 worldwide, FIRMS 20 largest clusters per
+  region) counts as partial coverage.
 - New response keys; existing keys keep their meaning. `computed_from`
-  names the components the score was computed from, and
+  names the components the score was computed from,
   `zero_filled_components` the ones among them that are a 0 only because
   the military or ACLED fetch failed (`score_hotspot` takes no null for
-  those, unchanged); `news_signal` (query, both windows' counts and
-  shares, change), `news_scoping` and `convergence_signal` (cells, events
-  per domain, inputs used, failed or partial) carry the working. A failed
-  news or convergence input makes that component null in `components`,
-  listed in `unavailable_components` and explained in `data_gaps`, never
-  a 0.
+  those, unchanged), and `lower_bound_components` the ones partial data
+  can only have understated. An AOI has no curated baseline, so the score
+  tops out at 80; `score_ceiling` is the highest score reachable with the
+  components this call measured (a zero-filled one held at 0) and
+  `score_method` the formula.
+  `news_signal` (query, fetch time, both windows' counts and shares,
+  change), `news_scoping` and `convergence_signal` (cells, grid offset,
+  events per domain, inputs used, failed or partial, each domain's window
+  and fetch time) carry the working. A failed news or convergence input
+  makes that component null in `components`, listed in
+  `unavailable_components` and explained in `data_gaps`, never a 0.
+
+### Fixed
+- `fetch_earthquakes` and `fetch_wildfires` mark a failed fetch (`error`,
+  `degraded`, `reason`; per region for FIRMS, with `failed_regions` and,
+  when other regions answered, `partial_errors`) instead of answering a
+  well-formed empty. Their list keys stay, so callers that do not check
+  still iterate an empty list.
+- `fetch_earthquakes`, `fetch_wildfires` (per region), `fetch_acled_events`
+  and `fetch_gdelt_search` keep the fetcher's `_stale` /
+  `_stale_age_seconds` marks on an expired cached copy and report
+  `fetched_at`, when upstream answered: a cached answer reports its
+  original fetch, not the time it was served.
+- `fetch_gdelt_search`'s cache key holds a digest of every request
+  parameter. The old key reduced a non-Latin query to underscores, so
+  "Київ" and "Суми" shared one entry and one AOI was scored on the other's
+  timeline. The USGS and ACLED keys now hold the result limit, so a short
+  answer cached for one caller is not served to another as complete.
+- The FIRMS docstring states what the request asks for: a day range of 2
+  (FIRMS's two most recent days), not the last 24 hours.
+- A reverse-geocoding failure no longer repeats its prefix ("Reverse
+  geocoding failed: Reverse geocoding unavailable: ...").
 
 ### Changed
 - The escalation also fetches earthquakes and wildfires (convergence
   inputs) and one GDELT timeline, in parallel with ACLED and military
   flights; their failures are named in `data_gaps`. The brief, the change
-  sweep and the escalation now share one AOI scoping helper.
+  sweep and the escalation now share one AOI scoping helper, which reads
+  an answer without its list (an unrecognized shape) as unknown rather
+  than as an empty area, and names a failed FIRMS region next to answered
+  ones. The brief's aviation section reads a `sampled` list the
+  domestic-flights source does not return, so it now reports that as a
+  data gap where it used to show 0 aircraft.
+- `intel aoi escalation` prints a zero-filled component as not measured,
+  marks lower bounds, and shows the score ceiling and `computed_from`.
 - `test_aoi.py` stubs every network-bound source by default: its older
   escalation tests stub only ACLED and military flights and would
   otherwise reach Nominatim, GDELT, USGS and FIRMS live.

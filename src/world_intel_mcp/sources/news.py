@@ -6,12 +6,15 @@ search via the GDELT 2.0 Doc API. No API keys required.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import string
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from .freshness import json_answer_freshness
 
 try:
     import feedparser
@@ -729,6 +732,20 @@ async def fetch_trending_keywords(
 # ---------------------------------------------------------------------------
 
 
+def _gdelt_cache_key(params: dict) -> str:
+    """Cache key for one GDELT request: a readable prefix plus a digest of
+    every request parameter. The prefix alone (the query reduced to ASCII
+    letters, digits, ``_`` and ``-``, cut to 64 characters) maps different
+    non-Latin queries to one string ("Київ" and "Суми" both become
+    ``______``) and leaves out ``maxrecords``, so one search was answered
+    from another's cache entry."""
+    safe_query = re.sub(r"[^a-zA-Z0-9_-]", "_", str(params["query"]))[:64]
+    digest = hashlib.sha256(
+        json.dumps(params, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"news:gdelt:{safe_query}:{params['mode']}:{digest}"
+
+
 async def fetch_gdelt_search(
     fetcher: Fetcher,
     query: str = "conflict",
@@ -748,7 +765,10 @@ async def fetch_gdelt_search(
 
     Returns:
         Dict with articles/timeline data, count, query info, source,
-        and timestamp.
+        timestamp and ``fetched_at`` (when GDELT answered; earlier than
+        ``timestamp`` for a cached answer). An expired cached copy served
+        because GDELT did not answer carries ``_stale`` and
+        ``_stale_age_seconds``.
     """
     now = datetime.now(timezone.utc)
 
@@ -759,11 +779,11 @@ async def fetch_gdelt_search(
         "format": "json",
     }
 
-    safe_query = re.sub(r"[^a-zA-Z0-9_-]", "_", query)[:64]
+    cache_key = _gdelt_cache_key(params)
     data = await fetcher.get_json(
         _GDELT_DOC_URL,
         source="gdelt",
-        cache_key=f"news:gdelt:{safe_query}:{mode}",
+        cache_key=cache_key,
         cache_ttl=600,
         params=params,
         timeout=GDELT_TIMEOUT,
@@ -812,6 +832,7 @@ async def fetch_gdelt_search(
             "mode": mode,
             "source": "gdelt",
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **json_answer_freshness(fetcher, cache_key, data),
         }
 
     # timelinevol mode — return timeline data as-is
@@ -823,4 +844,5 @@ async def fetch_gdelt_search(
         "mode": mode,
         "source": "gdelt",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **json_answer_freshness(fetcher, cache_key, data),
     }
