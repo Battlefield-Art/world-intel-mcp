@@ -2941,13 +2941,25 @@ function updateDrawer(data) {
     }
 
     // ── TRENDS ──
-    if (data.weekly_trends && !data.weekly_trends.error) {
+    // A count the analysis could not compute arrives as null, and a failed
+    // fetch carries none: show those as a dim '?', never as 0, and list the
+    // error and every data gap.
+    if (data.weekly_trends) {
         var wt = data.weekly_trends;
+        var wtCount = function(n) { return typeof n === 'number' ? String(n) : '<span class="dim">?</span>'; };
         h += '<div class="sh">TRENDS</div>';
         h += '<div class="mini-row">';
-        h += '<div class="mini-box"><div class="v">' + (wt.trend_count || 0) + '</div><div class="l">Metrics</div></div>';
-        h += '<div class="mini-box"><div class="v' + ((wt.current_anomaly_count || 0) > 0 ? ' warn' : '') + '">' + (wt.current_anomaly_count || 0) + '</div><div class="l">Anomalies</div></div>';
+        h += '<div class="mini-box"><div class="v">' + wtCount(wt.trend_count) + '</div><div class="l">Metrics</div></div>';
+        h += '<div class="mini-box"><div class="v' + (wt.current_anomaly_count > 0 ? ' warn' : '') + '">' + wtCount(wt.current_anomaly_count) + '</div><div class="l">Anomalies</div></div>';
         h += '</div>';
+        var wtGaps = (wt.error ? [wt.error] : []).concat(Array.isArray(wt.data_gaps) ? wt.data_gaps : []);
+        if (wtGaps.length) {
+            h += '<div class="sub">Data Gaps</div><table class="dtable"><tbody>';
+            wtGaps.forEach(function(g) {
+                h += '<tr><td class="warn">' + esc(String(g)) + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
         var anomalies = wt.current_anomalies || [];
         if (anomalies.length) {
             h += '<div class="sub">Active Anomalies</div><table class="dtable"><thead><tr><th>Metric</th><th>Region</th><th>Dev</th></tr></thead><tbody>';

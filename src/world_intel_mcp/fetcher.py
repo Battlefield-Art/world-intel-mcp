@@ -289,6 +289,7 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         max_bytes: int = 256 * 1024 * 1024,
+        *,
         accept_404: Callable[[bytes], bool] | None = None,
     ) -> BinaryResult:
         """Fetch a binary body with rate limiting, retries and circuit breaking.

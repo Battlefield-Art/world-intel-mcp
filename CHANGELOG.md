@@ -37,12 +37,48 @@
 - Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
   the cache: `$XDG_CACHE_HOME/world-intel-mcp/temporal.db` and
   `$XDG_CACHE_HOME/world-intel-mcp/keyword_spikes.db`. With it unset, they
-  remain in `~/.cache/world-intel-mcp/`. Users who set `XDG_CACHE_HOME`
-  can keep existing baselines by moving these two files from
-  `~/.cache/world-intel-mcp/` to `$XDG_CACHE_HOME/world-intel-mcp/`.
-  Importing the package no longer opens databases; they open on first use.
+  remain in `~/.cache/world-intel-mcp/`. Existing baselines are not moved:
+  with `XDG_CACHE_HOME` set, the two files already in
+  `~/.cache/world-intel-mcp/` stay there unread and new, empty baselines
+  start under `$XDG_CACHE_HOME/world-intel-mcp/`. To keep their history,
+  move both files there yourself before the next run. Nothing points at
+  the old files at runtime; `intel_weekly_trends` reports the new baseline
+  as created by that call, then as short of history.
+- The cache's default path (`~/.cache/world-intel-mcp/cache.db` when
+  neither `WORLD_INTEL_CACHE_DB` nor `XDG_CACHE_HOME` is set) is resolved
+  when the cache opens, not at import, so it agrees with the baselines if
+  `HOME` changes in between.
+- When the cache cannot open at its configured or default path, it now
+  falls back to a per-user directory, `world-intel-mcp-<uid>` under the
+  system temp directory, created with mode 0700, instead of a shared
+  `world-intel-mcp` directory there. It refuses that directory with an
+  error naming the reason if it is a symlink or not a directory, is owned
+  by another user, gives group or other users access, or holds a symlink
+  at `cache.db` or its `-wal`, `-shm` or `-journal` file. A fallback cache
+  left in the old shared directory is not read or moved. On Windows the
+  fallback keeps its old name and is not checked.
+- Importing the package no longer opens databases. The shared cache,
+  circuit breaker, AOI store, vector store and fetcher behind the MCP
+  tools are built on first use, under a lock, as one set: concurrent first
+  uses get the same objects, and a first use that fails binds nothing and
+  closes the databases it had opened, so the next use starts over.
+- `intel_weekly_trends` no longer reports a failed input as zero. When the
+  baseline database is missing or unreadable, `trend_count` is `null` and
+  `error` says why; when anomaly detection fails, `current_anomaly_count`
+  is `null`. A new `data_gaps` list names each failed input, carries
+  anomaly detection's own gaps, and flags a baseline created by the same
+  call or with no metric at the 5 observations volatility needs. Reading
+  the baselines no longer creates an empty database file.
+- The dashboard's Trends panel shows a count that could not be computed as
+  a dimmed `?` instead of 0, stays visible when weekly trends report an
+  error or time out, and lists the error and every data gap.
 - Apply per-source request spacing to every HTTP retry, including JSON,
   text, XML and binary fetches.
+- Known open: each retry now waits out its source's spacing and the
+  breaker is still checked only before the first attempt, so a full outage
+  of a rate-limited source takes longer than before to fall back to its
+  stale copy. The registry tests' temp-cache premise still depends on test
+  order.
 
 ### Fixed: database handles close on every exit path
 - The collector (`run_once` and the daemon), standalone report generation
@@ -54,6 +90,16 @@
   unclosed connection's ResourceWarning kept it alive) and failed at the
   default 1,024 open-file limit. Test runs also no longer leave
   `wim-server-test-*` directories in the system temp directory.
+
+### Fixed: the collector cycle summary separates data from errors
+- A source that answers with an upstream error (`{"error": ...}`) still
+  counts as a completed fetch, but the cycle summary now lists it under
+  `upstream_errors`, and `intel-collector` prints how many of the
+  "succeeded" sources stored nothing. Before, such a cycle read as data
+  collected.
+- A stale cache copy (`_stale`) is no longer stored in the vector store as
+  if it were collected this cycle; the summary lists it under
+  `stale_not_stored`.
 
 ### Added: liquidity and money (Phase 29)
 Keyless sources only: the FRED graph CSV (`fred.stlouisfed.org/graph/fredgraph.csv`,
@@ -106,21 +152,25 @@ responses say so. `limit=0` returns the full history.
   `fetch_failure`, and name the failure in `data_gaps`: the HTTP status, no
   response, an open circuit or an unexpected payload. Each stale copy served
   counts in the circuit breaker's `total_stale_serves` (`intel_status`), and none
-  is re-cached as fresh. Only parsed bodies enter the cache. An ECB 404 whose
-  body is empty or a JSON object (the portal's problem answer) is a final
-  no-data answer, without outage retries; any other 404, such as an HTML or
-  plain-text error page, is retried, counted as a breaker failure and takes the
-  outage path. An empty ECB response is one only when a start was requested;
+  is re-cached as fresh. Only parsed bodies enter the cache. An ECB 404 is a
+  final no-data answer, without outage retries, only when its body is the
+  portal's JSON problem answer whose detail starts "No Series was returned for
+  the query"; any other 404, an empty body or an HTML or plain-text error page
+  included, is retried, counted as a breaker failure and takes the outage path.
+  An empty ECB response is one only when a start was requested;
   without one it is an unexpected payload and takes the outage path, as does
-  JSON that is not an object.
+  JSON that is not an object. An observation value that is not a finite number
+  makes the response a parse error.
   Missing ECB roles and board rows are named; index bases, provisional status
   and percentage-point change units are retained. ECB keys must specify every
-  dimension and request at most 50 series combinations.
+  dimension, request at most 50 series combinations and be at most 200
+  characters long. An ECB start after today (UTC) is refused before any
+  request, so a caller's input is never counted as a source failure.
 - CLI: `intel liquidity`, `intel net-liquidity`, `intel money-supply`,
   `intel fed-liquidity`, `intel ecb-series`. Collector: `liquidity_board` and
   `net_liquidity` (group `liquidity`). `intel liquidity` prints the ranking
-  rule and each row's status; a terminal too narrow for the table gets one
-  entry per indicator instead, so no value, date or unit is cut.
+  rule of the chosen sort and each row's status; a terminal too narrow for the
+  table gets one entry per indicator instead, so no value, date or unit is cut.
 - Live reading 2026-10-17: net liquidity for Wednesday 2026-10-14 was
   USD 5,869.615 billion (WALCL 6,755,639 million, WDTGAL 885,823 million,
   RRPONTSYD 0.201 billion, all observed 2026-10-14).

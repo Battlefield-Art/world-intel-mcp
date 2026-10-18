@@ -270,7 +270,11 @@ async def collect_once(
 ) -> dict:
     """Run one collection cycle across all sources.
 
-    Returns dict with counts of successes, failures, and skipped.
+    Returns dict with counts of successes and failures. A fetch that
+    completed counts as a success even when its payload carries an upstream
+    error; those are also listed in ``upstream_errors`` and are not stored.
+    Stale cache copies (``_stale``) are listed in ``stale_not_stored`` and
+    are not stored in the vector store as this cycle's data.
     """
     start = time.time()
     sources_to_run = [
@@ -301,6 +305,8 @@ async def collect_once(
     successes = 0
     failures = 0
     errors = []
+    upstream_errors = []
+    stale_not_stored = []
     outcomes = []
 
     for (source_name, _, _, _), item in zip(sources_to_run, results):
@@ -328,11 +334,21 @@ async def collect_once(
             errors.append(f"{name}: {error}")
             logger.warning("Collect %s failed: %s", name, error)
         elif data is not None:
+            # A completed fetch counts as a success even when its payload
+            # carries an upstream error; that error is listed separately so
+            # the summary never reads it as data collected.
             successes += 1
-            # The fetcher already stores in vector_store via its hook,
-            # but for sources that return composite data (analysis modules),
-            # we also store the high-level result directly.
-            if not isinstance(data, dict) or not data.get("error"):
+            if isinstance(data, dict) and data.get("error"):
+                upstream_errors.append(f"{name}: {str(data['error'])[:100]}")
+                logger.warning("Collect %s returned an upstream error: %s", name, data["error"])
+            elif isinstance(data, dict) and data.get("_stale"):
+                # A stale cache copy is old data; storing it again would
+                # file it in the vector store as if collected this cycle.
+                stale_not_stored.append(name)
+            else:
+                # The fetcher already stores in vector_store via its hook,
+                # but for sources that return composite data (analysis modules),
+                # we also store the high-level result directly.
                 await vector_store.store(name, data)
         else:
             failures += 1
@@ -348,6 +364,8 @@ async def collect_once(
         "successes": successes,
         "failures": failures,
         "errors": errors[:10],
+        "upstream_errors": upstream_errors,
+        "stale_not_stored": stale_not_stored,
         "vector_store_points": stats.get("points_count", 0),
         "history": history,
     }
@@ -474,9 +492,14 @@ def main():
     else:
         summary = asyncio.run(run_once(source_filter=args.sources))
         print("Collection complete:")
-        print(
-            f"  Sources: {summary['successes']}/{summary['sources_attempted']} succeeded"
-        )
+        upstream = summary.get("upstream_errors") or []
+        line = f"  Sources: {summary['successes']}/{summary['sources_attempted']} succeeded"
+        if upstream:
+            line += f"; {len(upstream)} of them returned an upstream error and stored nothing"
+        print(line)
+        stale = summary.get("stale_not_stored") or []
+        if stale:
+            print(f"  Stale copies, not stored as new ({len(stale)}): {', '.join(sorted(stale))}")
         print(f"  Time: {summary['cycle_time_s']}s")
         print(f"  Vector store: {summary['vector_store_points']} points")
         history = summary.get("history") or {}
@@ -493,6 +516,10 @@ def main():
         if summary["errors"]:
             print(f"  Errors ({len(summary['errors'])}):")
             for e in summary["errors"]:
+                print(f"    - {e}")
+        if upstream:
+            print(f"  Upstream errors ({len(upstream)}):")
+            for e in upstream:
                 print(f"    - {e}")
         sys.exit(0 if summary["failures"] == 0 else 1)
 

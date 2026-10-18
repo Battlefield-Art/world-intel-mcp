@@ -68,7 +68,10 @@ async def test_collector_closes_cache(tmp_path, monkeypatch, fail):
 
 
 async def test_weekly_trends_closes_database_on_query_error(tmp_path, monkeypatch):
+    # An empty file is a database with no baselines table, so the read opens
+    # a connection and its query fails (a missing file is never opened).
     path = tmp_path / "no-baselines.db"
+    path.write_bytes(b"")
     monkeypatch.setattr(temporal, "_default_db_path", lambda: path)
     opened = []
     connect = sqlite3.connect
