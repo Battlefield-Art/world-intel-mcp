@@ -1065,9 +1065,11 @@ source here, and no proxy is substituted for any of these measures.
   paths it disallows are never requested; a newer-looking CBP file at such
   a path is named in `data_gaps` instead, as is any encounters link the
   tool cannot read (including names with "_" or a space after
-  "nationwide"). Redirects are followed, and the
-  download size caps apply after the body is read, both in the shared
-  fetcher (see the module's gaps).
+  "nationwide"). No redirect is followed: a 3xx from any of the four
+  requests reads as a failed refresh naming its Location (degraded, or the
+  last good copy marked stale), never as data. Downloads stop as soon as
+  the decoded body passes its cap (CBP page 2 MiB, CBP CSV 32 MiB, GOV.UK
+  Content API 2 MiB, Home Office ODS 8 MiB), and the refusal names the cap.
 - Frontex is not built: its only data file is an XLSX under `/assets/`,
   which its robots.txt disallows (measured 2026-10-17, see ROADMAP Phase 28).
 - Tools 139 -> 141.

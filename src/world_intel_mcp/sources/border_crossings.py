@@ -54,17 +54,21 @@ Gaps / not covered:
   2026-10-17 their figures matched the ODS).
 * robots.txt is not re-read at run time; the CBP path rule is pinned as read on
   2026-10-17.
-* Redirects: the shared fetcher follows them, and only the first URL is
-  checked against the host, scheme and robots.txt rules, so a redirect could
-  reach a path those rules refuse and the response would name the first URL.
-  Download caps are checked after the whole decoded body is in memory. Both
-  are fetcher behaviour and are left to the fetcher.
+* Redirects are never followed: a redirect's target was not checked against
+  the host, scheme and robots.txt rules, so a 3xx from any of the four
+  requests reads as a failed refresh naming its Location (degraded, or the
+  last good copy marked stale), never as data. A publisher that moves a file
+  behind a redirect therefore reads as an outage until the module follows it.
+* Download caps, checked as the body streams in (decoded size): CBP dataset
+  page 2 MiB (123 kB on 2026-10-17), CBP CSV 32 MiB (6.7 MB), GOV.UK Content
+  API item 2 MiB (133 kB), Home Office ODS 8 MiB (77 kB). A body past its cap
+  reads as a failed refresh naming the cap.
 * Memory, measured 2026-10-17 (peak RSS growth): the ODS limits bound what the
   reader keeps and what expat holds, but zipfile reads the whole central
   directory when it opens an archive (400,000 empty entries, a 35 MB file:
-  about 230 MB), bounded only by the 32 MiB download cap. The CBP CSV is parsed
+  about 230 MB), bounded only by the 8 MiB download cap. The CBP CSV is parsed
   whole: a crafted 64 MiB file with every row a new citizenship took about
-  470 MB (the live 6.7 MB file about 21 MB).
+  470 MB (the live 6.7 MB file about 21 MB); the cap is now 32 MiB.
 * Neither file has a person identifier, so neither series counts unique
   people; the responses say so as a tool note, not in the publishers' words.
 """
@@ -132,6 +136,22 @@ def _why(result: BinaryResult) -> str:
     if result.error:
         return result.error
     return f"HTTP {result.status}" if result.status is not None else "no response"
+
+
+_STOPPED_AFTER = re.compile(r"stopped after (\d+) decoded bytes")
+
+
+def _no_body(what: str, result: BinaryResult, cap: int) -> str:
+    """Why a download gave no body, said for data_gaps. A redirect names its target, which was
+    never requested; a body past the cap names the cap. Neither is ever read as data."""
+    if result.location is not None:
+        return (f"{what} redirects to {_shown(result.location)} (HTTP {result.status}); redirects are not "
+                "followed, since their target is not checked against the host and robots.txt rules")
+    stopped = _STOPPED_AFTER.search(result.error or "")
+    if result.content is None and result.status is not None and 200 <= result.status < 300 and stopped:
+        return (f"{what} is larger than this tool's {cap >> 20} MiB cap (stopped after {int(stopped[1]):,} "
+                "bytes); refused")
+    return f"{what} unavailable: {_why(result)}"
 
 
 def _pct(current: int | None, prior: int | None) -> float | None:
@@ -231,8 +251,9 @@ CBP_STATS_PAGE = "https://www.cbp.gov/newsroom/stats/nationwide-encounters"
 CBP_CACHE_KEY = "border_crossings:cbp_encounters"
 _CBP_SCHEMA = 2  # 2: unreadable-byte rows and skipped links are recorded
 _CBP_TTL = 43200  # 12 h; CBP posts one file a month
-_CBP_PAGE_MAX_BYTES = 8 * 1024 * 1024
-_CBP_CSV_MAX_BYTES = 64 * 1024 * 1024  # the August 2026 file is 6.7 MB
+# Download caps (decoded bytes, whole MiB): each at least 4x the 17 October 2026 payload.
+_CBP_PAGE_MAX_BYTES = 2 * 1024 * 1024  # the dataset page was 123 kB
+_CBP_CSV_MAX_BYTES = 32 * 1024 * 1024  # the August 2026 file is 6.7 MB, one year more is about 8.4 MB
 _CBP_HOST = "www.cbp.gov"
 # https://www.cbp.gov/robots.txt, read 2026-10-17: "#Disallow the files/assets/documents directory".
 _CBP_DISALLOWED_PREFIXES = ("/sites/default/files/assets/documents/",)
@@ -688,10 +709,10 @@ def cbp_page_last_modified(html: str) -> str | None:
 
 async def _fetch_cbp_dataset(fetcher: Fetcher) -> dict[str, Any]:
     page_result = await fetcher.get_bytes(
-        CBP_DATASET_PAGE, CBP_SOURCE, headers=_HEADERS, max_bytes=_CBP_PAGE_MAX_BYTES
+        CBP_DATASET_PAGE, CBP_SOURCE, headers=_HEADERS, max_bytes=_CBP_PAGE_MAX_BYTES, follow_redirects=False
     )
     if page_result.content is None:
-        raise _SourceError("cbp_fetch_failed", f"CBP dataset page unavailable: {_why(page_result)}")
+        raise _SourceError("cbp_fetch_failed", _no_body("CBP dataset page", page_result, _CBP_PAGE_MAX_BYTES))
     try:
         page = _parse_page(page_result.content.decode("utf-8", errors="replace"))
         latest, skipped, text = _latest_file(page), _skipped_links(page), _page_text(page)
@@ -706,9 +727,11 @@ async def _fetch_cbp_dataset(fetcher: Fetcher) -> dict[str, Any]:
             "robots.txt allows" + (f"; links it has that this tool cannot read: {', '.join(skipped[:5])}"
                                    if skipped else ""),
         )
-    csv_result = await fetcher.get_bytes(latest["url"], CBP_SOURCE, headers=_HEADERS, max_bytes=_CBP_CSV_MAX_BYTES)
+    csv_result = await fetcher.get_bytes(
+        latest["url"], CBP_SOURCE, headers=_HEADERS, max_bytes=_CBP_CSV_MAX_BYTES, follow_redirects=False
+    )
     if csv_result.content is None:
-        raise _SourceError("cbp_fetch_failed", f"CBP encounters file unavailable: {_why(csv_result)}")
+        raise _SourceError("cbp_fetch_failed", _no_body("CBP encounters file", csv_result, _CBP_CSV_MAX_BYTES))
     try:
         # A byte that is not UTF-8 becomes U+FFFD, which parse_cbp_csv counts per row instead of
         # failing the file over it.
@@ -953,8 +976,8 @@ UK_CONTENT_API = "https://www.gov.uk/api/content" + UK_PUBLICATION_PATH
 UK_CACHE_KEY = "border_crossings:uk_small_boats"
 _UK_SCHEMA = 2  # 2: rows dated outside the series window are left out (an older copy may hold them)
 _UK_TTL = 10800  # 3 h; its change history shows 72 updates from 1 August to 16 October 2026
-_UK_API_MAX_BYTES = 8 * 1024 * 1024
-_UK_ODS_MAX_BYTES = 32 * 1024 * 1024  # the 16 October 2026 file is 76,787 bytes
+_UK_API_MAX_BYTES = 2 * 1024 * 1024  # the Content API item was 133 kB
+_UK_ODS_MAX_BYTES = 8 * 1024 * 1024  # the 16 October 2026 file is 76,787 bytes
 _UK_FILE_HOSTS = {"assets.publishing.service.gov.uk", "www.gov.uk"}
 _UK_GOV_UK_FILES = "/government/uploads/"  # the only www.gov.uk path read: robots.txt disallows others
 _UK_FIRST_DAY = date(2018, 1, 1)  # SB_01 starts on 1 January 2018
@@ -1571,10 +1594,11 @@ def _uk_attachment(item: Any) -> dict[str, Any]:
 
 async def _fetch_uk_dataset(fetcher: Fetcher) -> dict[str, Any]:
     api = await fetcher.get_bytes(
-        UK_CONTENT_API, UK_SOURCE, headers={**_HEADERS, "Accept": "application/json"}, max_bytes=_UK_API_MAX_BYTES
+        UK_CONTENT_API, UK_SOURCE, headers={**_HEADERS, "Accept": "application/json"}, max_bytes=_UK_API_MAX_BYTES,
+        follow_redirects=False,
     )
     if api.content is None:
-        raise _SourceError("uk_fetch_failed", f"GOV.UK Content API unavailable: {_why(api)}")
+        raise _SourceError("uk_fetch_failed", _no_body("GOV.UK Content API", api, _UK_API_MAX_BYTES))
     try:
         item = json.loads(api.content)
     except MemoryError:
@@ -1586,9 +1610,11 @@ async def _fetch_uk_dataset(fetcher: Fetcher) -> dict[str, Any]:
     if history is not None and not isinstance(history, list):
         raise _SourceError("uk_unexpected_format", "GOV.UK Content API response not readable: its change_history "
                            f"is not a list ({type(history).__name__})")
-    ods = await fetcher.get_bytes(attachment["url"], UK_SOURCE, headers=_HEADERS, max_bytes=_UK_ODS_MAX_BYTES)
+    ods = await fetcher.get_bytes(
+        attachment["url"], UK_SOURCE, headers=_HEADERS, max_bytes=_UK_ODS_MAX_BYTES, follow_redirects=False
+    )
     if ods.content is None:
-        raise _SourceError("uk_fetch_failed", f"Home Office time series unavailable: {_why(ods)}")
+        raise _SourceError("uk_fetch_failed", _no_body("Home Office time series", ods, _UK_ODS_MAX_BYTES))
     try:
         tables = read_ods_tables(ods.content, _UK_SHEETS)
         if not {"SB_01", "SB_02"} <= tables.keys():
