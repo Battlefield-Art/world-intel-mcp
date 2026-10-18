@@ -3510,6 +3510,26 @@ def _with_history_store(fn: Any) -> dict:
         store.close()
 
 
+def _reason_text(reason: str | None, stale_age: Any = None, stale_fetches: Any = None) -> str:
+    """A run-log reason for display, with a stale-cache replay's copy age
+    and fetch count beside it (stored apart, so the reason itself is the
+    same text on every replay)."""
+    from .history import STALE_REASON
+
+    text = reason or ""
+    if not text.startswith(STALE_REASON):
+        return text
+    if stale_fetches and stale_fetches > 1:
+        detail = f"{stale_fetches} fetches" + (
+            f", oldest {stale_age} s" if stale_age is not None else ""
+        )
+    elif stale_age is not None:
+        detail = f"age {stale_age} s"
+    else:
+        return text
+    return f"{STALE_REASON} ({detail}){text[len(STALE_REASON):]}"
+
+
 @main.group(name="history")
 def history_group() -> None:
     """Saved collector history: health, captures, series, revisions.
@@ -3542,21 +3562,25 @@ def history_health(ctx: click.Context, source: str | None) -> None:
     table.add_column("State")
     table.add_column("Last attempt")
     table.add_column("Last success")
+    table.add_column("Last ok")
     table.add_column("Fails", justify="right")
     table.add_column("Latest observed")
     table.add_column("Reason")
     styles = {"ok": "green", "degraded": "yellow", "never_run": "dim"}
     for row in data["sources"]:
         state = row["state"]
-        label = f"{state}, overdue" if state == "failing" and row.get("overdue") else state
+        overdue = state in ("failing", "stale") and row.get("overdue")
+        label = f"{state}, overdue" if overdue else state
         table.add_row(
             _cell(row["source"]),
             Text(label, style=styles.get(state, "red")),
             _cell(row.get("last_attempt_at") or "-"),
             _cell(row.get("last_success_at") or "-"),
+            _cell(row.get("last_ok_at") or "-"),
             str(row.get("consecutive_failures", "-")),
             _cell(row.get("latest_observed_at") or "-"),
-            _cell(row.get("last_reason") or ""),
+            _cell(_reason_text(row.get("last_reason"), row.get("last_stale_age_s"),
+                               row.get("last_stale_fetches"))),
         )
     if data["sources"]:
         console.print(table)
@@ -3583,6 +3607,7 @@ def history_health(ctx: click.Context, source: str | None) -> None:
         f"({storage['payload_bytes_compressed']:,} bytes compressed), "
         f"{storage['observations']} observations in {storage['series']} series."
     )
+    _print_data_gaps(data)
     for line in data["cannot_prove"]:
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 
@@ -3611,11 +3636,15 @@ def history_captures(
             f"{cap['collected_at']}: {cap['status']} ({cap['change'] or 'no payload'})"
         )
         if cap.get("reason"):
-            console.print(f"[yellow]Reason:[/yellow] {escape(str(cap['reason']))}")
+            reason = _reason_text(str(cap["reason"]), cap.get("stale_age_s"),
+                                  cap.get("stale_fetches"))
+            console.print(f"[yellow]Reason:[/yellow] {escape(reason)}")
         if cap.get("payload_note"):
             console.print(f"[yellow]Gap:[/yellow] {escape(cap['payload_note'])}")
         if cap.get("payload") is not None:
             _print_json(cap["payload"])
+        elif cap.get("payload_outline") is not None:
+            _print_json(cap["payload_outline"])
         return
 
     captures = data["captures"]
@@ -3642,7 +3671,8 @@ def history_captures(
             "-" if cap["duration_s"] is None else f"{cap['duration_s']:.2f}",
             "-" if cap["record_count"] is None else str(cap["record_count"]),
             cap["change"] or "-",
-            _cell(cap.get("reason") or ""),
+            _cell(_reason_text(cap.get("reason"), cap.get("stale_age_s"),
+                               cap.get("stale_fetches"))),
         )
     console.print(table)
     console.print(f"[dim]{escape(data['note'])}[/dim]")
@@ -3744,6 +3774,7 @@ def history_revisions(
                 rev["revised_collected_at"],
             )
         console.print(table)
+    _print_data_gaps(data)
     for line in data["cannot_prove"]:
         console.print(f"[yellow]Cannot prove:[/yellow] {escape(line)}")
 

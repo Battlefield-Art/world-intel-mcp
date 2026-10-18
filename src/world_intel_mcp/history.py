@@ -12,10 +12,24 @@ settled on, fallback path included):
   ``error`` row with a reason and a null record count, never an ``ok``
   row with zero records. A payload with no records is ``degraded``,
   because a quiet period and a silent upstream failure look the same.
+  A run that was served an expired cached copy for any upstream fetch is
+  a stale-cache replay: ``degraded`` with a reason starting ``served
+  stale cache``, the same text on every replay so replays group; the
+  copy's age and the number of stale fetches are the capture's
+  ``stale_age_s`` and ``stale_fetches``. The collector reads that from
+  the fetcher's per-task log (``fetcher.recording_stale_serves``),
+  because most source modules rebuild their dict and drop the fetcher's
+  ``_stale`` marker; a top-level ``_stale`` marker counts too. A run log
+  created before those two columns gains them in place when opened.
 - ``history_payloads``: the payload body as zlib-compressed JSON, stored
   once per ``(source, payload_hash)``. The hash ignores the top-level
   fetch-time stamps in ``VOLATILE_KEYS`` (they change on every call while
-  the data do not); the body kept is the first capture's.
+  the data do not); the body kept is the first capture's, and replaying a
+  later capture says so. A body over ``WORLD_INTEL_HISTORY_MAX_BODY_BYTES``
+  (default 4 MiB of JSON, ``0`` = no cap) is not stored: the capture keeps
+  its hash and a reason. Replay returns at most
+  ``WORLD_INTEL_HISTORY_REPLAY_MAX_BYTES`` (default 256 KiB, ``0`` = no
+  cap) and an outline of the top-level keys beyond that.
 - ``history_observations``: dated numeric points pulled out of payloads by
   per-source extractors, each with three dates. ``observed_at`` is the
   period or instant the value describes, taken from the payload; when a
@@ -24,7 +38,11 @@ settled on, fallback path included):
   one, else NULL. ``collected_at`` is when this server saved the capture.
   A point is stored when it is new or its value differs from the last
   stored value for the same series and ``observed_at``, so successive
-  rows for one ``(series_key, observed_at)`` are revisions.
+  rows for one ``(series_key, observed_at)`` are revisions. Points are
+  stored from live captures only: a stale-cache replay is not a new
+  observation, so its points are extracted and counted but not stored. A
+  live capture that is degraded for another reason (empty, partial,
+  marked degraded) still stores the points it has.
 
 History accrues while the collector runs, plus what a backfill
 (``history_backfill.py``) loads on demand from FRED and the ECB Data
@@ -32,6 +50,13 @@ Portal, which serve their whole history; a source the collector does not
 run reads ``never_run``. Backfills are captures under ``backfill:*``
 sources, so their rows never read as collector captures, and
 ``collection_health`` lists them apart from the collector's roster.
+Health counts a success only from a live capture, so a source served from
+stale cache reads ``stale`` and goes overdue on schedule. When a cycle's
+write fails twice (a locked or unwritable DB), the collector appends a
+record of the lost cycle to ``<db>-history-write-failures.jsonl`` beside
+the DB (newest 500 kept), which ``collection_health`` reports. That file
+is rewritten through an exclusive temp file and never read or written
+through a symlink.
 
 Registering an extractor (the public API)::
 
@@ -44,13 +69,16 @@ Registering an extractor (the public API)::
 The store prefixes each ``series_key`` with the source name
 (``my_source:rate``), so extractors cannot collide. ``observed_at`` must be
 ``YYYY``, ``YYYY-MM``, ``YYYY-MM-DD`` or a timezone-aware ISO 8601
-instant (use ``normalize_observed_at`` to convert, with ``assume_utc=True``
+instant, in ASCII digits and naming a real calendar date or period
+(use ``normalize_observed_at`` to convert, with ``assume_utc=True``
 only when the publisher documents UTC); a point with an unparseable date
 or a non-finite value is skipped and counted in the capture's
 ``extract_error``. Register at import time of your source module: the
 collector imports a source's module before it records that source's
-capture. A registered extractor that finds nothing in a non-error payload
-marks the capture ``degraded``.
+capture. A registered extractor that finds nothing in a non-error payload,
+or raises, marks the capture ``degraded``; pass ``expected=N`` when a
+complete payload yields N points (one per requested symbol), and a
+capture with fewer is ``degraded`` as partial.
 
 Retention, each ``0`` = keep forever, pruned at the end of every recorded
 cycle in the same transaction:
@@ -80,16 +108,34 @@ Gaps / not covered:
   has only what the collector saw from its first recorded cycle on.
 - ``published_at`` is NULL for every built-in extractor: none of their
   payloads names a release time.
+- A built-in extractor skips a row whose date it cannot read (not ASCII
+  ISO 8601, or no such calendar date) without counting it; that shows
+  only when every row is skipped, which reads ``degraded``. A point with
+  such a date that an extractor does return is counted in
+  ``extract_error``.
 - ``record_count`` is a size hint (the payload's longest top-level list,
   else its integer ``count``), not a semantic count; payloads shaped as
   nested dicts read NULL.
-- Degradation is read from top-level ``_stale`` / ``degraded`` markers;
-  a source that degrades without marking its payload reads ``ok`` unless
-  it is empty or its extractor finds nothing.
+- Stale data are seen only through the fetcher's stale fallback or a
+  top-level ``_stale`` marker. A source that serves old data by other
+  means, or awaits a fetch that another task started, reads live; one
+  that drops part of a failed answer without marking it reads ``ok``
+  unless it is empty, its extractor finds nothing, or fewer points than
+  ``expected`` arrive.
+- Observation retention prunes by ``collected_at``: a value unchanged for
+  longer than ``WORLD_INTEL_HISTORY_DAYS`` is pruned and then stored again
+  at its next capture, so its first sighting reads as that capture.
+- A collector and a server that resolve different cache paths keep
+  different run logs; health then reads ``never_run`` for every source and
+  says where it looked.
+- The lost-cycle record is read when it is a regular file, whoever owns
+  it: in a DB directory another local user can write, that user can plant
+  records there (as they can tamper with the DB itself).
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -97,17 +143,36 @@ import math
 import os
 import re
 import sqlite3
+import stat
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .sources.markets import _COMMODITY_SYMBOLS, _DEFAULT_INDEX_SYMBOLS
+
 logger = logging.getLogger("world-intel-mcp.history")
 
-# Top-level keys that carry this server's fetch time, not upstream data.
-VOLATILE_KEYS = frozenset({"timestamp", "fetched_at", "generated_at", "_stale_age_seconds"})
+# Top-level keys that carry this server's fetch time or fetch path, not
+# upstream data.
+VOLATILE_KEYS = frozenset(
+    {"timestamp", "fetched_at", "generated_at", "_stale", "_stale_age_seconds"}
+)
+
+# Reason prefix of a stale-cache replay. Health reads it back from the run
+# log, so stale captures need no column of their own.
+STALE_REASON = "served stale cache"
+# A capture whose payload came live from the upstream: ok, or degraded for
+# any reason but a stale-cache replay. Binds (len(STALE_REASON), STALE_REASON).
+_LIVE_CAPTURE = "status IN ('ok', 'degraded') AND (error IS NULL OR substr(error, 1, ?) != ?)"
+_RAISED = "extractor raised"
+_BODY_NOT_STORED = "payload body not stored"
+
+# How long a history write waits on another writer's lock before failing.
+BUSY_TIMEOUT_S = 5.0
 
 # Expected seconds between collector attempts. The shipped launchd plist
 # and the daemon default both run every 300 s; an operator running a
@@ -124,7 +189,15 @@ OVERDUE_MULTIPLE = 3.0
 _DEFAULT_PAYLOAD_DAYS = 7.0
 _DEFAULT_CAPTURE_DAYS = 30.0
 _DEFAULT_HISTORY_DAYS = 365.0
+# No body in the 2026-10-17 three-cycle measurement can have exceeded
+# 1 MiB of JSON (the largest cycle added 958,424 bytes across 10 bodies),
+# so the cap stops a runaway payload, not a real one.
+_DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
+_DEFAULT_REPLAY_MAX_BYTES = 256 * 1024
 _MAX_LIMIT = 1000
+
+_WRITE_FAILURES_SUFFIX = "-history-write-failures.jsonl"
+_WRITE_FAILURES_KEPT = 500
 
 HISTORY_ACCRUAL_NOTE = (
     "History accrues only while the collector (intel-collector) runs; "
@@ -161,15 +234,22 @@ class Observation:
 
 Extractor = Callable[[Any], Iterable[Observation]]
 _EXTRACTORS: dict[str, Extractor] = {}
+_EXPECTED: dict[str, int] = {}
 
 
 def register_extractor(
-    source: str, fn: Extractor | None = None, *, replace: bool = False
+    source: str,
+    fn: Extractor | None = None,
+    *,
+    replace: bool = False,
+    expected: int | None = None,
 ) -> Any:
     """Register ``fn`` as the extractor for collector source ``source``.
 
     Usable as ``register_extractor("src", fn)`` or as a decorator. A second
     registration for the same source raises unless ``replace=True``.
+    ``expected`` is how many valid points a complete payload yields; a
+    capture with fewer is ``degraded`` as partial (its points are stored).
     """
 
     def _register(f: Extractor) -> Extractor:
@@ -177,6 +257,10 @@ def register_extractor(
         if existing is not None and existing is not f and not replace:
             raise ValueError(f"an extractor is already registered for {source!r}")
         _EXTRACTORS[source] = f
+        if expected is None:
+            _EXPECTED.pop(source, None)
+        else:
+            _EXPECTED[source] = expected
         return f
 
     return _register(fn) if fn is not None else _register
@@ -187,23 +271,39 @@ def registered_extractors() -> dict[str, Extractor]:
     return dict(_EXTRACTORS)
 
 
-_DATE_PERIOD = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
+_DATE_PERIOD = re.compile(r"(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?")
+
+
+def _valid_period(match: re.Match) -> bool:
+    year, month, day = match.groups()
+    if day is not None:
+        try:
+            date.fromisoformat(match.group(0))
+        except ValueError:
+            return False
+        return True
+    return int(year) >= 1 and (month is None or 1 <= int(month) <= 12)
 
 
 def normalize_observed_at(value: Any, *, assume_utc: bool = False) -> str | None:
     """Payload date -> stored form, or None when it cannot be read.
 
-    ``YYYY``, ``YYYY-MM`` and ``YYYY-MM-DD`` periods are kept as written.
-    An ISO 8601 instant becomes ``YYYY-MM-DDTHH:MM:SSZ`` in UTC. A naive
-    instant (no offset) is only accepted with ``assume_utc=True``.
+    ``YYYY``, ``YYYY-MM`` and ``YYYY-MM-DD`` periods are kept as written
+    when they name a real calendar period (year 0001 on, month 01-12, a
+    day that exists). An ISO 8601 instant becomes ``YYYY-MM-DDTHH:MM:SSZ``
+    in UTC. A naive instant (no offset) is only accepted with
+    ``assume_utc=True``. Only ASCII text is read: ``\\d`` and ``int()``
+    also accept fullwidth and other Unicode digits, and a period stored in
+    those would match no date query.
     """
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip()
-    if not text:
+    if not text or not text.isascii():
         return None
-    if _DATE_PERIOD.fullmatch(text):
-        return text
+    period = _DATE_PERIOD.fullmatch(text)
+    if period:
+        return text if _valid_period(period) else None
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace(" ", "T", 1))
     except ValueError:
@@ -281,7 +381,56 @@ def _extract_central_bank_rates(payload: dict) -> list[Observation]:
     return points
 
 
-def _quote_extractor(list_key: str, label_key: str, unit_key: str | None):
+# Exchange quotation units of the commodity futures the collector reads
+# (the commodity payload carries no currency). The currency half was
+# checked against Yahoo's chart meta on 2026-10-17 (USD for COMEX and
+# NYMEX, USX = US cents for the CBOT grains); the per-unit half is each
+# contract's quotation unit.
+COMMODITY_UNITS = {
+    "GC=F": "USD per troy ounce",
+    "SI=F": "USD per troy ounce",
+    "CL=F": "USD per barrel",
+    "BZ=F": "USD per barrel",
+    "NG=F": "USD per MMBtu",
+    "ZC=F": "US cents per bushel",
+    "ZW=F": "US cents per bushel",
+    "ZS=F": "US cents per bushel",
+}
+# Yahoo reports an index level with its constituents' currency; the level
+# itself is in index points, so the currency goes in the label.
+_INDEX_UNIT = "index points"
+
+
+def _market_quote_unit(quote: dict) -> str | None:
+    symbol = str(quote.get("symbol") or "")
+    if symbol in _DEFAULT_INDEX_SYMBOLS:
+        return _INDEX_UNIT
+    if symbol.startswith("^"):
+        return None  # a Yahoo index or rate whose unit this table does not know
+    return quote.get("currency")
+
+
+def _market_quote_label(quote: dict) -> str:
+    symbol = str(quote.get("symbol") or "")
+    currency = quote.get("currency")
+    if symbol in _DEFAULT_INDEX_SYMBOLS and isinstance(currency, str) and currency:
+        return f"{symbol} ({currency})"
+    return symbol
+
+
+def _commodity_unit(quote: dict) -> str | None:
+    return COMMODITY_UNITS.get(str(quote.get("symbol") or ""))
+
+
+def _commodity_label(quote: dict) -> str:
+    return quote.get("name") or str(quote.get("symbol") or "")
+
+
+def _quote_extractor(
+    list_key: str,
+    unit_of: Callable[[dict], str | None],
+    label_of: Callable[[dict], str],
+):
     def _extract(payload: dict) -> list[Observation]:
         """Yahoo quotes. The source module keeps price and change only, not
         the quote time, so observed_at is NULL (unknown), not collected_at."""
@@ -293,16 +442,22 @@ def _quote_extractor(list_key: str, label_key: str, unit_key: str | None):
                 continue
             points.append(
                 Observation(f"{symbol}:price", price, observed_at=None,
-                            unit=quote.get(unit_key) if unit_key else None,
-                            label=quote.get(label_key) or symbol)
+                            unit=unit_of(quote), label=label_of(quote) or symbol)
             )
         return points
 
     return _extract
 
 
-register_extractor("market_quotes", _quote_extractor("quotes", "symbol", "currency"))
-register_extractor("commodity_quotes", _quote_extractor("commodities", "name", None))
+# The collector runs both with their defaults: one point per symbol.
+register_extractor(
+    "market_quotes", _quote_extractor("quotes", _market_quote_unit, _market_quote_label),
+    expected=len(_DEFAULT_INDEX_SYMBOLS),
+)
+register_extractor(
+    "commodity_quotes", _quote_extractor("commodities", _commodity_unit, _commodity_label),
+    expected=len(_COMMODITY_SYMBOLS),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -312,13 +467,19 @@ register_extractor("commodity_quotes", _quote_extractor("commodities", "name", N
 
 @dataclass
 class SourceOutcome:
-    """What one collector source run produced, handed to ``record_cycle``."""
+    """What one collector source run produced, handed to ``record_cycle``.
+
+    ``stale_serves`` holds what ``fetcher.recording_stale_serves()`` logged
+    during the run (items with an ``age_seconds``); any entry makes the
+    capture a stale-cache replay.
+    """
 
     source: str
     collected_at: float
     duration_s: float | None = None
     payload: Any = None
     error: str | None = None
+    stale_serves: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -329,6 +490,8 @@ class _Classified:
     observations: list[Observation] = field(default_factory=list)
     extract_error: str | None = None
     extracted: int | None = None
+    stale_age_s: float | None = None
+    stale_fetches: int | None = None
 
 
 def record_count(payload: Any) -> int | None:
@@ -362,7 +525,7 @@ def _extract(source: str, payload: Any) -> tuple[list[Observation], str | None, 
         raw = list(extractor(payload))
     except Exception as exc:  # an extractor bug must not lose the capture
         logger.warning("History extractor for %s failed: %s", source, exc)
-        return [], f"extractor raised: {type(exc).__name__}: {str(exc)[:200]}", None
+        return [], f"{_RAISED}: {type(exc).__name__}: {str(exc)[:200]}", None
     valid: list[Observation] = []
     skipped = 0
     for obs in raw:
@@ -381,8 +544,36 @@ def _extract(source: str, payload: Any) -> tuple[list[Observation], str | None, 
     return valid, note, len(raw)
 
 
+def _stale_replay(outcome: SourceOutcome) -> tuple[int | None, float | None] | None:
+    """(upstream fetches answered from expired cache, oldest copy age in
+    seconds) when this run was a stale-cache replay, else None.
+
+    The fetch count is None when only the payload's ``_stale`` marker shows
+    the replay; the age is None when no serve or marker reported one.
+    """
+    serves = list(outcome.stale_serves or ())
+    payload = outcome.payload
+    marked = isinstance(payload, dict) and bool(payload.get("_stale"))
+    if not serves and not marked:
+        return None
+    ages = [_finite(getattr(serve, "age_seconds", None)) for serve in serves]
+    if marked:
+        ages.append(_finite(payload.get("_stale_age_seconds")))
+    known = [age for age in ages if age is not None]
+    return (len(serves) or None), (max(known) if known else None)
+
+
 def classify(outcome: SourceOutcome) -> _Classified:
-    """Status, reason and observations for one source run."""
+    """Status, reason and observations for one source run.
+
+    ``error`` when the run produced no usable payload. ``degraded`` when it
+    was a stale-cache replay, or live but marked degraded, empty, partial,
+    without the measures its extractor expects, or its extractor raised
+    (the payload is kept; the error is the reason). Otherwise ``ok``. A
+    stale-cache replay keeps its extracted count but no observations. The
+    reason holds no per-run numbers for a replay (its copy age and fetch
+    count are fields), so successive replays share one reason.
+    """
     if outcome.error is not None:
         return _Classified("error", outcome.error[:500], None)
     payload = outcome.payload
@@ -393,26 +584,37 @@ def classify(outcome: SourceOutcome) -> _Classified:
 
     count = record_count(payload)
     observations, extract_error, extracted = _extract(outcome.source, payload)
-    status, reason = "ok", None
-    if isinstance(payload, dict) and payload.get("_stale"):
-        age = payload.get("_stale_age_seconds")
-        status, reason = "degraded", (
-            f"served stale cache (age {age} s)" if age is not None else "served stale cache"
-        )
-    elif isinstance(payload, dict) and (
+    notes = []
+    stale = _stale_replay(outcome)
+    if stale is not None:
+        notes.append(STALE_REASON)
+    if isinstance(payload, dict) and (
         payload.get("degraded") is True or payload.get("status") == "degraded"
     ):
-        status, reason = "degraded", "payload marked degraded"
+        notes.append("payload marked degraded")
+    expected = _EXPECTED.get(outcome.source)
+    if extract_error and extract_error.startswith(_RAISED):
+        notes.append(extract_error[:150])  # in full in extract_error
     elif count == 0:
-        status, reason = "degraded", (
+        notes.append(
             "payload has no records: a quiet period and a silent upstream "
             "failure look the same here"
         )
     elif extracted is not None and not observations:
-        status, reason = "degraded", "registered extractor found no measures in this payload" + (
+        notes.append("registered extractor found no measures in this payload" + (
             f" ({extract_error})" if extract_error else ""
-        )
-    return _Classified(status, reason, count, observations, extract_error, extracted)
+        ))
+    elif extracted is not None and expected is not None and len(observations) < expected:
+        notes.append(f"partial: {len(observations)} of {expected} expected series")
+    if stale is not None and observations:
+        notes.append("observations not stored: a stale-cache replay is not a new observation")
+        observations = []
+    reason = "; ".join(notes)[:500] if notes else None
+    stale_fetches, stale_age_s = stale if stale is not None else (None, None)
+    return _Classified(
+        "degraded" if notes else "ok", reason, count, observations, extract_error, extracted,
+        stale_age_s=stale_age_s, stale_fetches=stale_fetches,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +643,31 @@ def retention_days() -> dict[str, float]:
         "payload_days": _env_days("WORLD_INTEL_HISTORY_PAYLOAD_DAYS", _DEFAULT_PAYLOAD_DAYS),
         "capture_days": _env_days("WORLD_INTEL_HISTORY_CAPTURE_DAYS", _DEFAULT_CAPTURE_DAYS),
         "history_days": _env_days("WORLD_INTEL_HISTORY_DAYS", _DEFAULT_HISTORY_DAYS),
+    }
+
+
+def _env_bytes(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("%s=%r must be >= 0; using %s", name, raw, default)
+        return default
+    return value
+
+
+def size_caps() -> dict[str, int]:
+    """Stored-body and replay caps in bytes of JSON; 0 = no cap."""
+    return {
+        "max_body_bytes": _env_bytes("WORLD_INTEL_HISTORY_MAX_BODY_BYTES", _DEFAULT_MAX_BODY_BYTES),
+        "replay_max_bytes": _env_bytes(
+            "WORLD_INTEL_HISTORY_REPLAY_MAX_BYTES", _DEFAULT_REPLAY_MAX_BYTES
+        ),
     }
 
 
@@ -486,15 +713,241 @@ def _clamp(limit: Any, default: int) -> int:
     return max(1, min(_MAX_LIMIT, value))
 
 
+def write_failures_path(db_path: Path | str) -> Path:
+    """The lost-cycle record file kept beside the history DB."""
+    db_path = Path(db_path)
+    return db_path.with_name(db_path.name + _WRITE_FAILURES_SUFFIX)
+
+
+# open() flags for reading the lost-cycle record: never through a symlink,
+# never blocking on a FIFO (0 where the OS has no such flag).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_SYMLINK_REFUSED = "is a symlink; not followed"
+_NOT_REGULAR_REFUSED = "is not a regular file; not read"
+
+
+def _record_refusal(path: Path) -> str | None:
+    """Why the lost-cycle record at ``path`` is not read, judged by the
+    entry itself (``lstat``), or None when it is absent, a regular file, or
+    cannot be inspected (opening it then raises that error)."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return _SYMLINK_REFUSED
+    if not stat.S_ISREG(mode):
+        return _NOT_REGULAR_REFUSED
+    return None
+
+
+def _read_record(path: Path) -> tuple[str | None, str | None]:
+    """(text, None); (None, None) when there is no record yet; or
+    (None, why) when it is refused.
+
+    A symlink is never followed (an ``lstat`` check, and ``O_NOFOLLOW``
+    where the OS has it in case the name is swapped after the check) and
+    only a regular file is read, so a name planted beside the DB, in a
+    directory another user can write, cannot point the read at another
+    file or hang it on a FIFO. Undecodable bytes are replaced, so such a
+    line counts as unreadable instead of raising.
+    """
+    refused = _record_refusal(path)
+    if refused:
+        return None, refused
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        # O_NOFOLLOW on a symlink: ELOOP (Linux, macOS) or EMLINK (FreeBSD).
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            return None, _SYMLINK_REFUSED
+        raise
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return None, _NOT_REGULAR_REFUSED
+        return fh.read().decode("utf-8", errors="replace"), None
+
+
+def _replace_privately(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through an exclusive temp file beside it.
+
+    ``mkstemp`` creates the temp file with O_EXCL, an unpredictable name
+    and mode 0600, and it is renamed over ``path``. ``path`` itself is
+    never opened, so a symlink there is replaced, not written through. The
+    temp file is removed on any error.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as exc:
+            logger.warning("Could not remove the temp file %s: %s", tmp, exc)
+        raise
+
+
+def record_write_failure(
+    db_path: Path | str, outcomes: Iterable[SourceOutcome], error: str,
+    now: float | None = None,
+) -> Path | None:
+    """Keep a lasting record of a cycle whose history write failed.
+
+    Written beside the DB, not in it (the DB may be what failed), newest
+    ``_WRITE_FAILURES_KEPT`` records kept, through an exclusive temp file
+    renamed into place. The record is never read or written through a
+    symlink: a symlink (or anything but a regular file) at its path is
+    replaced unread, which is logged and noted in the new record as
+    ``replaced_unread``. Returns the file, or None when it could not be
+    written either; that is logged, and the collector log is then the only
+    trace of the lost cycle.
+    """
+    now = time.time() if now is None else now
+    path = write_failures_path(db_path)
+    record = {
+        "failed_at": _iso(now),
+        "failed_at_ts": round(now, 3),
+        "error": str(error)[:500],
+        "sources": sorted({outcome.source for outcome in outcomes}),
+    }
+    try:
+        text, refused = _read_record(path)
+        if refused:
+            logger.error("Not reading the lost-cycle record %s: it %s; replacing it", path, refused)
+            record["replaced_unread"] = f"{path} {refused}"
+        lines = (text or "").splitlines()
+        lines = (lines + [json.dumps(record, separators=(",", ":"))])[-_WRITE_FAILURES_KEPT:]
+        _replace_privately(path, "\n".join(lines) + "\n")
+    except OSError as exc:
+        logger.error("Could not record the history write failure at %s: %s", path, exc)
+        return None
+    return path
+
+
+def read_write_failures(db_path: Path | str, now: float | None = None) -> tuple[list[dict], int]:
+    """(lost-cycle records inside the run-log retention window, unreadable count).
+
+    A record file that is a symlink or not a regular file is not read; it
+    is logged and counts as one unreadable record.
+    """
+    path = write_failures_path(db_path)
+    try:
+        text, refused = _read_record(path)
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return [], 1
+    if refused:
+        logger.warning("Not reading the lost-cycle record %s: it %s", path, refused)
+        return [], 1
+    if text is None:
+        return [], 0
+    keep_days = retention_days()["capture_days"]
+    now = time.time() if now is None else now
+    cutoff = now - keep_days * 86400 if keep_days > 0 else None
+    records, unreadable = [], 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            failed_at = float(record["failed_at_ts"])
+        except (ValueError, KeyError, TypeError):
+            unreadable += 1
+            continue
+        if cutoff is None or failed_at >= cutoff:
+            records.append(record)
+    return records, unreadable
+
+
+def _unrecorded_attempts(failures: list[dict], source: str, after: float | None) -> int:
+    """Lost cycles that ran ``source`` after its last recorded capture."""
+    count = 0
+    for record in failures:
+        sources = record.get("sources")
+        if not isinstance(sources, list) or source not in sources:
+            continue
+        if after is None or float(record.get("failed_at_ts") or 0) > after:
+            count += 1
+    return count
+
+
+def _temp_fallback_db() -> Path:
+    """Where ``Cache`` falls back when its default path is unusable."""
+    return Path(tempfile.gettempdir()) / "world-intel-mcp" / "cache.db"
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
+def _outline(payload: Any) -> Any:
+    """Top-level shape of a payload too large to replay."""
+
+    def _shape(value: Any) -> str:
+        if isinstance(value, list):
+            return f"list of {len(value)}"
+        if isinstance(value, dict):
+            return f"object with {len(value)} keys"
+        return type(value).__name__
+
+    if isinstance(payload, dict):
+        return {str(key): _shape(value) for key, value in list(payload.items())[:100]}
+    return _shape(payload)
+
+
+# Run-log columns added after the first schema, each with the statement
+# that adds it to an existing table in place.
+_ADDED_CAPTURE_COLUMNS = (
+    ("stale_age_s", "ALTER TABLE history_captures ADD COLUMN stale_age_s REAL"),
+    ("stale_fetches", "ALTER TABLE history_captures ADD COLUMN stale_fetches INTEGER"),
+)
+
+
+def _add_missing_capture_columns(conn: Any) -> None:
+    """Bring a run log created by an earlier schema up to date, in place.
+
+    Safe to run on every open. A second process can add a column between
+    this one's table_info read and its ALTER; that "duplicate column"
+    error means the work is done, any other error is raised.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(history_captures)")}
+    for name, statement in _ADDED_CAPTURE_COLUMNS:
+        if name in present:
+            continue
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
+
+
 class HistoryStore:
     """Capture log, payload bodies and observations in the cache DB."""
 
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=10)
+        # The connect timeout is SQLite's busy timeout: how long a write
+        # waits on another writer's lock before "database is locked".
+        self._conn = sqlite3.connect(str(self.db_path), timeout=BUSY_TIMEOUT_S)
+        try:
+            self._create_schema()
+        except BaseException:
+            # A file that is not a database (or a failed migration) raises
+            # here; the caller never gets a store to close, so close it now.
+            self._conn.close()
+            raise
+
+    def _create_schema(self) -> None:
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(
             """
@@ -510,7 +963,9 @@ class HistoryStore:
                 changed INTEGER,
                 observations_extracted INTEGER,
                 observations_stored INTEGER,
-                extract_error TEXT
+                extract_error TEXT,
+                stale_age_s REAL,
+                stale_fetches INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_history_captures_source
                 ON history_captures(source, collected_at);
@@ -547,6 +1002,7 @@ class HistoryStore:
                 ON history_observations(collected_at);
             """
         )
+        _add_missing_capture_columns(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -561,6 +1017,7 @@ class HistoryStore:
         counts = {"ok": 0, "degraded": 0, "error": 0}
         payloads_stored = 0
         observations_stored = 0
+        max_body = size_caps()["max_body_bytes"]
         with conn:
             for outcome in outcomes:
                 c = classify(outcome)
@@ -579,7 +1036,15 @@ class HistoryStore:
                         digest = body = None
                         note = f"payload not stored in history: {type(exc).__name__}: {exc}"
                         c.reason = (f"{c.reason}; {note}" if c.reason else note)[:500]
-                if digest is not None and body is not None:
+                if body is not None and max_body and len(body) > max_body:
+                    # The hash still dates changes; only the body is lost.
+                    note = (
+                        f"{_BODY_NOT_STORED}: {len(body):,} bytes of JSON, over the "
+                        f"{max_body:,}-byte cap (WORLD_INTEL_HISTORY_MAX_BODY_BYTES)"
+                    )
+                    c.reason = (f"{c.reason}; {note}" if c.reason else note)[:500]
+                    body = None
+                if digest is not None:
                     prev = conn.execute(
                         "SELECT payload_hash FROM history_captures "
                         "WHERE source = ? AND payload_hash IS NOT NULL "
@@ -587,6 +1052,7 @@ class HistoryStore:
                         (outcome.source,),
                     ).fetchone()
                     changed = None if prev is None else int(prev[0] != digest)
+                if digest is not None and body is not None:
                     inserted = conn.execute(
                         "INSERT OR IGNORE INTO history_payloads "
                         "(source, payload_hash, first_seen_at, last_seen_at, raw_bytes, body) "
@@ -605,10 +1071,12 @@ class HistoryStore:
                 capture_id = conn.execute(
                     "INSERT INTO history_captures (source, collected_at, status, duration_s, "
                     "record_count, error, payload_hash, changed, observations_extracted, "
-                    "extract_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "extract_error, stale_age_s, stale_fetches) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (outcome.source, outcome.collected_at, c.status,
                      None if outcome.duration_s is None else round(outcome.duration_s, 3),
-                     c.record_count, c.reason, digest, changed, c.extracted, c.extract_error),
+                     c.record_count, c.reason, digest, changed, c.extracted, c.extract_error,
+                     c.stale_age_s, c.stale_fetches),
                 ).lastrowid
                 stored = self._store_observations(capture_id, outcome, c.observations)
                 observations_stored += stored
@@ -696,6 +1164,7 @@ class HistoryStore:
             "series": series,
             "first_capture_at": _iso(first),
             "retention": retention_days(),
+            "size_caps": size_caps(),
             "db_path": str(self.db_path),
         }
 
@@ -720,13 +1189,16 @@ class HistoryStore:
             names = [source] if source in names else []
             backfilled = [source] if source in backfilled else []
 
+        failures, unreadable_failures = read_write_failures(self.db_path, now)
+        live_args = (len(STALE_REASON), STALE_REASON)
         rows = []
         for name in names:
             cadence = overrides.get(name, default_cadence)
             overdue_after = OVERDUE_MULTIPLE * cadence
             last = conn.execute(
-                "SELECT collected_at, status, error, extract_error FROM history_captures "
-                "WHERE source = ? ORDER BY collected_at DESC, id DESC LIMIT 1",
+                "SELECT collected_at, status, error, extract_error, stale_age_s, stale_fetches "
+                "FROM history_captures WHERE source = ? ORDER BY collected_at DESC, id DESC "
+                "LIMIT 1",
                 (name,),
             ).fetchone()
             entry: dict[str, Any] = {
@@ -738,28 +1210,35 @@ class HistoryStore:
             if last is None:
                 entry.update(state="never_run", attempts=0, overdue=None,
                              last_attempt_at=None, last_success_at=None)
+                unrecorded = _unrecorded_attempts(failures, name, None)
+                if unrecorded:
+                    entry["unrecorded_attempts"] = unrecorded
                 rows.append(entry)
                 continue
-            last_at, last_status, last_reason, last_extract_error = last
+            (last_at, last_status, last_reason, last_extract_error,
+             last_stale_age, last_stale_fetches) = last
+            last_is_stale = last_status != "error" and (last_reason or "").startswith(
+                STALE_REASON
+            )
             attempts = conn.execute(
                 "SELECT COUNT(*) FROM history_captures WHERE source = ?", (name,)
             ).fetchone()[0]
             last_success = conn.execute(
-                "SELECT MAX(collected_at) FROM history_captures "
-                "WHERE source = ? AND status IN ('ok', 'degraded')",
-                (name,),
+                "SELECT MAX(collected_at) FROM history_captures WHERE source = ? AND "
+                + _LIVE_CAPTURE,
+                (name, *live_args),
             ).fetchone()[0]
             last_ok = conn.execute(
                 "SELECT MAX(collected_at) FROM history_captures WHERE source = ? AND status = 'ok'",
                 (name,),
             ).fetchone()[0]
-            # Errors recorded after the last non-error capture, in insertion
-            # order (robust to a clock that stepped backwards).
+            # Captures after the last live one (errors and stale replays), in
+            # insertion order (robust to a clock that stepped backwards).
             consecutive = conn.execute(
-                "SELECT COUNT(*) FROM history_captures WHERE source = ? AND status = 'error' "
+                "SELECT COUNT(*) FROM history_captures WHERE source = ? "
                 "AND id > COALESCE((SELECT MAX(id) FROM history_captures "
-                "WHERE source = ? AND status != 'error'), 0)",
-                (name, name),
+                "WHERE source = ? AND " + _LIVE_CAPTURE + "), 0)",
+                (name, name, *live_args),
             ).fetchone()[0]
             obs = conn.execute(
                 "SELECT MAX(observed_at), COUNT(DISTINCT series_key), "
@@ -768,15 +1247,18 @@ class HistoryStore:
             ).fetchone()
             age_attempt = now - last_at
             age_success = None if last_success is None else now - last_success
+            age_ok = None if last_ok is None else now - last_ok
             overdue = age_success is None or age_success > overdue_after
             attempt_overdue = age_attempt > overdue_after
-            # A non-error last capture is itself the last success, so overdue
-            # can differ from attempt_overdue only for a failing source; it is
-            # reported there as the overdue flag, not as a state of its own.
+            # A live last capture is itself the last success, so overdue can
+            # differ from attempt_overdue only for a failing or stale source;
+            # it is reported there as the overdue flag, not as a state.
             if attempt_overdue:
                 state = "not_attempted_recently"
             elif last_status == "error":
                 state = "failing"
+            elif last_is_stale:
+                state = "stale"
             else:
                 state = last_status
             entry.update(
@@ -789,10 +1271,17 @@ class HistoryStore:
                 last_success_at=_iso(last_success),
                 last_success_age_s=None if age_success is None else round(age_success, 1),
                 last_ok_at=_iso(last_ok),
+                last_ok_age_s=None if age_ok is None else round(age_ok, 1),
                 consecutive_failures=consecutive,
                 overdue=overdue,
                 attempt_overdue=attempt_overdue,
             )
+            if last_is_stale:
+                entry["last_stale_age_s"] = last_stale_age
+                entry["last_stale_fetches"] = last_stale_fetches
+            unrecorded = _unrecorded_attempts(failures, name, last_at)
+            if unrecorded:
+                entry["unrecorded_attempts"] = unrecorded
             if last_extract_error:
                 entry["last_extract_error"] = last_extract_error
             if obs[1]:
@@ -805,6 +1294,40 @@ class HistoryStore:
         states: dict[str, int] = {}
         for entry in rows:
             states[entry["state"]] = states.get(entry["state"], 0) + 1
+        storage = self.storage_stats()
+        record_file = write_failures_path(self.db_path)
+        gaps = []
+        if storage["captures"] == 0:
+            gaps.append(
+                f"no captures in this run log ({self.db_path}): the collector has not "
+                "written to this database. A collector that resolved another cache path "
+                "(WORLD_INTEL_CACHE_DB, XDG_CACHE_HOME, the temp-directory fallback) keeps "
+                "its own log."
+            )
+        elif states.get("never_run"):
+            gaps.append(f"{states['never_run']} source(s) have no capture in this run log")
+        if _same_path(self.db_path, _temp_fallback_db()):
+            gaps.append(
+                f"this run log is the temp-directory fallback ({self.db_path}): the default "
+                "cache path was unusable when this process started, so a collector writing "
+                "to the default path is not visible here"
+            )
+        if failures:
+            gaps.append(
+                f"{len(failures)} collector cycle(s) were not written to this run log (last "
+                f"at {failures[-1].get('failed_at')}: {failures[-1].get('error')}); their "
+                "attempts, failures and payloads are missing, so ages and failure counts "
+                "can be off (unrecorded_attempts per source)"
+            )
+        if unreadable_failures:
+            refused = _record_refusal(record_file)
+            gaps.append(
+                f"the lost-cycle record {record_file} {refused}, so cycles whose history "
+                "write failed are not counted here"
+                if refused
+                else f"{unreadable_failures} lost-cycle record(s) in {record_file} could not "
+                "be read"
+            )
         return {
             "sources": rows,
             "state_counts": states,
@@ -813,7 +1336,14 @@ class HistoryStore:
             "checked_at": _iso(now),
             "default_cadence_s": default_cadence,
             "overdue_multiple": OVERDUE_MULTIPLE,
-            "storage": self.storage_stats(),
+            "storage": storage,
+            "history_write_failures": {
+                "count": len(failures),
+                "last_failed_at": failures[-1].get("failed_at") if failures else None,
+                "last_error": failures[-1].get("error") if failures else None,
+                "record_file": str(record_file),
+            },
+            "data_gaps": gaps,
             "cannot_prove": [
                 "A recent capture shows the collector reached the upstream and saved a "
                 "payload; it does not show the upstream's observations are current. "
@@ -824,19 +1354,49 @@ class HistoryStore:
                 "real period is longer by the cycle's own duration.",
                 "A degraded capture with no records cannot tell a quiet period from a "
                 "silent upstream failure.",
+                "A stale-cache replay is seen through the fetcher's stale fallback (logged "
+                "per source run) or a top-level _stale marker. A source that serves old "
+                "data by other means, or awaits a fetch another task started, reads live.",
+                "This is the run log in storage.db_path, wherever this process's cache "
+                "resolved (WORLD_INTEL_CACHE_DB, else XDG_CACHE_HOME, else ~/.cache, or the "
+                "temp-directory fallback). A collector that resolved another path writes a "
+                "log this does not read, and its sources read never_run here.",
+                "A cycle whose history write failed is counted in history_write_failures; "
+                "one whose failure record could not be written either (a full disk, an "
+                "unwritable directory) leaves no trace here.",
                 HISTORY_ACCRUAL_NOTE + " A source the collector never ran reads never_run, "
                 "not healthy.",
             ],
             "states_explained": {
-                "ok": "last capture delivered records with no degradation marker",
-                "degraded": "last capture delivered a payload marked stale/degraded, empty, "
-                "or without the measures its extractor expects",
-                "failing": "last capture was an error (consecutive_failures counts the run; "
-                f"overdue is true when no payload arrived within {OVERDUE_MULTIPLE:g} "
-                "cadences)",
+                "ok": "last capture was live and complete: records, every upstream fetch "
+                "answered, no degradation marker",
+                "degraded": "last capture was live but degraded: marked degraded, empty, "
+                "partial (fewer series than expected), or its extractor found nothing or "
+                "raised",
+                "stale": "last capture replayed an expired cached copy because an upstream "
+                "fetch failed; that is not a success, so overdue counts from the last live "
+                "capture",
+                "failing": "last capture was an error (overdue is true when no live payload "
+                f"arrived within {OVERDUE_MULTIPLE:g} cadences)",
                 "not_attempted_recently": f"the collector has not attempted it within "
-                f"{OVERDUE_MULTIPLE:g} cadences (overdue is then always true)",
+                f"{OVERDUE_MULTIPLE:g} cadences, or its attempts were not recorded (see "
+                "unrecorded_attempts); overdue is then always true",
                 "never_run": "no capture recorded",
+            },
+            "fields_explained": {
+                "last_success_at": "last live capture: ok, or degraded for any reason but a "
+                "stale-cache replay; overdue and last_success_age_s count from it",
+                "last_ok_at": "last ok capture: live, complete and unmarked",
+                "consecutive_failures": "errors and stale-cache replays recorded since the "
+                "last live capture",
+                "unrecorded_attempts": "cycles after this source's last recorded capture "
+                "whose history write failed",
+                "last_stale_age_s": "present when the last capture was a stale-cache "
+                "replay: age in seconds of the oldest expired copy it served (null when "
+                "none was reported)",
+                "last_stale_fetches": "present when the last capture was a stale-cache "
+                "replay: how many upstream fetches the fetcher answered from expired "
+                "cache (null when only the payload's _stale marker showed the replay)",
             },
         }
 
@@ -886,7 +1446,7 @@ class HistoryStore:
         columns = (
             "c.id, c.collected_at, c.status, c.duration_s, c.record_count, c.error, "
             "c.payload_hash, c.changed, c.observations_extracted, c.observations_stored, "
-            "c.extract_error, p.body IS NOT NULL"
+            "c.extract_error, c.stale_age_s, c.stale_fetches, p.body IS NOT NULL"
         )
         join = (
             "FROM history_captures c LEFT JOIN history_payloads p "
@@ -898,17 +1458,48 @@ class HistoryStore:
             except (TypeError, ValueError):
                 return {"error": f"capture_id must be an integer, got {capture_id!r}"}
             row = conn.execute(
-                f"SELECT {columns}, p.body {join} WHERE c.id = ? AND c.source = ?",
+                f"SELECT {columns}, p.raw_bytes, p.first_seen_at, p.body {join} "
+                "WHERE c.id = ? AND c.source = ?",
                 (cid, source),
             ).fetchone()
             if row is None:
                 return {"error": f"no capture {cid} for source {source!r}"}
-            capture = self._capture_row(row[:-1])
-            if row[-1] is not None:
-                capture["payload"] = json.loads(zlib.decompress(row[-1]))
-            elif capture["payload_hash"]:
-                capture["payload"] = None
-                capture["payload_note"] = "body pruned past WORLD_INTEL_HISTORY_PAYLOAD_DAYS"
+            capture = self._capture_row(row[:-3])
+            raw_bytes, stored_at, body = row[-3:]
+            notes = []
+            if body is None:
+                if capture["payload_hash"]:
+                    capture["payload"] = None
+                    notes.append(
+                        "body not stored: it was over WORLD_INTEL_HISTORY_MAX_BODY_BYTES "
+                        "when captured (see reason)"
+                        if _BODY_NOT_STORED in (capture["reason"] or "")
+                        else "body pruned past WORLD_INTEL_HISTORY_PAYLOAD_DAYS"
+                    )
+            else:
+                payload = json.loads(zlib.decompress(body))
+                replay_cap = size_caps()["replay_max_bytes"]
+                if replay_cap and raw_bytes > replay_cap:
+                    capture["payload"] = None
+                    capture["payload_outline"] = _outline(payload)
+                    notes.append(
+                        f"body is {raw_bytes:,} bytes of JSON, over the {replay_cap:,}-byte "
+                        "replay cap (WORLD_INTEL_HISTORY_REPLAY_MAX_BYTES, 0 = no cap); "
+                        "payload_outline lists its top-level keys"
+                    )
+                else:
+                    capture["payload"] = payload
+                if stored_at != row[1]:
+                    # Dedupe keeps one body per hash: this one is another
+                    # capture's, identical except for the volatile keys.
+                    capture["payload_stored_at"] = _iso(stored_at)
+                    notes.append(
+                        f"body stored by the capture at {_iso(stored_at)} with the same "
+                        f"payload hash; its top-level {', '.join(sorted(VOLATILE_KEYS))} "
+                        "are from that capture, not this one"
+                    )
+            if notes:
+                capture["payload_note"] = "; ".join(notes)
             return {"source": source, "capture": capture, "note": HISTORY_ACCRUAL_NOTE}
 
         n = _clamp(limit, 20)
@@ -940,7 +1531,7 @@ class HistoryStore:
     @staticmethod
     def _capture_row(row: tuple) -> dict:
         (cid, collected_at, status, duration, count, error, digest, changed,
-         extracted, stored, extract_error, body_retained) = row
+         extracted, stored, extract_error, stale_age_s, stale_fetches, body_retained) = row
         return {
             "capture_id": cid,
             "collected_at": _iso(collected_at),
@@ -958,6 +1549,8 @@ class HistoryStore:
             "observations_extracted": extracted,
             "observations_stored": stored,
             "extract_error": extract_error,
+            "stale_age_s": stale_age_s,
+            "stale_fetches": stale_fetches,
         }
 
     def series_history(
@@ -1039,7 +1632,10 @@ class HistoryStore:
             "data_gaps": gaps,
             "note": (
                 "Rows for the same observed_at are successive values this server saw "
-                "(revisions); a row is stored only when new or changed. "
+                "(revisions); a row is stored only when new or changed, and never from a "
+                "stale-cache replay. Rows older than WORLD_INTEL_HISTORY_DAYS are pruned by "
+                "collected_at, so a value unchanged for longer is stored again at its next "
+                "capture and its first sighting then reads as that capture. "
                 + HISTORY_ACCRUAL_NOTE
             ),
         }
@@ -1068,7 +1664,34 @@ class HistoryStore:
             "ORDER BY collected_at DESC, id DESC LIMIT ?",
             (*params, _clamp(limit, 100)),
         ).fetchall()
+        # What was searched: the same source / series filters, every point.
+        scope = filters[1:]
+        observations, series, dated = self._conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT series_key), "
+            "COUNT(DISTINCT CASE WHEN observed_at IS NOT NULL THEN series_key END) "
+            "FROM history_observations" + (" WHERE " + " AND ".join(scope) if scope else ""),
+            params,
+        ).fetchone()
+        gaps = []
+        if observations == 0:
+            gaps.append("no observations recorded yet" + (
+                f" for source {source!r}" if source else ""
+            ) + (f" for series {series_key!r}" if series_key else "") + (
+                ", so no revision can be seen"
+            ))
+        elif dated == 0:
+            gaps.append(
+                f"none of the {series} series checked has an observed_at, so none can be "
+                "checked for revisions"
+            )
+        elif dated < series:
+            gaps.append(
+                f"{series - dated} of {series} series have no observed_at and cannot be "
+                "checked for revisions"
+            )
         return {
+            "checked": {"observations": observations, "series": series, "dated_series": dated},
+            "data_gaps": gaps,
             "revisions": [
                 {
                     "series_key": r[0], "source": r[1], "observed_at": r[2],
@@ -1086,6 +1709,8 @@ class HistoryStore:
                 "running, is not.",
                 "Series without observed_at (for example Yahoo quotes) cannot be checked "
                 "for revisions: there is no observation date to hold fixed.",
+                "Observations older than WORLD_INTEL_HISTORY_DAYS are pruned by collected_at: "
+                "a revision of a value whose earlier row was pruned is not seen.",
             ],
             "note": HISTORY_ACCRUAL_NOTE,
         }
