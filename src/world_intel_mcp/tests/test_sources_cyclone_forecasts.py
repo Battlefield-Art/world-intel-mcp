@@ -29,6 +29,10 @@ import asyncio as asyncio_mod
 import io
 import json
 import math
+import random
+import struct
+import threading
+import tracemalloc
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,10 +75,15 @@ def _tcm_page() -> str:
     )
 
 
-def _kmz(kml: str, name: str = "ep212026_017adv_CONE.kml") -> bytes:
-    """Zip a KML the way the live CONE.kmz is packed (one deflated member)."""
+def _kmz(
+    kml: str | bytes,
+    name: str = "ep212026_017adv_CONE.kml",
+    method: int = zipfile.ZIP_DEFLATED,
+) -> bytes:
+    """Zip a KML the way the live CONE.kmz is packed (one deflated member,
+    unless ``method`` names another compression)."""
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", method) as zf:
         zf.writestr(name, kml)
     return buf.getvalue()
 
@@ -95,6 +104,30 @@ def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     monkeypatch.setattr(asyncio_mod, "sleep", _no_sleep)
+
+
+_FAR_NOW = datetime(2027, 3, 1, 12, 0, tzinfo=timezone.utc)
+
+
+class _FrozenClock(datetime):
+    """Stands in for cyclone_forecasts.datetime: ``now()`` returns ``at``."""
+
+    at = _FAR_NOW
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.at
+
+
+@pytest.fixture(autouse=True)
+def _far_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test here runs with "now" fixed at 2027-03-01T12:00Z, four
+    and a half months from the 2026-10-17 captures. Day-only product times
+    ("18/0000Z") then reach their expected dates only through the
+    products' own date lines, so the tests exercise that anchoring and
+    give the same result on any day the suite runs. A test that needs a
+    different "now" sets ``_FrozenClock.at`` itself."""
+    monkeypatch.setattr(cf, "datetime", _FrozenClock)
 
 
 def _mock_nhc(
@@ -541,16 +574,26 @@ def test_cone_kml_with_doctype_is_refused() -> None:
         cf.parse_nhc_cone_kmz(_kmz(kml))
 
 
-def _ring_kml(vertices: int) -> str:
-    """A closed ring of ``vertices`` distinct points in a minimal cone KML."""
-    points = [f"{-100 + i * 1e-4:.4f},{15 + (i % 2) * 1e-4:.4f},0" for i in range(vertices)]
+def _coords_kml(tokens: list[str]) -> str:
+    """A minimal cone KML around one ring of KML "lon,lat,alt" tokens."""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Polygon>'
         "<outerBoundaryIs><LinearRing><coordinates>"
-        + " ".join(points + points[:1])
+        + " ".join(tokens)
         + "</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></kml>"
     )
+
+
+def _ring_kml(vertices: int) -> str:
+    """A closed ring of ``vertices`` distinct points in a minimal cone KML:
+    a thin band, out along 15.00N and back along 15.05N, which simplifies
+    to its four corners (a cone outline needs at least three vertices)."""
+    half = vertices // 2
+    out = [(15.0, -100 + i * 1e-4) for i in range(half)]
+    back = [(15.05, -100 + i * 1e-4) for i in reversed(range(vertices - half))]
+    points = [f"{lon:.4f},{lat:.4f},0" for lat, lon in out + back]
+    return _coords_kml(points + points[:1])
 
 
 def test_cone_ring_over_the_vertex_cap_is_refused_before_simplifying() -> None:
@@ -828,14 +871,21 @@ async def test_jtwc_warning_link_off_the_jtwc_host_is_refused_not_fetched(
 async def test_jtwc_text_without_forecast_positions_is_unparsed_and_refetched(
     fetcher: Fetcher, no_sleep: None
 ) -> None:
-    """Synthetic body: the first two lines of 29W's warning text, no
-    forecast blocks (a real JTWC final warning has not been observed).
-    Reported unparsed, degraded, and not kept for the next call."""
+    """Synthetic body: the first two lines of 29W's warning text and its
+    REMARKS date line, no forecast blocks (a real JTWC final warning has
+    not been observed). Reported unparsed, degraded, and not kept for the
+    next call. The date line fixes the month of "171500"; without it the
+    issue time would follow the fetch time (see
+    test_jtwc_text_without_a_date_line_resolves_against_the_fetch_time)."""
     routes = _mock_jtwc()
     routes["29W"].mock(
         return_value=httpx.Response(
             200,
-            text=_crlf("WTPN32 PGTW 171500\nSUBJ/TYPHOON 29W (CHAMPI) WARNING NR 013//\n"),
+            text=_crlf(
+                "WTPN32 PGTW 171500\nSUBJ/TYPHOON 29W (CHAMPI) WARNING NR 013//\n"
+                "REMARKS:\n171500Z POSITION NEAR 12.7N 145.5E.\n"
+                "17OCT26. TYPHOON 29W (CHAMPI), LOCATED APPROXIMATELY 96 NM\n"
+            ),
         )
     )
 
@@ -922,3 +972,1087 @@ async def test_cyclone_tools_expose_and_honor_include_forecast(
     jtwc = await tools_pkg.ALL_HANDLERS["intel_jtwc_cyclones"]({"include_forecast": True})
     by_id = {s["id"]: s for s in jtwc["storms"]}
     assert by_id["29W"]["forecast"]["track_status"] == "ok"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_tool_ignores_a_non_boolean_include_forecast(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_pkg = _tools_registry()
+    from world_intel_mcp import runtime
+
+    monkeypatch.setattr(runtime, "fetcher", fetcher)
+    routes = _mock_jtwc()
+
+    stringly = await tools_pkg.ALL_HANDLERS["intel_jtwc_cyclones"]({"include_forecast": "false"})
+
+    assert stringly["count"] == 3
+    assert all("forecast" not in s for s in stringly["storms"])
+    assert not any(routes[k].called for k in ("29W", "01P", "21E"))
+
+
+# ---------------------------------------------------------------------------
+# The clock: product dates decide, not the day the suite runs
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_text_without_a_date_line_resolves_against_the_fetch_time(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, no_sleep: None
+) -> None:
+    """A warning text with no REMARKS date line places its day-only times
+    in the month nearest the fetch time ("now", set here to the capture
+    time; at the module's 2027-03-01 they would land in February)."""
+    monkeypatch.setattr(
+        _FrozenClock, "at", datetime(2026, 10, 17, 16, 45, tzinfo=timezone.utc)
+    )
+    routes = _mock_jtwc()
+    routes["29W"].mock(
+        return_value=httpx.Response(
+            200, text=_crlf(_fixture("jtwc_wp2926web_wrn013.txt").replace("17OCT26. ", ""))
+        )
+    )
+
+    result = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    champi = next(s for s in result["storms"] if s["id"] == "29W")["forecast"]
+    assert champi["track_status"] == "ok"
+    assert champi["issued"] == "2026-10-17T15:00:00Z"
+    assert _as_tuples(champi["points"]) == _CHAMPI_POINTS
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_page_with_crlf_line_ends_parses_the_same(fetcher: Fetcher) -> None:
+    """Line ends are normalised before parsing: with CRLF the issuance
+    line would not match, and the times would follow "now" instead."""
+    _mock_nhc(tcm=httpx.Response(200, text=_crlf(_tcm_page())))
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["issued"] == "2026-10-17T15:00:00Z"
+    assert _as_tuples(fc["points"]) == _TRUDY_POINTS
+
+
+# ---------------------------------------------------------------------------
+# Feed and text out of step: which number came from where
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_page_newer_than_the_feed_is_feed_lags_text_and_kept(
+    fetcher: Fetcher,
+) -> None:
+    """CurrentStorms.json is cached for 600 s, so after an issuance it can
+    still list advisory 016 while the bin page already serves 17. The page
+    is then the newer product: labelled feed_lags_text with both numbers,
+    not stale, not degraded, and kept for the next call."""
+    current = _current_storms()
+    current["activeStorms"][0]["forecastAdvisory"]["advNum"] = "016"
+    routes = _mock_nhc(current=current)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "feed_lags_text"
+    assert fc["advisory_number"] == "17"
+    assert fc["feed_advisory_number"] == "016"
+    assert "expected_advisory_number" not in fc
+    assert _as_tuples(fc["points"]) == _TRUDY_POINTS
+    assert "degraded" not in result
+    [gap] = result["data_gaps"]
+    assert "feed_lags_text" in gap and "advisory 17" in gap and "016" in gap
+
+    again = await fetch_cyclones(fetcher, include_forecast=True)
+    assert again["storms"][0]["forecast"]["track_status"] == "feed_lags_text"
+    assert routes["tcm"].call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_text_newer_than_the_rss_is_feed_lags_text_and_kept(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    routes = _mock_jtwc()
+    rss = _fixture("jtwc_rss_20261017.xml").replace(
+        "Typhoon  29W (Champi) Warning #13", "Typhoon  29W (Champi) Warning #12"
+    )
+    routes["rss"].mock(return_value=httpx.Response(200, text=rss))
+
+    result = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    storm = next(s for s in result["storms"] if s["id"] == "29W")
+    assert storm["warning_number"] == 12  # the RSS's number, at storm level
+    champi = storm["forecast"]
+    assert champi["track_status"] == "feed_lags_text"
+    assert champi["warning_number"] == 13
+    assert champi["feed_warning_number"] == 12
+    assert _as_tuples(champi["points"]) == _CHAMPI_POINTS
+    gap = next(g for g in result["data_gaps"] if "Champi" in g)
+    assert "feed_lags_text" in gap and "warning 13" in gap and "12" in gap
+
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+    assert routes["29W"].call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_stale_warning_text_is_not_kept(fetcher: Fetcher) -> None:
+    """A lagging JTWC text is labelled stale and fetched again on the next
+    call, never served from the cache."""
+    routes = _mock_jtwc(
+        trudy=httpx.Response(200, text=_crlf(_fixture("jtwc_wp2926web_wrn013.txt")))
+    )
+
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+    second = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    trudy = next(s for s in second["storms"] if s["id"] == "21E")["forecast"]
+    assert trudy["track_status"] == "stale_warning"
+    assert trudy["expected_warning_number"] == 17
+    assert routes["21E"].call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_unparsed_page_is_not_kept(fetcher: Fetcher) -> None:
+    routes = _mock_nhc(
+        tcm=httpx.Response(200, text="<html><body><h1>Not Found</h1></body></html>")
+    )
+
+    await fetch_cyclones(fetcher, include_forecast=True)
+    second = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert second["storms"][0]["forecast"]["track_status"] == "unparsed"
+    assert routes["tcm"].call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_stale_feed_copy_is_marked_and_a_newer_page_is_not_called_stale(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    """CurrentStorms.json down, an expired copy listing advisory 016 in the
+    cache: the fetcher serves the copy marked _stale, and the response
+    keeps the marker, with or without forecasts. The text page (17) is
+    newer than that copy, so it reads feed_lags_text, not stale."""
+    old = _current_storms()
+    old["activeStorms"][0]["forecastAdvisory"]["advNum"] = "016"
+    fetcher.cache.set("cyclones:nhc:current", old, -1)
+    routes = _mock_nhc()
+    routes["current"].mock(return_value=httpx.Response(503))
+
+    plain = await fetch_cyclones(fetcher)
+
+    assert plain["count"] == 1
+    assert plain["_stale"] is True
+    assert plain["_stale_age_seconds"] >= 0
+    assert "forecast" not in plain["storms"][0]
+
+    with_forecast = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert with_forecast["_stale"] is True
+    fc = with_forecast["storms"][0]["forecast"]
+    assert fc["track_status"] == "feed_lags_text"
+    assert fc["feed_advisory_number"] == "016"
+
+
+# ---------------------------------------------------------------------------
+# An unreadable advisory or warning number: one rule for both agencies
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_an_unreadable_issuance_number_is_stale_for_both_agencies(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    """The number is the only check that a per-bin text belongs to the
+    issuance the feed lists. A text whose number cannot be read cannot be
+    shown to be current, so NHC and JTWC both label it stale (degraded,
+    not kept) and say the number was unreadable."""
+    nhc_routes = _mock_nhc(
+        tcm=httpx.Response(
+            200, text=_tcm_page().replace("FORECAST/ADVISORY NUMBER  17", "FORECAST/ADVISORY")
+        )
+    )
+    jtwc_routes = _mock_jtwc()
+    jtwc_routes["29W"].mock(
+        return_value=httpx.Response(
+            200,
+            text=_crlf(
+                _fixture("jtwc_wp2926web_wrn013.txt").replace("WARNING NR 013", "WARNING 013")
+            ),
+        )
+    )
+
+    nhc = await fetch_cyclones(fetcher, include_forecast=True)
+    jtwc = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    fc = nhc["storms"][0]["forecast"]
+    assert fc["track_status"] == "stale_advisory"
+    assert fc["advisory_number"] is None
+    assert "no readable advisory number" in fc["track_error"]
+    assert len(fc["points"]) == 8
+    assert nhc["degraded"] is True
+    champi = next(s for s in jtwc["storms"] if s["id"] == "29W")["forecast"]
+    assert champi["track_status"] == "stale_warning"
+    assert champi["warning_number"] is None
+    assert "no readable warning number" in champi["track_error"]
+    assert len(champi["points"]) == 8
+
+    await fetch_cyclones(fetcher, include_forecast=True)
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+    assert nhc_routes["tcm"].call_count == 2
+    assert jtwc_routes["29W"].call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Redirects: a product comes from its own URL or not at all
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_product_redirects_are_refused_never_followed(fetcher: Fetcher) -> None:
+    """The review's redirect probe: allowlisted product URLs answering 302
+    to a private address and to the link-local metadata address. Neither
+    target is requested, each redirect is named as a refused link, and the
+    reported URLs are the only ones fetched."""
+    routes = _mock_nhc(
+        tcm=httpx.Response(302, headers={"location": "http://10.0.0.5:8080/tcm"}),
+        cone=httpx.Response(
+            302, headers={"location": "http://169.254.169.254/latest/cone.kmz"}
+        ),
+    )
+    inner_tcm = respx.get("http://10.0.0.5:8080/tcm").mock(
+        return_value=httpx.Response(200, text=_tcm_page())
+    )
+    inner_cone = respx.get("http://169.254.169.254/latest/cone.kmz").mock(
+        return_value=httpx.Response(200, content=_cone_kmz())
+    )
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert inner_tcm.called is False
+    assert inner_cone.called is False
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "refused_link"
+    assert fc["track_url"] == _TCM_URL
+    assert "'http://10.0.0.5:8080/tcm'" in fc["track_error"]
+    assert fc["points"] == []
+    assert fc["cone_status"] == "refused_link"
+    assert fc["cone_url"] == _CONE_URL
+    assert "'http://169.254.169.254/latest/cone.kmz'" in fc["cone_error"]
+    assert fc["cone"] is None
+    assert result["degraded"] is True
+    assert sum("redirect" in g for g in result["data_gaps"]) == 2
+    # A redirect is an answer, not an outage: asked once, not retried.
+    assert routes["tcm"].call_count == 1
+    assert routes["cone"].call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_same_host_https_product_redirect_is_not_followed_either(
+    fetcher: Fetcher,
+) -> None:
+    """No product redirect is followed, even one that stays on
+    www.nhc.noaa.gov over https, so track_url is always the URL the track
+    came from."""
+    _mock_nhc(
+        tcm=httpx.Response(
+            301, headers={"location": "https://www.nhc.noaa.gov/text/refresh/MIATCMEP1.shtml"}
+        )
+    )
+    moved = respx.get("https://www.nhc.noaa.gov/text/refresh/MIATCMEP1.shtml").mock(
+        return_value=httpx.Response(200, text=_tcm_page())
+    )
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert moved.called is False
+    assert fc["track_status"] == "refused_link"
+    assert "not followed" in fc["track_error"]
+    assert fc["cone_status"] == "ok"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_warning_text_redirect_is_refused_never_followed(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    routes = _mock_jtwc()
+    routes["29W"].mock(
+        return_value=httpx.Response(
+            301, headers={"location": "http://127.0.0.1:9/wp2926web.txt"}
+        )
+    )
+    inner = respx.get("http://127.0.0.1:9/wp2926web.txt").mock(
+        return_value=httpx.Response(200, text=_crlf(_fixture("jtwc_wp2926web_wrn013.txt")))
+    )
+
+    result = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    champi = next(s for s in result["storms"] if s["id"] == "29W")["forecast"]
+    assert inner.called is False
+    assert champi["track_status"] == "refused_link"
+    assert champi["track_url"] == _JTWC_29W_URL
+    assert "'http://127.0.0.1:9/wp2926web.txt'" in champi["track_error"]
+    assert champi["points"] == []
+    assert routes["29W"].call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Feed values of the wrong type; links with whitespace or control characters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "track_status", "cone_status"),
+    [
+        (("forecastAdvisory",), "n/a", "refused_link", "ok"),
+        (("forecastAdvisory", "url"), 17, "refused_link", "ok"),
+        (("trackCone",), [1], "ok", "refused_link"),
+        (("trackCone", "kmzFile"), {"x": 1}, "ok", "refused_link"),
+        (("trackCone",), [], "ok", "not_linked"),
+    ],
+)
+@respx.mock
+@pytest.mark.asyncio
+async def test_malformed_feed_values_are_named_never_a_failed_call(
+    fetcher: Fetcher, path: tuple, value: object, track_status: str, cone_status: str
+) -> None:
+    """The review's malformed CurrentStorms.json values: four raised out of
+    fetch_cyclones and lost the storm list."""
+    current = _current_storms()
+    target = current["activeStorms"][0]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    _mock_nhc(current=current)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert result["count"] == 1
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == track_status
+    assert fc["cone_status"] == cone_status
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.nhc.noaa.gov/text/MIATCM\tEP1.shtml",
+        " https://www.nhc.noaa.gov/text/MIATCMEP1.shtml",
+        "https://www.nhc.noaa.gov/text/MIATCMEP1.shtml\r\nHost: evil.example",
+        "https://www.nhc.noaa.gov/text/MIATCMEP1.shtml\x00",
+        "https://www.nhc.noaa.gov/text/MIATCM EP1.shtml",
+        "https://www.nhc.noaa.gov/text/MIATCMEP1.shtml​",
+    ],
+)
+def test_links_with_whitespace_or_control_characters_are_refused(url: str) -> None:
+    """urllib strips tab, CR and LF before reading the host, so the
+    allowlist passed links that httpx then refused with InvalidURL."""
+    reason = cf._refused_link(url, cf._NHC_PRODUCT_HOSTS)
+    assert reason is not None
+    assert "whitespace or control" in reason
+
+
+@pytest.mark.parametrize(
+    "value", [17, {"x": 1}, ["https://www.nhc.noaa.gov/x"], b"https://www.nhc.noaa.gov/x"]
+)
+def test_links_that_are_not_strings_are_refused(value: object) -> None:
+    reason = cf._refused_link(value, cf._NHC_PRODUCT_HOSTS)
+    assert reason is not None
+    assert "not a string" in reason
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_cone_link_with_a_tab_is_refused_not_requested(fetcher: Fetcher) -> None:
+    """In the review this link passed the allowlist and httpx's
+    InvalidURL escaped fetch_cyclones."""
+    current = _current_storms()
+    current["activeStorms"][0]["trackCone"]["kmzFile"] = (
+        "https://www.nhc.noaa.gov/storm_graphics/api/EP212026_017adv\t_CONE.kmz"
+    )
+    _mock_nhc(current=current)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["cone_status"] == "refused_link"
+    assert "whitespace or control" in fc["cone_error"]
+
+
+# ---------------------------------------------------------------------------
+# One bad product never fails the response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_LZMA, zipfile.ZIP_BZIP2])
+@respx.mock
+@pytest.mark.asyncio
+async def test_corrupt_bzip2_or_lzma_cone_is_a_named_gap_not_a_failed_call(
+    fetcher: Fetcher, method: int
+) -> None:
+    """The review's corrupt LZMA and bzip2 members raised LZMAError and
+    OSError out of fetch_cyclones, losing the storm list."""
+    raw = bytearray(_kmz(_fixture("nhc_ep212026_017adv_CONE.kml"), method=method))
+    start = 30 + len("ep212026_017adv_CONE.kml")
+    for i in range(start + 12, start + 40):
+        raw[i] ^= 0x5A
+    _mock_nhc(cone=httpx.Response(200, content=bytes(raw)))
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert result["count"] == 1
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["cone_status"] == "unparsed"
+    assert "compression method" in fc["cone_error"]
+    assert result["degraded"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_one_product_keeps_the_rest(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mock_nhc()
+
+    async def broken_cone(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cf, "_nhc_cone", broken_cone)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert result["count"] == 1
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert _as_tuples(fc["points"]) == _TRUDY_POINTS
+    assert fc["cone_status"] == "error"
+    assert fc["cone_url"] == _CONE_URL
+    assert fc["cone"] is None
+    assert "RuntimeError: boom" in fc["cone_error"]
+    assert result["degraded"] is True
+    assert any("Trudy" in g and "boom" in g for g in result["data_gaps"])
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_the_nhc_track_is_a_failure_named_per_storm(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The track side of the same net: the cone still arrives, and the
+    track's error alone marks the response degraded."""
+    _mock_nhc()
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cf, "parse_nhc_forecast_advisory", broken)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "error"
+    assert fc["track_url"] == _TCM_URL
+    assert fc["feed_advisory_number"] == "017"
+    assert fc["points"] == []
+    assert "RuntimeError: boom" in fc["track_error"]
+    assert fc["cone_status"] == "ok"
+    assert result["degraded"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_any_exception_reading_the_cone_kmz_is_unparsed(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's corrupt bzip2 member raised OSError, which the cone's
+    old exception list did not name. Any exception from the KMZ parser is
+    now an unparsed cone, named with its type."""
+    _mock_nhc()
+
+    def corrupt(content: bytes) -> dict:
+        raise OSError("Invalid data stream")
+
+    monkeypatch.setattr(cf, "parse_nhc_cone_kmz", corrupt)
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["cone_status"] == "unparsed"
+    assert "OSError: Invalid data stream" in fc["cone_error"]
+    assert fc["track_status"] == "ok"
+
+
+def test_unexpected_errors_are_named_but_cancellation_is_not_swallowed() -> None:
+    assert cf._unexpected(RuntimeError("boom")) == "RuntimeError: boom"
+    with pytest.raises(asyncio_mod.CancelledError):
+        cf._unexpected(asyncio_mod.CancelledError())
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_one_jtwc_storm_keeps_the_others(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, no_sleep: None
+) -> None:
+    _mock_jtwc()
+    real = cf.parse_jtwc_warning
+
+    def flaky(text: str, anchor: datetime) -> dict:
+        if "CHAMPI" in text:
+            raise RuntimeError("boom")
+        return real(text, anchor)
+
+    monkeypatch.setattr(cf, "parse_jtwc_warning", flaky)
+
+    result = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    assert result["count"] == 3
+    by_id = {s["id"]: s["forecast"] for s in result["storms"]}
+    assert by_id["29W"]["track_status"] == "error"
+    assert by_id["29W"]["track_url"] == _JTWC_29W_URL
+    assert "RuntimeError: boom" in by_id["29W"]["track_error"]
+    assert by_id["29W"]["points"] == []
+    assert by_id["29W"]["cone_status"] == "not_published"
+    assert _as_tuples(by_id["01P"]["points"]) == _WATI_POINTS
+    assert any("Champi" in g and "boom" in g for g in result["data_gaps"])
+
+
+# ---------------------------------------------------------------------------
+# KMZ members: compression method, expansion ratio, declared size
+# ---------------------------------------------------------------------------
+
+
+def _record_member_opens(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every ZipFile.open call (a member read) from here on."""
+    opened: list = []
+    real_open = zipfile.ZipFile.open
+
+    def recording_open(self, *args, **kwargs):
+        opened.append(args[0] if args else kwargs.get("name"))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", recording_open)
+    return opened
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
+def test_cone_kmz_member_not_stored_or_deflated_is_refused_unread(
+    method: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """zipfile runs bzip2 and LZMA members through decompressors with no
+    output bound (the review measured a 621-byte bzip2 KMZ taking the
+    process to 1 GiB RSS), so such a member is refused before it is
+    opened."""
+    kmz = _kmz(_fixture("nhc_ep212026_017adv_CONE.kml"), method=method)
+    opened = _record_member_opens(monkeypatch)
+    with pytest.raises(ValueError, match="compression method"):
+        cf.parse_nhc_cone_kmz(kmz)
+    assert opened == []
+
+
+def test_cone_kmz_with_a_stored_member_parses() -> None:
+    cone = cf.parse_nhc_cone_kmz(
+        _kmz(_fixture("nhc_ep212026_017adv_CONE.kml"), method=zipfile.ZIP_STORED)
+    )
+    assert cone["source_vertex_count"] == 1167
+    assert cone["vertices"][0] == [16.33344, -103.90001]
+
+
+def test_cone_kmz_member_expanding_past_the_ratio_bound_is_refused_unread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4 MiB of padding inside the KML: under the 8 MiB cap, but the member
+    then expands about 300:1 (the live cone's member expands 2.8:1)."""
+    kml = _fixture("nhc_ep212026_017adv_CONE.kml").replace(
+        "<Document>\n", "<Document>\n" + " " * (4 * 1024 * 1024), 1
+    )
+    kmz = _kmz(kml)
+    info = zipfile.ZipFile(io.BytesIO(kmz)).infolist()[0]
+    assert info.file_size <= cf._KML_MAX_BYTES
+    assert info.file_size > cf._KML_MAX_RATIO * info.compress_size
+    opened = _record_member_opens(monkeypatch)
+    with pytest.raises(ValueError, match="expands"):
+        cf.parse_nhc_cone_kmz(kmz)
+    assert opened == []
+
+
+def test_cone_kmz_member_declaring_more_than_the_kml_cap_is_refused_unread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member over 8 MiB is refused from its declared size, before any of
+    it is decompressed. Random bytes keep the compression ratio near 1:1,
+    so only the size check can refuse it unopened."""
+    kmz = _kmz(random.Random(0).randbytes(cf._KML_MAX_BYTES + 1))
+    opened = _record_member_opens(monkeypatch)
+    with pytest.raises(ValueError, match="exceeds cap"):
+        cf.parse_nhc_cone_kmz(kmz)
+    assert opened == []
+
+
+def test_cone_kmz_member_larger_than_it_declares_is_refused() -> None:
+    """A header that understates the member (1 MiB of KML declared as
+    1,000 bytes): zipfile stops reading at the declared size, and the
+    checksum then refuses the member."""
+    kml = _fixture("nhc_ep212026_017adv_CONE.kml").replace(
+        "<Document>\n", "<Document>\n" + " " * (1024 * 1024), 1
+    )
+    raw = bytearray(_kmz(kml))
+    struct.pack_into("<I", raw, 22, 1000)  # local file header: uncompressed size
+    central = raw.rfind(b"PK\x01\x02")
+    struct.pack_into("<I", raw, central + 24, 1000)  # central directory entry
+    with pytest.raises(zipfile.BadZipFile, match="CRC"):
+        cf.parse_nhc_cone_kmz(bytes(raw))
+
+
+def _understated_kmz(real_bytes: int, declared_bytes: int) -> bytes:
+    """One deflated member of ``real_bytes`` spaces whose local and central
+    headers declare ``declared_bytes`` (the CRC stays the real one)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("ep212026_017adv_CONE.kml")
+        info.compress_type = zipfile.ZIP_DEFLATED
+        chunk = b" " * (1024 * 1024)
+        with zf.open(info, "w") as member:
+            for _ in range(real_bytes // len(chunk)):
+                member.write(chunk)
+    raw = bytearray(buf.getvalue())
+    struct.pack_into("<I", raw, 22, declared_bytes)  # local file header: uncompressed size
+    central = raw.rfind(b"PK\x01\x02")
+    struct.pack_into("<I", raw, central + 24, declared_bytes)  # central directory entry
+    return bytes(raw)
+
+
+def test_cone_kml_read_stays_bounded_when_the_member_understates_its_size() -> None:
+    """32 MiB of KML declared as 1 MiB passes the size and ratio checks, so
+    only the bounded read keeps the member from being decompressed whole.
+    Peak traced allocation, measured with tracemalloc on Python 3.11.11,
+    3.12.7 and 3.13.11 (2026-10-17): 16.1 MiB as written, 77.4 MiB when
+    the member is read unbounded (``handle.read()``)."""
+    kmz = _understated_kmz(32 * 1024 * 1024, 1024 * 1024)
+    started = not tracemalloc.is_tracing()
+    if started:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        with pytest.raises(zipfile.BadZipFile, match="CRC"):
+            cf.parse_nhc_cone_kmz(kmz)
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        if started:
+            tracemalloc.stop()
+    assert peak < 3 * cf._KML_MAX_BYTES
+
+
+def test_cone_kml_past_the_cap_is_refused_even_if_the_zip_layer_returns_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The length check after the read is the second line behind the
+    declared-size check: CPython's zipfile never returns more than a member
+    declares (see the CRC test above), so this stands in a zip layer that
+    does, handing back the live cone's KML followed by 8 MiB of trailing
+    whitespace. Without the check that document parses as an ok cone."""
+    kmz = _cone_kmz()
+    kml = _fixture("nhc_ep212026_017adv_CONE.kml").encode() + b" " * cf._KML_MAX_BYTES
+    monkeypatch.setattr(zipfile.ZipFile, "open", lambda self, *args, **kwargs: io.BytesIO(kml))
+    with pytest.raises(ValueError, match="KML exceeds cap"):
+        cf.parse_nhc_cone_kmz(kmz)
+
+
+@pytest.mark.parametrize(
+    "bad", ["-100.0,91.0,0", "-100.0,-90.5,0", "-100.0,nan,0", "nan,15.0,0", "inf,15.0,0"]
+)
+def test_cone_vertex_outside_the_coordinate_range_is_refused(bad: str) -> None:
+    tokens = ["-100.0,15.0,0", "-99.0,15.0,0", bad, "-100.0,16.0,0", "-100.0,15.0,0"]
+    with pytest.raises(ValueError, match="out of range"):
+        cf.parse_cone_kml_ring(_coords_kml(tokens).encode())
+
+
+def test_cone_outline_under_three_vertices_is_refused() -> None:
+    """The review's ring 0.004 degrees across simplified to one vertex at
+    the 0.01 degree tolerance and still read ok."""
+    pts = [(15.0, -100.0), (15.004, -100.0), (15.004, -100.004), (15.0, -100.004)]
+    tokens = [f"{lon},{lat},0" for lat, lon in pts + pts[:1]]
+    with pytest.raises(ValueError, match="at least 3"):
+        cf.parse_nhc_cone_kmz(_kmz(_coords_kml(tokens)))
+
+
+# ---------------------------------------------------------------------------
+# Simplifier cost and outline size
+# ---------------------------------------------------------------------------
+
+
+def _zigzag_kml(vertices: int, amplitude: float) -> str:
+    """The review's worst case: a ring zig-zagging ``amplitude`` degrees,
+    above the 0.01 degree tolerance, so nearly every vertex is kept and
+    each split peels off one vertex."""
+    points = [
+        f"{-100 + i * 1e-3:.4f},{15 + (i % 2) * amplitude:.4f},0" for i in range(vertices)
+    ]
+    return _coords_kml(points + points[:1])
+
+
+def test_cone_simplifier_cost_is_bounded_at_the_vertex_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At the old 10,000-vertex cap this ring kept 9,990 vertices and took
+    15.1 s of CPU (the review's measurement, 2026-10-17) and 49,994,955
+    distance evaluations (calls to _segment_distance, counted the same way
+    on the unfixed module, the same day). The bound is counted, not timed,
+    so the test is deterministic; it is absolute, so raising either cap
+    past it fails here; and the counter stops a regressed run early
+    instead of letting it take seconds."""
+    budget = 2_000_000
+    calls = 0
+    real = cf._segment_distance
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        if calls > budget:
+            raise AssertionError(f"simplifier passed {budget:,} distance evaluations")
+        return real(*args)
+
+    kmz = _kmz(_zigzag_kml(cf._CONE_MAX_VERTICES, 0.05))
+    monkeypatch.setattr(cf, "_segment_distance", counted)
+    with pytest.raises(ValueError, match="over the outline cap"):
+        cf.parse_nhc_cone_kmz(kmz)
+    assert calls <= budget
+
+
+def test_simplified_outline_over_the_vertex_cap_is_refused() -> None:
+    square = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+    assert len(cf.simplify_closed_ring(square, 0.01, max_vertices=4)) == 4
+    with pytest.raises(ValueError, match="more than 3"):
+        cf.simplify_closed_ring(square, 0.01, max_vertices=3)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_cone_is_parsed_off_the_event_loop_thread(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+    real = cf.parse_nhc_cone_kmz
+
+    def recording(content: bytes) -> dict:
+        seen.append(threading.get_ident())
+        return real(content)
+
+    monkeypatch.setattr(cf, "parse_nhc_cone_kmz", recording)
+    _mock_nhc()
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert result["storms"][0]["forecast"]["cone_status"] == "ok"
+    assert len(seen) == 1
+    assert seen[0] != threading.get_ident()
+
+
+# ---------------------------------------------------------------------------
+# Parsers: values stay inside their own block and fix
+# ---------------------------------------------------------------------------
+
+
+def test_nhc_point_without_a_wind_line_does_not_borrow_the_next_one() -> None:
+    text = _fixture("nhc_tcm_ep212026_adv017.txt")
+    old = "FORECAST VALID 19/0000Z 20.1N 106.4W\nMAX WIND  85 KT...GUSTS 105 KT.\n"
+    assert old in text
+    parsed = cf.parse_nhc_forecast_advisory(
+        text.replace(old, "FORECAST VALID 19/0000Z 20.1N 106.4W\n")
+    )
+    by_tau = {p["tau_hours"]: p for p in parsed["points"]}
+    assert by_tau[36]["max_wind_kt"] is None
+    assert by_tau[36]["gust_kt"] is None
+    assert by_tau[48]["max_wind_kt"] == 65
+
+
+def test_jtwc_point_without_a_wind_line_does_not_borrow_the_next_one() -> None:
+    text = _fixture("jtwc_wp2926web_wrn013.txt")
+    old = "181200Z --- 13.5N 141.6E\n   MAX SUSTAINED WINDS - 135 KT, GUSTS 165 KT\n"
+    assert old in text
+    parsed = cf.parse_jtwc_warning(text.replace(old, "181200Z --- 13.5N 141.6E\n"), _FAR_NOW)
+    by_tau = {p["tau_hours"]: p for p in parsed["points"]}
+    assert by_tau[24]["max_wind_kt"] is None
+    assert by_tau[36]["max_wind_kt"] == 140
+
+
+def test_jtwc_pressure_for_another_time_is_not_the_warning_fix_pressure() -> None:
+    text = _fixture("jtwc_wp2926web_wrn013.txt")
+    old = "MINIMUM CENTRAL PRESSURE AT 171200Z IS 945 MB"
+    assert old in text
+    parsed = cf.parse_jtwc_warning(
+        text.replace(old, "MINIMUM CENTRAL PRESSURE AT 171800Z IS 945 MB"), _FAR_NOW
+    )
+    assert parsed["initial"]["valid_time"] == "2026-10-17T12:00:00Z"
+    assert parsed["initial"]["pressure_mb"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-issuance cache keys
+# ---------------------------------------------------------------------------
+
+
+def _next_advisory_feed() -> dict:
+    """Trudy's feed entry moved on to advisory 018 (new numbers, file times
+    and cone URL; the text URL is the same bin page)."""
+    current = _current_storms()
+    storm = current["activeStorms"][0]
+    storm["forecastAdvisory"].update(advNum="018", fileUpdateTime="2026-10-17T20:37:11.524Z")
+    storm["trackCone"].update(
+        advNum="018",
+        fileUpdateTime="2026-10-17T20:39:40.332Z",
+        kmzFile=_CONE_URL.replace("_017adv_", "_018adv_"),
+    )
+    return current
+
+
+def _advisory_18_cone_kml() -> str:
+    kml = _fixture("nhc_ep212026_017adv_CONE.kml")
+    old = '<Data name="advisoryNum">\n                <value>17</value>'
+    assert kml.count(old) == 1
+    return kml.replace(old, old.replace(">17<", ">18<"))
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_track_and_cone_are_fetched_again_for_a_new_advisory(
+    fetcher: Fetcher,
+) -> None:
+    """The cache keys carry the advisory number and file time: a new
+    advisory never reuses the previous advisory's text or cone."""
+    routes = _mock_nhc()
+    first = await fetch_cyclones(fetcher, include_forecast=True)
+    assert first["storms"][0]["forecast"]["advisory_number"] == "17"
+    assert first["storms"][0]["forecast"]["cone"]["advisory_number"] == "17"
+
+    fetcher.cache.delete("cyclones:nhc:current")  # the feed itself is cached 600 s
+    routes["current"].mock(return_value=httpx.Response(200, json=_next_advisory_feed()))
+    routes["tcm"].mock(
+        return_value=httpx.Response(
+            200,
+            text=_tcm_page().replace(
+                "FORECAST/ADVISORY NUMBER  17", "FORECAST/ADVISORY NUMBER  18"
+            ),
+        )
+    )
+    cone_18 = respx.get(_CONE_URL.replace("_017adv_", "_018adv_")).mock(
+        return_value=httpx.Response(200, content=_kmz(_advisory_18_cone_kml()))
+    )
+
+    second = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = second["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["advisory_number"] == "18"
+    assert fc["cone_status"] == "ok"
+    assert fc["cone"]["advisory_number"] == "18"
+    assert routes["tcm"].call_count == 2
+    assert cone_18.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_products_are_fetched_again_when_only_the_advisory_number_changes(
+    fetcher: Fetcher,
+) -> None:
+    """The keys carry the number itself, not only the file time: a feed
+    entry for advisory 018 that kept 017's file times still gets fresh
+    products. A key on the file time alone would serve 017's text (read
+    as stale) and 017's cone."""
+    routes = _mock_nhc()
+    await fetch_cyclones(fetcher, include_forecast=True)
+
+    renumbered = _current_storms()
+    storm = renumbered["activeStorms"][0]
+    storm["forecastAdvisory"]["advNum"] = "018"
+    storm["trackCone"]["advNum"] = "018"
+    fetcher.cache.delete("cyclones:nhc:current")
+    routes["current"].mock(return_value=httpx.Response(200, json=renumbered))
+    routes["tcm"].mock(
+        return_value=httpx.Response(
+            200,
+            text=_tcm_page().replace(
+                "FORECAST/ADVISORY NUMBER  17", "FORECAST/ADVISORY NUMBER  18"
+            ),
+        )
+    )
+    routes["cone"].mock(return_value=httpx.Response(200, content=_kmz(_advisory_18_cone_kml())))
+
+    second = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = second["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["advisory_number"] == "18"
+    assert fc["cone"]["advisory_number"] == "18"
+    assert routes["tcm"].call_count == 2
+    assert routes["cone"].call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_corrected_product_with_the_same_number_is_fetched_again(
+    fetcher: Fetcher,
+) -> None:
+    """Same advisory number, new file time (a corrected product): both
+    products are fetched again, not served from the cache."""
+    routes = _mock_nhc()
+    await fetch_cyclones(fetcher, include_forecast=True)
+
+    corrected = _current_storms()
+    storm = corrected["activeStorms"][0]
+    storm["forecastAdvisory"]["fileUpdateTime"] = "2026-10-17T15:10:00.000Z"
+    storm["trackCone"]["fileUpdateTime"] = "2026-10-17T15:12:00.000Z"
+    fetcher.cache.delete("cyclones:nhc:current")
+    routes["current"].mock(return_value=httpx.Response(200, json=corrected))
+
+    await fetch_cyclones(fetcher, include_forecast=True)
+
+    assert routes["tcm"].call_count == 2
+    assert routes["cone"].call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_text_is_fetched_again_when_only_the_warning_number_changes(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    """Warning 14 listed with warning 13's issue time still gets a fresh
+    text: the key carries the number, not only the time."""
+    routes = _mock_jtwc()
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    rss_14 = _fixture("jtwc_rss_20261017.xml").replace(
+        "Typhoon  29W (Champi) Warning #13", "Typhoon  29W (Champi) Warning #14"
+    )
+    text_14 = _fixture("jtwc_wp2926web_wrn013.txt").replace("WARNING NR 013", "WARNING NR 014")
+    fetcher.cache.delete("jtwc:rss:current")
+    routes["rss"].mock(return_value=httpx.Response(200, text=rss_14))
+    routes["29W"].mock(return_value=httpx.Response(200, text=_crlf(text_14)))
+
+    second = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    champi = next(s for s in second["storms"] if s["id"] == "29W")["forecast"]
+    assert champi["track_status"] == "ok"
+    assert champi["warning_number"] == 14
+    assert routes["29W"].call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_jtwc_text_is_fetched_again_for_a_new_or_reissued_warning(
+    fetcher: Fetcher, no_sleep: None
+) -> None:
+    routes = _mock_jtwc()
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    rss_14 = (
+        _fixture("jtwc_rss_20261017.xml")
+        .replace("Typhoon  29W (Champi) Warning #13", "Typhoon  29W (Champi) Warning #14")
+        .replace("Issued at 17/1500Z", "Issued at 17/2100Z")
+    )
+    text_14 = _fixture("jtwc_wp2926web_wrn013.txt").replace("WARNING NR 013", "WARNING NR 014")
+    fetcher.cache.delete("jtwc:rss:current")  # the RSS itself is cached 600 s
+    routes["rss"].mock(return_value=httpx.Response(200, text=rss_14))
+    routes["29W"].mock(return_value=httpx.Response(200, text=_crlf(text_14)))
+
+    second = await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+
+    champi = next(s for s in second["storms"] if s["id"] == "29W")["forecast"]
+    assert champi["track_status"] == "ok"
+    assert champi["warning_number"] == 14
+    assert routes["29W"].call_count == 2
+
+    # Reissued: the same warning number at a new issue time.
+    fetcher.cache.delete("jtwc:rss:current")
+    routes["rss"].mock(
+        return_value=httpx.Response(
+            200, text=rss_14.replace("Issued at 17/2100Z", "Reissued at 17/2200Z")
+        )
+    )
+    await fetch_jtwc_cyclones(fetcher, include_forecast=True)
+    assert routes["29W"].call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Small paths: number comparison, text size cap, tiny rings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("found", "listed", "standing"),
+    [
+        ("17", "017", "same"),
+        ("18", "017", "newer"),
+        ("16", "017", "older"),
+        (13, 12, "newer"),
+        (None, "017", "unreadable"),
+        ("17A", "017a", "same"),  # not plain integers: equal or not, never ordered
+        ("17A", "017", "older"),
+    ],
+)
+def test_issuance_numbers_are_compared_as_integers_when_they_are_integers(
+    found: object, listed: object, standing: str
+) -> None:
+    assert cf._compare_issuance(found, listed) == standing
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_nhc_text_over_the_size_cap_is_a_named_fetch_failure(fetcher: Fetcher) -> None:
+    _mock_nhc(tcm=httpx.Response(200, content=b"x" * (cf._TEXT_MAX_BYTES + 1)))
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "fetch_failed"
+    assert f"exceeds cap {cf._TEXT_MAX_BYTES}" in fc["track_error"]
+    assert result["degraded"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_cone_kmz_over_the_size_cap_is_a_named_fetch_failure(fetcher: Fetcher) -> None:
+    _mock_nhc(cone=httpx.Response(200, content=b"x" * (cf._CONE_MAX_BYTES + 1)))
+
+    result = await fetch_cyclones(fetcher, include_forecast=True)
+
+    fc = result["storms"][0]["forecast"]
+    assert fc["track_status"] == "ok"
+    assert fc["cone_status"] == "fetch_failed"
+    assert f"exceeds cap {cf._CONE_MAX_BYTES}" in fc["cone_error"]
+
+
+def test_the_documented_limits_are_the_enforced_ones() -> None:
+    """The CHANGELOG and the module docstring state these numbers, and the
+    behaviour tests above are written against the constants; this pins
+    the constants to the stated values, so changing a limit means
+    changing its documentation too."""
+    assert cf.MAX_FORECAST_STORMS == 10
+    assert cf._TEXT_MAX_BYTES == 1024 * 1024
+    assert cf._CONE_MAX_BYTES == 2 * 1024 * 1024
+    assert cf._KML_MAX_BYTES == 8 * 1024 * 1024
+    assert cf._KML_MAX_RATIO == 100
+    assert cf._CONE_MAX_VERTICES == 3_000
+    assert cf._CONE_MAX_OUTLINE_VERTICES == 500
+
+
+def test_simplify_ring_too_short_to_simplify_still_honours_the_cap() -> None:
+    two_point_ring = [(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]
+    assert cf.simplify_closed_ring(two_point_ring, 0.01, max_vertices=2) == [(0.0, 0.0), (1.0, 0.0)]
+    with pytest.raises(ValueError, match="more than 1"):
+        cf.simplify_closed_ring(two_point_ring, 0.01, max_vertices=1)

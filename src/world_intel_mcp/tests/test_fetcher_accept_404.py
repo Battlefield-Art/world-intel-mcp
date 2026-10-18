@@ -161,3 +161,42 @@ async def test_accept_404_is_keyword_only(fetcher: Fetcher, sleep: AsyncMock) ->
     with pytest.raises(TypeError):
         await fetcher.get_bytes(_URL, "t", None, None, 1024, _json_object)
     assert route.call_count == 0
+
+
+@respx.mock
+async def test_accepted_404_body_is_read_through_the_stream(fetcher: Fetcher, sleep: AsyncMock) -> None:
+    """get_bytes streams its response, so the predicate gets the 404 body
+    read from the stream, not resp.content (which raises on a stream)."""
+    seen: list[bytes] = []
+
+    def accept(body: bytes) -> bool:
+        seen.append(body)
+        return True
+
+    respx.get(_URL).mock(return_value=httpx.Response(404, content=_PROBLEM_404))
+
+    result = await fetcher.get_bytes(_URL, source="t", accept_404=accept)
+
+    assert result == BinaryResult(404, None, None)
+    assert seen == [_PROBLEM_404]
+
+
+@respx.mock
+async def test_404_body_over_the_cap_counts_as_rejected(fetcher: Fetcher, sleep: AsyncMock) -> None:
+    """A 404 body is read for the predicate only up to max_bytes; a longer
+    one is never handed to it and is handled as a rejected 404."""
+    fetcher.max_retries = 0
+    seen: list[bytes] = []
+
+    def accept(body: bytes) -> bool:
+        seen.append(body)
+        return True
+
+    respx.get(_URL).mock(return_value=httpx.Response(404, content=_PROBLEM_404))
+
+    result = await fetcher.get_bytes(_URL, source="t", max_bytes=len(_PROBLEM_404) - 1, accept_404=accept)
+
+    assert seen == []
+    assert result.status == 404 and result.content is None
+    assert result.error is not None and result.error.startswith("HTTPStatusError: Client error '404 Not Found'")
+    assert fetcher.breaker.status()["t"]["total_failures"] == 1

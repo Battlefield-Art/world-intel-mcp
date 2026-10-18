@@ -197,10 +197,13 @@ class Cache:
             logger.warning("Cache write failed for %s: %s", key, exc)
 
     def delete(self, key: str) -> None:
-        """Delete a specific key."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM cache WHERE key = ?", (key,))
-        conn.commit()
+        """Delete a specific key. Failures are logged and swallowed, as in set()."""
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            logger.warning("Cache delete failed for %s: %s", key, exc)
 
     def evict_expired(self) -> int:
         """Remove all expired entries. Returns count removed."""

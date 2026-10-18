@@ -351,28 +351,65 @@ source here, and no proxy is substituted for any of these measures.
 ### Data honesty: forecast tracks
 - `data_gaps` names every track or cone not delivered, per storm, with a
   status: `fetch_failed`, `unparsed`, `refused_link`, `not_linked`,
-  `not_published` or `not_fetched_cap` (at most 10 storms per call; the rest are named,
-  never dropped). A failure marks the response `degraded`; a product the
-  agency does not link is a gap, not degradation. A quiet basin still
-  answers zero storms, not degraded, and makes no product fetches; a feed
-  outage keeps its existing degraded shape and makes none either.
-- The text pages are per storm bin, not per issuance, so one can lag the
-  feed: an advisory or warning number that disagrees with the feed is
-  returned as `stale_advisory` or `stale_warning` with the expected
-  number, and its cached copy is dropped.
+  `not_published`, `not_fetched_cap` (at most 10 storms per call; the rest are named,
+  never dropped) or `error` (an unexpected exception while building that one
+  product; the storm list and every other product still arrive). A failure
+  marks the response `degraded`; a product the agency does not link is a
+  gap, not degradation. A quiet basin still answers zero storms, not
+  degraded, and makes no product fetches; a feed outage keeps its existing
+  degraded shape and makes none either.
+- The text pages are per storm bin, not per issuance, and the feeds are
+  cached for 600 s, so a text and its feed entry can be out of step either
+  way. Its advisory or warning number is compared with the feed's, with one
+  rule for both agencies: a text older than the feed, or one whose number
+  cannot be read, is `stale_advisory` or `stale_warning` (degraded, with the
+  expected number, not kept); a text newer than the feed is
+  `feed_lags_text` (named in `data_gaps`, not degraded, kept). Every
+  forecast carries both numbers: `advisory_number` / `warning_number` from
+  the text, `feed_advisory_number` / `feed_warning_number` from the feed,
+  which the storm's other fields also come from.
 - Each product is fetched once per issuance (cache keys carry the
-  advisory or warning number; one-hour TTL) under its own circuit breaker
+  advisory or warning number and the file or issue time; one-hour TTL;
+  only an accepted text is kept) under its own circuit breaker
   (`nhc-forecast`, `nhc-gis`, `jtwc-warning`), so a product outage does
-  not trip the warning feeds' breakers.
+  not trip the warning feeds' breakers. A failed text fetch is
+  `fetch_failed`; it is not answered from an expired copy.
 - Remote KML is parsed with the standard library: strict UTF-8, any
-  DOCTYPE refused, size caps (KMZ 2 MB, KML 8 MB), and a cone with more
-  than one ring refused, never trimmed. A ring of more than 10,000
-  vertices is refused before simplifying, and simplifying runs off the
-  event loop.
+  DOCTYPE refused, the KML member read only when it is stored or deflated
+  and declares at most 100:1 expansion, and a cone with more than one ring
+  refused, never trimmed. Size caps: text 1 MiB, KMZ 2 MiB, KML member
+  8 MiB. Texts and the KMZ are read with `Fetcher.get_bytes`, which stops
+  reading once the decoded body passes its cap; one 64 KiB network read of
+  gzip can still decode to about 64 MiB before that check.
+- A ring of more than 3,000 vertices is refused before simplifying, and
+  simplifying stops once the outline passes 500 vertices, which bounds it
+  at about 1.5 million distance evaluations. Measured on one machine: a
+  zig-zag ring at the cap takes 0.42 s of CPU; the same shape at the old
+  10,000-vertex cap took 15 s. An outline of fewer than 3 vertices is
+  refused. Simplifying runs off the event loop.
 - Product links come from the agencies' feeds and are fetched only when
-  they are https on the agency's own host (www.nhc.noaa.gov,
-  www.metoc.navy.mil). Any other link is reported as `refused_link` and
-  never requested.
+  they are strings, contain no whitespace or control characters, and are
+  https on the agency's own host (www.nhc.noaa.gov, www.metoc.navy.mil).
+  Any other link, and a feed record that is not an object, is reported as
+  `refused_link` and never requested. No product redirect is followed:
+  one is reported as `refused_link` naming its target, so `track_url` and
+  `cone_url` are always where the data came from.
+- `intel_cyclones` keeps the fetcher's `_stale` and `_stale_age_seconds`
+  marker when CurrentStorms.json is served from an expired cached copy,
+  with or without `include_forecast` (it was dropped before).
+- `Fetcher.get_bytes` takes `follow_redirects` (keyword-only, default
+  true); with false, a redirect is returned as its status and resolved
+  `location`, never requested, retried or counted as a source failure. It
+  also reads a body as it arrives and refuses it as soon as the decoded
+  size passes `max_bytes`, where it used to buffer and decode the whole
+  body first. Measured on one machine, a 521,844-byte gzip body that
+  decodes to 512 MiB, from a local server, with a 64 MiB cap: peak RSS
+  went from 40 MiB to 1,120 MiB before, to 176 MiB after (reading stopped
+  at 67,244,864 decoded bytes, the first network read). The over-cap
+  error now reads "body exceeds cap N: stopped after M decoded bytes".
+  `get_text` and `get_json` still read whole bodies, and `get_text` has no
+  cap. `Cache.delete` logs and swallows a locked or read-only database, as
+  `Cache.set` does.
 - Measured 2026-10-17: every product used answered HTTP 200 without a
   key; nhc.noaa.gov robots.txt disallows nothing and the NWS disclaimer
   puts the products in the public domain. The JTWC home page and
