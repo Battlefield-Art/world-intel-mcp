@@ -607,7 +607,7 @@ History accrues only while the collector (`intel-collector`) runs; nothing befor
 | `intel_capture_history` | A source's earlier captures (ok / degraded / error with reason, duration, record count) and whether each changed from the previous one; `capture_id` replays one stored payload |
 | `intel_series_history` | One series' observations with all three dates, or the list of available series |
 | `intel_revisions` | Values for the same `observed_at` that a later capture changed (USGS magnitude revisions, NOAA Kp updates) |
-| `intel_history_backfill` | Load the history FRED (graph CSV) or the ECB Data Portal already serve into the history store: one capture per series under `backfill:fred` / `backfill:ecb`, `observed_at` from the publisher's dates, `published_at` null, `collected_at` the backfill time; re-runs store only new or changed values (a change is a revision); missing values skipped and counted; writes and fetches, so capped at 5 FRED series or 2 ECB keys per call |
+| `intel_history_backfill` | Load the history FRED (graph CSV) or the ECB Data Portal already serve into the history store: one capture per request (a FRED id, or an ECB key that may match several series) under `backfill:fred` / `backfill:ecb`, `observed_at` from the publisher's dates, `published_at` null, `collected_at` the backfill time; re-runs store only new or changed values (a change is a revision); FRED missing values skipped and counted, ECB missing values not countable (null); writes and fetches, so capped at 5 FRED series or 2 ECB keys per call |
 
 ---
 

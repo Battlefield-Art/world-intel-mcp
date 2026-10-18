@@ -242,7 +242,9 @@ source here, and no proxy is substituted for any of these measures.
   `backfill:ecb` (series `backfill:fred:<ID>` and
   `backfill:ecb:<DATASET>.<KEY>`), so they never read as collector
   captures; `intel_collection_health` and `intel history health` list them
-  apart (`backfills`). Every run is logged in a new table,
+  apart (`backfills`), and a source whose latest call had any failed
+  request reads `error` with that request's reason, whatever order the
+  requests were named in. Every run is logged in a new table,
   `history_backfills`, created in place with `CREATE TABLE IF NOT EXISTS`
   (existing rows untouched).
 - Dates: `observed_at` is the publisher's period (FRED's date; ECB months
@@ -251,7 +253,19 @@ source here, and no proxy is substituted for any of these measures.
   vintage date; `collected_at` is the backfill time, stamped after the
   call's last fetch. Values are the publisher's vintage on the backfill
   day, already revised, so revisions made before the first backfill are
-  invisible.
+  invisible. `--start` keeps values dated on or after it: FRED dates as
+  written (a month by its first day), ECB weeks and quarters by the period
+  end the store keeps, so the ECB is asked from up to one period earlier
+  and the boundary period is cut client-side.
+- One capture per request (a FRED id, or an ECB key that may match several
+  series). Its saved body is a summary (request, start, full-response
+  hash, per-series counts and dates), not the response: the values are in
+  the observations, and a replay stays small. An ECB '+' alternative that
+  matched no series is named in `data_gaps`.
+- Values a re-run no longer finds in the response's date span (withdrawn,
+  or now a missing cell) are reported as `absent_from_response` with the
+  first and last date; the store keeps them as the earlier backfill read
+  them.
 - Idempotent: a re-run stores only new or changed values, and a changed
   value is a revision in `intel_revisions`. FRED's missing cells (`.` and
   blank) are skipped and counted, never stored as zero. ECB missing values
@@ -259,14 +273,23 @@ source here, and no proxy is substituted for any of these measures.
 - Failures are errors, never an empty success: an HTTP error, an empty or
   malformed body, a window without values, and a response available only
   as a stale cache copy each record an error capture and store nothing.
-  The CLI exits 1 when any request failed.
+  The CLI exits 1 when any request failed. A store write failure names
+  the request it failed on, the requests fetched but not written, and the
+  upstream failures after it, written as error captures when the store
+  accepts them and listed as not logged when it does not.
 - Caps per call: 5 FRED series or 2 ECB keys (at most 20 series per key),
   the newest 20,000 points per series and 100,000 per call; `--start`
-  narrows the window.
-- Retention: observations are pruned by `collected_at`, not `observed_at`,
-  so a 1962 value is kept as long as any value stored by the same backfill
-  (`WORLD_INTEL_HISTORY_DAYS`, default 365). A backfill prunes before it
-  stores, so a pruned value is stored again as new.
+  narrows the window. Older values past the series cap cannot be loaded
+  by a backfill (there is no end bound); values left out by the call
+  budget load in a call of their own.
+- Retention: a backfill prunes only backfill rows (sources `backfill:*`
+  and its own log), with this process's retention settings; collector rows
+  are left to the collector. Observations are pruned by `collected_at`, not
+  `observed_at`, so a 1962 value is kept as long as any value stored by the
+  same backfill (`WORLD_INTEL_HISTORY_DAYS`, default 365, 0 keeps forever).
+  A backfill prunes before it stores, so a pruned value is stored again as
+  new. The collector's own prune still covers backfill rows, under the
+  collector's settings.
 - New history extractors (`history_extractors.py`): `liquidity_board`
   (latest and previous value per indicator; the derived net liquidity row
   is left to its own source), `net_liquidity` (net liquidity and its three

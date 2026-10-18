@@ -9,8 +9,9 @@ the fetch and parse code the liquidity tools use (``sources/liquidity.py``:
 project's Fetcher with its FRED rate floor, circuit breaker and cache, and
 writes the points into the history store (``history.py``):
 
-- One capture per request (one FRED series id, or one ECB series key)
-  under the source ``backfill:fred`` or ``backfill:ecb``, so a backfilled
+- One capture per request (one FRED series id, or one ECB series key,
+  which may match several series) under the source ``backfill:fred`` or
+  ``backfill:ecb``, so a backfilled
   row never reads as a collector capture. Series keys are
   ``backfill:fred:<ID>`` and ``backfill:ecb:<DATASET>.<KEY>``. Every run is
   also logged in ``history_backfills`` (request, start, per-series counts,
@@ -20,7 +21,11 @@ writes the points into the history store (``history.py``):
 - Three dates: ``observed_at`` is the period the publisher dates a value
   by (FRED dates as written, a monthly value at the first day of its month;
   ECB months as written, an ECB week as the Sunday that ends the ISO week,
-  any other ECB period as the period end its response states);
+  any other ECB period as the period end its response states). A start
+  keeps values whose ``observed_at`` is on or after it, for both
+  providers: the ECB applies ``startPeriod`` to a period's first day, so
+  the ECB request asks from one period earlier (6 days for weeks, 92 for
+  quarters, 183 for half-years) and the window is cut here;
   ``published_at`` is NULL because neither response names a release or
   vintage date (the FRED graph CSV carries observation dates and values
   only); ``collected_at`` is the backfill time, one stamp per call taken
@@ -30,24 +35,40 @@ writes the points into the history store (``history.py``):
   stores nothing unless the publisher changed a value, and a changed value
   is then a revision (``intel_revisions``).
 - FRED missing values ("." and blank cells) are skipped and counted, never
-  stored as zero; non-finite values are skipped and counted apart.
+  stored as zero; non-finite values are skipped and counted apart. A
+  stored value inside the response's date span that the response no
+  longer serves is kept (the store never deletes a value) and reported as
+  ``absent_from_response``.
 - A failure is an error, never an empty success: an HTTP error, an empty or
   malformed body, a window without values, and a response available only
   as a stale cache copy (not the publisher's current data) each record an
-  error capture and store nothing.
+  error capture and store no values. A store write failure names the
+  request it failed on, the requests fetched but not written, and the
+  upstream failures it could or could not log.
+- Payload bodies of backfill captures hold a summary of the response
+  (series, counts, date span, the full response's hash), not the response:
+  one FRED series can carry 26,000 rows, and replaying it through
+  ``intel_capture_history`` would flood a client. The values loaded are in
+  the observations.
 - Bounded: ``MAX_FRED_SERIES`` series or ``MAX_ECB_KEYS`` keys per call, at
   most ``MAX_ECB_COMBINATIONS`` series per ECB key, the newest
   ``MAX_POINTS`` points per series and ``MAX_POINTS_PER_CALL`` per call,
-  optionally only from a start date.
+  optionally only from a start date. Values a series cap leaves out are
+  the oldest, and no later backfill can load them (there is no end bound);
+  values a call's budget leaves out load in a call of their own.
 
 Vintage: a backfilled value is the publisher's vintage on the backfill day,
 already revised, so revisions made before the first backfill are
-invisible. Retention: the store prunes observations by ``collected_at``
-(``WORLD_INTEL_HISTORY_DAYS``, default 365), never by ``observed_at``, so a
-1962 value is kept as long as any value stored the same day. An unchanged
-value is not stored again, so its ``collected_at`` stays at the backfill
-that first stored it; past retention the row is pruned, and the next
-backfill (which prunes before it stores) stores it again as new.
+invisible. Retention: a backfill prunes only backfill rows (``backfill:*``
+captures, payload bodies and observations, and ``history_backfills``),
+using the retention settings of the process that runs it; collector rows
+are left to the collector's own prune and settings. Observations are
+pruned by ``collected_at`` (``WORLD_INTEL_HISTORY_DAYS``, default 365),
+never by ``observed_at``, so a 1962 value is kept as long as any value
+stored the same day. An unchanged value is not stored again, so its
+``collected_at`` stays at the backfill that first stored it; past
+retention the row is pruned, and the next backfill (which prunes before
+it stores) stores it again as new.
 
 Gaps / not covered:
 - Only FRED graph CSV series and ECB Data Portal BSI and ILM series; no
@@ -63,8 +84,14 @@ Gaps / not covered:
   ECB key rules, and the store's ``_conn``, ``_store_observations`` and
   ``_prune``. A change there needs a matching change here; the tests pin
   the behaviour, not the coupling.
-- The collector's prune does not touch ``history_backfills``; its rows are
-  pruned here, on the next backfill, past the observation retention.
+- The collector's prune also deletes backfill rows, under the collector's
+  settings; it does not touch ``history_backfills``, whose rows are pruned
+  here, on the next backfill, past the observation retention.
+- No end bound: the oldest values of a series longer than ``MAX_POINTS``
+  cannot be backfilled.
+- An ECB key that matches only some of its combinations is not an error:
+  each ``+`` code that matched no series at all is named in the gaps, but
+  a combination of matched codes that is absent is not.
 - FRED's terms of use speak of personal, non-commercial use of FRED data;
   whether a deployment's use fits them is the operator's call, not this
   module's.
@@ -78,7 +105,7 @@ import re
 import sqlite3
 import time
 import zlib
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .fetcher import Fetcher
@@ -108,6 +135,11 @@ _START = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Dimensions in a key of each dataset: the rule fetch_ecb_series applies,
 # checked here so a bad key is refused before any request of the call.
 _ECB_DIMENSIONS = {"BSI": 11, "ILM": 6}
+# Days before the start an ECB request asks from, by frequency (the key's
+# first dimension), so a period that starts before the start but is dated
+# on or after it (weeks by their Sunday, quarters and half-years by their
+# end) is returned; the window is then cut on observed_at.
+_ECB_LOOKBACK_DAYS = {"W": 6, "Q": 92, "H": 183}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS history_backfills (
@@ -132,12 +164,19 @@ VINTAGE_GAP = (
     "revision (intel_revisions)."
 )
 RETENTION_GAP = (
-    "Retention: the store prunes observations by collected_at "
-    "(WORLD_INTEL_HISTORY_DAYS, default 365, 0 keeps forever), not by observed_at. "
+    "Retention: a backfill prunes only backfill rows, with this process's retention "
+    "settings; collector rows are left to the collector. Observations are pruned by "
+    "collected_at (WORLD_INTEL_HISTORY_DAYS, default 365, 0 keeps forever), not by "
+    "observed_at. "
     "An unchanged value is not stored again, so its collected_at stays at the "
     "backfill that first stored it; once that is past retention the row is pruned "
     "and the next backfill stores it again. Capture rows (WORLD_INTEL_HISTORY_CAPTURE_DAYS, "
     "default 30) and payload bodies (WORLD_INTEL_HISTORY_PAYLOAD_DAYS, default 7) age out sooner."
+)
+BODY_NOTE = (
+    "Summary only: a backfill keeps this summary instead of the response, which can "
+    "hold tens of thousands of rows. The values loaded are in the history store "
+    "(intel_series_history); payload_hash is the full response's hash."
 )
 COPY_GAP = (
     "copy_fetched_at is when the response this backfill read was fetched: a copy "
@@ -254,40 +293,62 @@ class _Run:
         self.now = 0.0  # set by commit()
         self.budget = MAX_POINTS_PER_CALL
         self.requests: list[dict] = []
-        self._pending: list[tuple[Any, tuple]] = []
+        self._pending: list[tuple[str, tuple]] = []
+        self.failed_at: int | None = None  # index in _pending of a failed write
 
     def defer_fail(self, request: str, error: str, duration: float) -> None:
-        self._pending.append((self.fail, (request, error, duration)))
+        self._pending.append(("fail", (request, error, duration)))
 
     def defer_store(self, request: str, payload: dict, series: list[dict], duration: float,
                     copy_at: float | None) -> None:
-        self._pending.append((self.store_request, (request, payload, series, duration, copy_at)))
+        self._pending.append(("store", (request, payload, series, duration, copy_at)))
 
     def commit(self, now: float | None) -> dict:
         """Create the log table if needed, prune, then write each request
-        in its own transaction; returns what the prune removed."""
+        in its own transaction; returns what the prune removed. On a store
+        error ``failed_at`` marks the write that failed."""
         ensure_schema(self.store)
         self.now = time.time() if now is None else now
         pruned = self.prune()
-        for write, args in self._pending:
-            write(*args)
+        for i, (kind, args) in enumerate(self._pending):
+            try:
+                if kind == "store":
+                    self.store_request(*args)
+                else:
+                    self.fail(*args)
+            except sqlite3.Error:
+                self.failed_at = i
+                raise
         return pruned
 
     def prune(self) -> dict:
-        """Prune before storing, so a value pruned past retention is stored
-        again by this run instead of vanishing."""
+        """Prune backfill rows only, before storing, so a value pruned past
+        retention is stored again by this run instead of vanishing. Collector
+        rows are the collector's to prune, under its own settings."""
         conn = self.store._conn
+        days = retention_days()
+        like = BACKFILL_PREFIX + "%"
+        pruned = {"payloads": 0, "captures": 0, "observations": 0, "backfill_log": 0}
         with conn:
-            pruned = self.store._prune(self.now)
-            days = retention_days()["history_days"]
-            pruned["backfill_log"] = (
-                conn.execute(
-                    "DELETE FROM history_backfills WHERE ran_at < ?",
-                    (self.now - days * 86400,),
+            if days["payload_days"] > 0:
+                pruned["payloads"] = conn.execute(
+                    "DELETE FROM history_payloads WHERE source LIKE ? AND last_seen_at < ?",
+                    (like, self.now - days["payload_days"] * 86400),
                 ).rowcount
-                if days > 0
-                else 0
-            )
+            if days["capture_days"] > 0:
+                pruned["captures"] = conn.execute(
+                    "DELETE FROM history_captures WHERE source LIKE ? AND collected_at < ?",
+                    (like, self.now - days["capture_days"] * 86400),
+                ).rowcount
+            if days["history_days"] > 0:
+                cutoff = self.now - days["history_days"] * 86400
+                pruned["observations"] = conn.execute(
+                    "DELETE FROM history_observations WHERE source LIKE ? AND collected_at < ?",
+                    (like, cutoff),
+                ).rowcount
+                pruned["backfill_log"] = conn.execute(
+                    "DELETE FROM history_backfills WHERE ran_at < ?", (cutoff,)
+                ).rowcount
         return pruned
 
     def _previous(self, request: str) -> tuple[str | None, float | None]:
@@ -340,7 +401,24 @@ class _Run:
         """
         conn = self.store._conn
         digest = payload_hash(payload)
-        body = json.dumps(payload, separators=(",", ":"), default=str).encode()
+        body = json.dumps({
+            "provider": payload.get("provider"),
+            "request": request,
+            "start": self.start_text,
+            "payload_hash": digest,
+            "body": BODY_NOTE,
+            "series": [
+                {
+                    "series_key": f"{self.source}:{s['key']}",
+                    "points_in_response": s["points_in_response"],
+                    "in_window": s["in_window"],
+                    "loaded": len(s["points"]),
+                    "first_observed_at": s["points"][0][0] if s["points"] else None,
+                    "last_observed_at": s["points"][-1][0] if s["points"] else None,
+                }
+                for s in series
+            ],
+        }, separators=(",", ":"), default=str).encode()
         prev_hash, prev_at = self._previous(request)
         changed = None if prev_hash is None else int(prev_hash != digest)
         results = []
@@ -397,6 +475,14 @@ class _Run:
                 stored_total += stored
                 new = sum(1 for observed, _ in s["points"] if observed not in prior)
                 loaded = len(s["points"])
+                # Stored values inside the response's date span that it no
+                # longer serves (withdrawn, or now a missing cell).
+                lo, hi = s.get("span") or (None, None)
+                served = s.get("served") or set()
+                absent = sorted(
+                    d for d in prior if d is not None and lo is not None
+                    and lo <= d <= hi and d not in served
+                )
                 results.append({
                     "series_key": key,
                     "label": s["label"],
@@ -406,12 +492,19 @@ class _Run:
                     "missing_skipped": s["missing_skipped"],
                     "invalid_skipped": s["invalid_skipped"],
                     "truncated": s["truncated"],
+                    "truncated_by": (
+                        None if not s["truncated"]
+                        else "call budget" if s.get("budget_limited") else "series cap"
+                    ),
                     "loaded": loaded,
                     "first_observed_at": s["points"][0][0] if loaded else None,
                     "last_observed_at": s["points"][-1][0] if loaded else None,
                     "stored_new": new,
                     "stored_revised": stored - new,
                     "unchanged": loaded - stored,
+                    "absent_from_response": len(absent),
+                    "absent_first": absent[0] if absent else None,
+                    "absent_last": absent[-1] if absent else None,
                     **({"provisional": s["provisional"]} if "provisional" in s else {}),
                 })
             conn.execute(
@@ -437,13 +530,17 @@ class _Run:
         self.requests.append(entry)
         return entry
 
-    def window(self, points: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], int]:
+    def window(
+        self, points: list[tuple[str, float]]
+    ) -> tuple[list[tuple[str, float]], int, bool]:
         """Newest points within the per-series cap and the call's budget,
-        oldest first, and how many older ones were left out."""
+        oldest first, how many older ones were left out, and whether the
+        call's budget (not the series cap) left them out."""
         cap = min(MAX_POINTS, self.budget)
         kept = points[-cap:] if cap > 0 else []
         self.budget -= len(kept)
-        return kept, len(points) - len(kept)
+        truncated = len(points) - len(kept)
+        return kept, truncated, bool(truncated) and cap < MAX_POINTS
 
     def result(self, provider: str, gaps: list[str], pruned: dict) -> dict:
         failed = [r for r in self.requests if r["status"] == "error"]
@@ -455,7 +552,7 @@ class _Run:
             **{
                 name: sum(s[name] for s in series)
                 for name in ("loaded", "stored_new", "stored_revised", "unchanged",
-                             "invalid_skipped", "truncated")
+                             "invalid_skipped", "truncated", "absent_from_response")
             },
             # Unknown, not zero, when any series could not count them (ECB).
             "missing_skipped": (
@@ -467,12 +564,32 @@ class _Run:
         if failed:
             gaps.insert(0, f"{len(failed)} of {len(self.requests)} request(s) failed and stored "
                         "nothing: " + "; ".join(f"{r['request']}: {r['error']}" for r in failed))
-        if any(s["truncated"] for s in series):
-            gaps.append(
-                f"Point cap: only the newest {MAX_POINTS:,} points per series and "
-                f"{MAX_POINTS_PER_CALL:,} per call are loaded; pass a later start or split "
-                "the call for the rest."
-            )
+        for s in series:
+            if not s["truncated"]:
+                continue
+            before = f"{s['truncated']:,} older value(s) before {s['first_observed_at']}"
+            if s["truncated_by"] == "call budget":
+                alone = s["loaded"] + s["truncated"]
+                gaps.append(
+                    f"Point cap: {s['series_key']}: {before} were not loaded because this "
+                    f"call's {MAX_POINTS_PER_CALL:,}-point budget ran out; backfill it in a "
+                    "call of its own"
+                    + (f", which loads its newest {MAX_POINTS:,}" if alone > MAX_POINTS else "")
+                    + "."
+                )
+            else:
+                gaps.append(
+                    f"Point cap: {s['series_key']}: {before} cannot be loaded by a "
+                    f"backfill, which keeps only the newest {MAX_POINTS:,} values of a series."
+                )
+        for s in series:
+            if s["absent_from_response"]:
+                gaps.append(
+                    f"{s['series_key']}: {s['absent_from_response']} stored value(s) from "
+                    f"{s['absent_first']} to {s['absent_last']} are absent from this response "
+                    "(withdrawn, or now a missing value); the store keeps them as an earlier "
+                    "backfill read them."
+                )
         out = {
             "source": self.source,
             "provider": provider,
@@ -489,6 +606,35 @@ class _Run:
                 f"{r['request']}: {r['error']}" for r in failed
             )[:500]
         return out
+
+
+def _first_day(observed: str | None) -> date | None:
+    """The date a stored observed_at is compared with a start by: the day
+    itself, or a month's or year's first day (as FRED dates a month)."""
+    if not observed:
+        return None
+    try:
+        if len(observed) == 10:
+            return date.fromisoformat(observed)
+        if len(observed) == 7:
+            return date.fromisoformat(observed + "-01")
+        if len(observed) == 4:
+            return date.fromisoformat(observed + "-01-01")
+    except ValueError:
+        return None
+    return None
+
+
+def _unmatched_codes(key: str, series: list[dict]) -> list[str]:
+    """Each '+' alternative of an ECB key that no returned series carries."""
+    returned = [str(s.get("key") or "").split(".")[1:] for s in series]
+    out = []
+    for i, dim in enumerate(key.split(".")):
+        codes = dim.split("+")
+        if len(codes) > 1:
+            present = {r[i] for r in returned if len(r) > i}
+            out += [code for code in codes if code not in present]
+    return out
 
 
 def _copy_at(fetcher: Fetcher, cache_key: str) -> float | None:
@@ -511,10 +657,33 @@ def _error_result(source: str, provider: str, error: str) -> dict:
 
 def _store_failure(source: str, provider: str, exc: sqlite3.Error, run: _Run) -> dict:
     """A store error mid-commit: each request is its own transaction, so the
-    requests listed were committed and the failing one was rolled back."""
+    requests listed were committed and the failing one was rolled back.
+
+    Names the request the write failed on, the requests fetched but not
+    written, and the upstream failures after it: their error captures are
+    written if the store now accepts them, else listed as not logged."""
+    committed = list(run.requests)
     out = _error_result(source, provider, f"history store write failed: {exc}")
-    out["requests"] = run.requests
-    out["error"] += f"; {len(run.requests)} earlier request(s) were committed"
+    out["error"] += f"; {len(committed)} earlier request(s) were committed"
+    out["requests"] = committed
+    out["collected_at"] = _iso(run.now) if run.now else None
+    failing = None if run.failed_at is None else run._pending[run.failed_at]
+    rest = run._pending if run.failed_at is None else run._pending[run.failed_at + 1:]
+    out["failed_request"] = failing[1][0] if failing else None
+    out["fetched_not_written"] = [args[0] for kind, args in rest if kind == "store"]
+    logged, not_logged = [], []
+    if failing and failing[0] == "fail":
+        not_logged.append(failing[1][0])
+    for kind, args in rest:
+        if kind != "fail":
+            continue
+        try:
+            run.fail(*args)
+            logged.append(args[0])
+        except sqlite3.Error:
+            not_logged.append(args[0])
+    out["upstream_failures_logged"] = logged
+    out["upstream_failures_not_logged"] = not_logged
     return out
 
 
@@ -564,12 +733,13 @@ async def backfill_fred(
         missing = sum(1 for _, v in in_window if v is None)
         valid = [(d.isoformat(), v) for d, v in in_window
                  if v is not None and math.isfinite(v)]
+        dates = [d.isoformat() for d, _ in in_window]
         if not valid:
             run.defer_fail(sid, f"FRED graph CSV for {sid} has no values"
                            + (f" on or after {start_d}" if start_d else "")
                            + (f" ({missing} missing)" if missing else ""), duration)
             continue
-        points, truncated = run.window(valid)
+        points, truncated, budget_limited = run.window(valid)
         if not points:
             run.defer_fail(sid, f"not loaded: this call's {MAX_POINTS_PER_CALL:,}-point budget "
                            "went to earlier series; backfill it in its own call", duration)
@@ -599,6 +769,9 @@ async def backfill_fred(
                 "missing_skipped": missing,
                 "invalid_skipped": len(in_window) - missing - len(valid),
                 "truncated": truncated,
+                "budget_limited": budget_limited,
+                "served": {d for d, _ in valid},
+                "span": (min(dates), max(dates)) if dates else None,
             }],
             duration,
             _copy_at(fetcher, f"liquidity:fred:{sid}"),
@@ -643,9 +816,14 @@ async def backfill_ecb(
     gaps = [ECB_PUBLISHED_GAP, ECB_DATE_GAP, ECB_MISSING_GAP]
     for dataset, key in parsed:
         request = f"{dataset}.{key}"
+        fetch_d = None
+        if start_d is not None:
+            back = max(_ECB_LOOKBACK_DAYS.get(f, 0) for f in key.split(".")[0].split("+"))
+            fetch_d = start_d - timedelta(days=back)
         began = time.monotonic()
         res = await liquidity.fetch_ecb_series(
-            fetcher, dataset=dataset, key=key, limit=0, start=run.start_text
+            fetcher, dataset=dataset, key=key, limit=0,
+            start=fetch_d.isoformat() if fetch_d else None,
         )
         duration = time.monotonic() - began
         if res.get("error"):
@@ -656,34 +834,49 @@ async def backfill_ecb(
             run.defer_fail(request, _refusal(f"ECB Data Portal {request}",
                                              stale[0].get("cache_age_seconds")), duration)
             continue
+        unmatched = _unmatched_codes(key, res["series"])
+        if unmatched:
+            gaps.append(
+                f"{request}: '+' alternative(s) that matched no series: {', '.join(unmatched)}"
+            )
         series = []
         for s in res["series"]:
-            in_window = list(reversed(s["points"]))  # oldest first
-            valid: list[tuple[str, float]] = []
-            seen: set[str] = set()
-            for p in in_window:
+            in_window: list[tuple[str | None, dict]] = []
+            for p in reversed(s["points"]):  # oldest first
                 observed = period_date(p.get("observed_at")) or normalize_observed_at(
                     p.get("period_end")
                 )
+                first_day = _first_day(observed)
+                if start_d is not None and first_day is not None and first_day < start_d:
+                    continue  # asked for one period early; before the window
+                in_window.append((observed, p))
+            valid: list[tuple[str, float]] = []
+            seen: set[str] = set()
+            for observed, p in in_window:
                 value = p.get("value")
                 if (observed is None or observed in seen or isinstance(value, bool)
                         or not isinstance(value, (int, float)) or not math.isfinite(value)):
                     continue
                 seen.add(observed)
                 valid.append((observed, float(value)))
-            points, truncated = run.window(valid)
+            points, truncated, budget_limited = run.window(valid)
+            dates = [o for o, _ in in_window if o is not None]
             series.append({
                 "key": s["key"],
                 "label": s.get("title") or s["key"],
                 "unit": s.get("units"),
                 "points": points,
-                "points_in_response": len(in_window),
+                "points_in_response": len(s["points"]),
                 "in_window": len(in_window),
                 "missing_skipped": None,
                 "invalid_skipped": len(in_window) - len(valid),
                 "truncated": truncated,
+                "budget_limited": budget_limited,
+                "served": {o for o, _ in valid},
+                "span": (min(dates), max(dates)) if dates else None,
                 "provisional": sum(
-                    1 for p in in_window if "provisional" in str(p.get("status") or "").lower()
+                    1 for _, p in in_window
+                    if "provisional" in str(p.get("status") or "").lower()
                 ),
             })
         if not any(s["points"] for s in series):
@@ -712,7 +905,7 @@ async def backfill_ecb(
             )
         run.defer_store(
             request, payload, series, duration,
-            _copy_at(fetcher, f"liquidity:ecb:{dataset}:{key}:0:{start_d}"),
+            _copy_at(fetcher, f"liquidity:ecb:{dataset}:{key}:0:{fetch_d}"),
         )
     try:
         pruned = run.commit(now)

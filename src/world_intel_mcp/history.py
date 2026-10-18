@@ -841,16 +841,23 @@ class HistoryStore:
         }
 
     def _backfill_row(self, name: str) -> dict:
-        """One backfill source: its captures and the series it stored."""
+        """One backfill source: its captures, its latest run and the series
+        it stored. Every capture of one backfill call shares one
+        collected_at, so the latest run is all captures at the latest time:
+        error if any request in it failed (with the first failure's reason),
+        whatever the order the requests were named in."""
         conn = self._conn
         captures, last_at = conn.execute(
             "SELECT COUNT(*), MAX(collected_at) FROM history_captures WHERE source = ?", (name,)
         ).fetchone()
-        last_status, last_reason = conn.execute(
-            "SELECT status, error FROM history_captures WHERE source = ? "
-            "ORDER BY collected_at DESC, id DESC LIMIT 1",
-            (name,),
-        ).fetchone()
+        run = conn.execute(
+            "SELECT status, error FROM history_captures WHERE source = ? AND collected_at = ? "
+            "ORDER BY id",
+            (name, last_at),
+        ).fetchall()
+        failed = [r for r in run if r[0] == "error"]
+        last_status = "error" if failed else (run[-1][0] if run else None)
+        last_reason = failed[0][1] if failed else None
         series, points, first_obs, last_obs = conn.execute(
             "SELECT COUNT(DISTINCT series_key), COUNT(*), MIN(observed_at), MAX(observed_at) "
             "FROM history_observations WHERE source = ?",
@@ -862,6 +869,8 @@ class HistoryStore:
             "last_run_at": _iso(last_at),
             "last_status": last_status,
             "last_reason": last_reason,
+            "last_run_requests": len(run),
+            "last_run_failed": len(failed),
             "series": series,
             "observations": points,
             "first_observed_at": first_obs,
