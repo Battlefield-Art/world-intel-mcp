@@ -250,8 +250,10 @@ def _extract_metrics(data: dict) -> tuple[dict, list[dict], dict[str, list[int]]
             _cite(citations, "alerts", n)
 
     space = data.get("space_weather", {})
-    kp = space.get("current_kp", 0) if isinstance(space, dict) else 0
-    if isinstance(space, dict) and space.get("current_kp") is not None:
+    # No Kp reading (SWPC down or breaker open) stays None: it is unknown,
+    # not quiet, and rendering it must not raise.
+    kp = space.get("current_kp") if isinstance(space, dict) else None
+    if kp is not None:
         n = _add_source(
             sources,
             "space_weather",
@@ -332,13 +334,20 @@ def _extract_metrics(data: dict) -> tuple[dict, list[dict], dict[str, list[int]]
         "posture_score": round(posture_score),
         "risk_level": risk_level,
         "alerts": alert_count,
-        "kp_index": round(kp, 1),
+        "kp_index": round(kp, 1) if kp is not None else None,
         "outbreaks": outbreaks,
         "total_aircraft": total_aircraft,
         "avg_congestion": avg_congestion,
         "top_headlines": headlines,
     }
     return metrics, sources, citations
+
+
+def _kp_text(m: dict) -> str:
+    """The Kp reading as text; a missing reading says so instead of "None"."""
+    if m["kp_index"] is None:
+        return "Kp unavailable (no reading)"
+    return f"Kp {m['kp_index']}"
 
 
 def _build_prompt(m: dict, sources: list[dict]) -> str:
@@ -362,7 +371,7 @@ CONFLICT: {m["conflicts"]} active events
 SEISMIC: {m["earthquakes"]} earthquakes (max M{m["max_magnitude"]})
 FIRES: {m["fire_clusters"]} active fire clusters
 CYBER: {m["cyber_threats"]} tracked IOCs
-SPACE WEATHER: Kp {m["kp_index"]}
+SPACE WEATHER: {_kp_text(m)}
 HEALTH: {m["outbreaks"]} high-concern outbreaks
 AIR TRAFFIC: {m["total_aircraft"]} aircraft airborne
 TRAFFIC: {m["avg_congestion"]}% avg city congestion
@@ -394,7 +403,7 @@ def _fallback_brief(m: dict, citations: dict[str, list[int]]) -> str:
         f"{_citation_suffix(citations, 'earthquakes', 'fire_clusters')}",
         f"CYBER: {m['cyber_threats']} IOCs. HEALTH: {m['outbreaks']} high-concern outbreaks."
         f"{_citation_suffix(citations, 'cyber_threats', 'outbreaks')}",
-        f"SPACE: Kp {m['kp_index']}. AIR TRAFFIC: {m['total_aircraft']} airborne. CONGESTION: {m['avg_congestion']}%."
+        f"SPACE: {_kp_text(m)}. AIR TRAFFIC: {m['total_aircraft']} airborne. CONGESTION: {m['avg_congestion']}%."
         f"{_citation_suffix(citations, 'kp_index', 'total_aircraft', 'avg_congestion')}",
     ]
     return "\n".join(lines)

@@ -278,6 +278,11 @@ source here, and no proxy is substituted for any of these measures.
   request; it now searches the default AI, ML and NLP categories. The
   search also goes into the first request: before, the first request was
   sent to the bare API URL and the query only reached a fallback.
+- `intel_situation_brief` and `intel_daily_digest` raised a TypeError when
+  NOAA SWPC was down, because the space weather source then reports no Kp
+  reading. The brief now says "Kp unavailable (no reading)" and
+  `metrics_snapshot.kp_index` is null, and the digest lists "Space weather:
+  no Kp reading" in `data_gaps`.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
