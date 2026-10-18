@@ -145,6 +145,27 @@
     divided by zero; feed links of any scheme (`javascript:`, `data:`)
     were passed on and titles had no length cap (now http(s) only, titles
     capped at 500 characters).
+- Second review fixes for the news signals (2026-10-17):
+  - The cross-process GDELT floor honoured a reserved slot up to 600 s
+    ahead; the bound is now 40 s (eight processes at 5 s), and a row
+    further ahead is treated as a clock jump: overwritten with the current
+    time and logged. A row that cannot be read as numbers raised on every
+    call; it is now overwritten the same way.
+  - A cancelled floor wait left the process's own future slot, and its
+    next call ignored it and went first; a process now keeps its own
+    queued slot. The slot time is taken once the write lock is held, so a
+    wait for the lock never shortens the gap.
+  - Dossier headline matching stopped counting demonyms such as "North
+    Korean(s)" and "Gazan(s)"; each keyword now also matches with an
+    `-n`, `-ns` or `-s` ending, the compound exclusions unchanged.
+    `searched_span` was sorted as text, so an unparsed date ("Okt 17,
+    2026") read as the newest item; it now spans parsed UTC times only,
+    and `items_without_parsed_time` counts the rest.
+  - `intel_hostility_timeline` refuses an empty, blank or one-letter
+    country (it went out as nine GDELT requests).
+  - `intel situations` and `intel top-stories` never printed the
+    partial-outage line: the results now carry `feeds_attempted` and
+    `feeds_ok` at the top level.
 
 ## 0.11.0 - 2026-10-12
 

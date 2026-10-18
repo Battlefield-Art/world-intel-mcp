@@ -9,35 +9,45 @@ collector daemon, one MCP stdio server per client, the dashboard, and
 every ``intel`` CLI run. For the sources in ``SHARED_SOURCES`` each live
 request therefore also reserves a slot in a one-row-per-source table of
 that cache DB. The reservation runs under ``BEGIN IMMEDIATE``, so two
-processes can never read the same last slot.
+processes can never read the same last slot, and the slot is stamped only
+once the write lock is held, so a wait for the lock never shortens the gap.
 
-A process's own earlier reservation is left to its in-process floor:
-only another process's slot pushes this one back. A slot more than
-``MAX_AHEAD_S`` ahead of the clock is treated as a clock jump or a corrupt
-row, not a queue, and ignored.
+Another process's slot pushes this one to that slot plus the interval. A
+process's own earlier slot is left to its in-process floor, except that
+a slot of its own still ahead of the clock (a reservation whose wait was
+cancelled) is kept, so the next call cannot jump the queue it joined. A
+slot more than ``MAX_AHEAD_S`` ahead of the clock is not a queue: it is
+treated as a clock jump, overwritten with the current time and logged. A
+row that cannot be read as numbers is overwritten the same way.
 
 Gaps / not covered: processes that resolve different cache DB paths
 (``WORLD_INTEL_CACHE_DB`` / ``XDG_CACHE_HOME`` decide it) do not see each
 other's slots; other hosts are separate IP addresses with their own DBs;
-a reservation that fails (database locked past the timeout, read-only
-file) is logged by the fetcher and the call goes ahead on the in-process
-floor alone; sources outside ``SHARED_SOURCES`` keep a per-process floor.
+a reservation that fails (database locked past the timeout, a file that
+is not a database, read-only file) is logged by the fetcher and the call
+goes ahead on the in-process floor alone; sources outside
+``SHARED_SOURCES`` keep a per-process floor; a backward clock step smaller
+than ``MAX_AHEAD_S`` is still waited out.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
 from pathlib import Path
 
+logger = logging.getLogger("world-intel-mcp.shared_floor")
+
 # Sources whose floor holds across processes. Others keep the in-process
 # floor only.
 SHARED_SOURCES = frozenset({"gdelt"})
 
-# Ten minutes of queued 5 s slots is far beyond any real queue (one waiter
-# per process at a time); a slot further ahead than this is not one.
-MAX_AHEAD_S = 600.0
+# A real queue holds at most one waiter per process: eight processes on one
+# host (collector, a few MCP servers, dashboard, CLI runs) at GDELT's 5 s
+# is 40 s. A slot further ahead than this is a clock jump, not a queue.
+MAX_AHEAD_S = 40.0
 
 _LOCK_TIMEOUT_S = 5.0
 
@@ -47,16 +57,17 @@ def reserve(
 ) -> float:
     """Reserve the next request slot for ``source``; return its Unix time.
 
-    The slot is ``now`` unless another process reserved one less than
-    ``interval`` before ``now`` (or one still ahead of it), in which case it
-    is that slot plus ``interval``. Raises ``sqlite3.Error`` when the DB
-    cannot be locked or written.
+    The slot is the current time (``now`` when given, else the clock once
+    the write lock is held), pushed to another process's slot plus
+    ``interval`` or kept at this process's own slot when either is still
+    ahead. Raises ``sqlite3.Error`` when the DB cannot be locked or written.
     """
-    now = time.time() if now is None else now
     pid = os.getpid()
     conn = sqlite3.connect(str(db_path), timeout=_LOCK_TIMEOUT_S, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # Sampled with the lock held: a slot never predates its reservation.
+        now = time.time() if now is None else now
         conn.execute(
             "CREATE TABLE IF NOT EXISTS source_floor ("
             "source TEXT PRIMARY KEY, slot REAL NOT NULL, pid INTEGER NOT NULL)"
@@ -66,9 +77,26 @@ def reserve(
         ).fetchone()
         slot = now
         if row is not None:
-            last, last_pid = float(row[0]), int(row[1])
-            if last_pid != pid and last - now <= MAX_AHEAD_S:
-                slot = max(now, last + interval)
+            try:
+                last, last_pid = float(row[0]), int(row[1])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Unreadable %s floor row %r; overwriting it with the current time",
+                    source,
+                    tuple(row),
+                )
+            else:
+                if last - now > MAX_AHEAD_S:
+                    logger.warning(
+                        "%s floor slot is %.0f s ahead of the clock (a clock jump, not a "
+                        "queue); overwriting it with the current time",
+                        source,
+                        last - now,
+                    )
+                elif last_pid != pid:
+                    slot = max(now, last + interval)
+                else:
+                    slot = max(now, last)
         conn.execute(
             "INSERT OR REPLACE INTO source_floor (source, slot, pid) VALUES (?, ?, ?)",
             (source, slot, pid),
