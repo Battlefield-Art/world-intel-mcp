@@ -267,6 +267,13 @@ source here, and no proxy is substituted for any of these measures.
   `ACLED_ACCESS_TOKEN`, which no code reads; added `UCDP_ACCESS_TOKEN`,
   `TOMTOM_API_KEY`, `WINDY_API_KEY`, `OPENSKY_USERNAME` and
   `OPENSKY_PASSWORD`.
+- `intel_yield_curve`: `inverted` is null, not `false`, when neither
+  spread could be computed, so an outage or one lost maturity no longer
+  reads as "not inverted". New `inversion_basis` names the spreads the
+  flag rests on (without `FRED_API_KEY` that is `spread_3m10y` alone) and
+  `yields_source` says whether the maturities came from FRED or Yahoo. A
+  maturity with no rate is listed in `data_gaps` with `degraded: true`, and
+  no rate at all is an `error`.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
