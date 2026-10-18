@@ -5,6 +5,15 @@
 Tools 139 -> 160. Collector sources 55 -> 61. New MCP surface: 29 prompts and 3
 resources (none before).
 
+### Fixed: failed fetches log no credentials
+- A failed keyed request (FRED, EIA, TomTom and others pass the key as a
+  query parameter) logged the full request URL, key included. Fetch
+  failure logs, `get_bytes` error strings and stale-cache log lines now mask
+  credential-named query parameters (`api_key`, `key`, `token` and similar)
+  and any value of a `*_KEY`, `*_TOKEN`, `*_SECRET` or `*_PASSWORD`
+  environment variable, which covers the key NASA FIRMS carries in the URL
+  path. Keys already written to old log files are not rewritten.
+
 ### Added: dashboard research panels (Phase 29)
 - RESEARCH in the dashboard top bar (or the `p` key) opens four tabs:
   liquidity board, situations, top stories and collection health. Each tab

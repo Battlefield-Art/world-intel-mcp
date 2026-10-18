@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -80,6 +81,36 @@ class BinaryResult:
     @property
     def ok(self) -> bool:
         return self.content is not None
+
+
+# Query parameters whose values are credentials. httpx puts the full
+# request URL in its error text, so a failed keyed request would otherwise
+# carry the key into logs and returned error strings.
+_SECRET_PARAMS = (
+    "api_key|apikey|app_key|appid|key|token|access_token|auth|password|secret|client_secret"
+)
+_SECRET_QUERY_RE = re.compile(rf"(?i)([?&](?:{_SECRET_PARAMS})=)[^&#\s'\"]+")
+# The same names as dict keys, as they appear in a cache key built from params.
+_SECRET_DICT_RE = re.compile(rf"(?i)(['\"](?:{_SECRET_PARAMS})['\"]\s*:\s*['\"])[^'\"]*")
+# Environment variables holding credentials; their values are masked wherever
+# they appear, which covers keys carried in a URL path (NASA FIRMS).
+_SECRET_ENV_RE = re.compile(r"(?i)(KEY|TOKEN|SECRET|PASSWORD)$")
+_MASK = "***"
+
+
+def redact(text: object) -> str:
+    """``str(text)`` with credential values masked.
+
+    Masks the values of credential-named query parameters and dict keys,
+    and any value (8+ characters) of an environment variable whose name
+    ends in KEY, TOKEN, SECRET or PASSWORD.
+    """
+    out = str(text)
+    for name, value in os.environ.items():
+        if len(value) >= 8 and _SECRET_ENV_RE.search(name) and value in out:
+            out = out.replace(value, _MASK)
+    out = _SECRET_QUERY_RE.sub(rf"\g<1>{_MASK}", out)
+    return _SECRET_DICT_RE.sub(rf"\g<1>{_MASK}", out)
 
 
 @dataclass(frozen=True)
@@ -263,14 +294,16 @@ class Fetcher:
                         attempt + 1,
                         self.max_retries,
                         source,
-                        exc,
+                        redact(exc),
                         wait,
                     )
                     await asyncio.sleep(wait)
 
         # All retries failed — try stale cache before giving up
         self.breaker.record_failure(source)
-        logger.warning("Fetch failed for %s: %s (url=%s)", source, last_error, url)
+        logger.warning(
+            "Fetch failed for %s: %s (url=%s)", source, redact(last_error), redact(url)
+        )
         return self._stale_fallback(effective_key, source)
 
     async def get_text(
@@ -315,7 +348,7 @@ class Fetcher:
                     await asyncio.sleep(min(2**attempt, 30))
 
         self.breaker.record_failure(source)
-        logger.warning("Text fetch failed for %s: %s", source, last_error)
+        logger.warning("Text fetch failed for %s: %s", source, redact(last_error))
         return self._stale_fallback(effective_key, source)
 
     async def get_xml(
@@ -426,12 +459,14 @@ class Fetcher:
                     )
                 return BinaryResult(last_status, body, None)
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = redact(f"{type(exc).__name__}: {exc}")
                 if attempt < self.max_retries:
                     await asyncio.sleep(min(2**attempt, 30))
 
         self.breaker.record_failure(source)
-        logger.warning("Binary fetch failed for %s: %s (url=%s)", source, last_error, url)
+        logger.warning(
+            "Binary fetch failed for %s: %s (url=%s)", source, last_error, redact(url)
+        )
         return BinaryResult(last_status, None, last_error)
 
     def _stale_fallback(self, cache_key: str, source: str) -> Any | None:
@@ -454,7 +489,7 @@ class Fetcher:
         logger.info(
             "Serving stale cache for %s (key=%s, age=%.0fs)",
             source,
-            cache_key,
+            redact(cache_key),
             age_seconds,
         )
         serve = StaleServe(source, cache_key, round(age_seconds, 1))
