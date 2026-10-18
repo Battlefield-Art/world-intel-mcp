@@ -108,7 +108,9 @@ KEYED_SOURCES: tuple[KeyedSource, ...] = (
     KeyedSource(
         "ACLED",
         ("ACLED_EMAIL", "ACLED_PASSWORD"),
-        "ACLED event, unrest and risk tools return an error naming the missing credentials.",
+        "ACLED event, unrest and risk tools return an error naming the missing "
+        "credentials. When both are set but the sign-in request fails, the "
+        "error says ACLED sign-in failed instead (reason acled_auth_failed).",
         needed_by=("intel_acled_events", "intel_unrest_events", "intel_risk_scores"),
     ),
     KeyedSource(

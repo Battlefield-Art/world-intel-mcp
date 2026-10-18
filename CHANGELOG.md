@@ -293,6 +293,10 @@ source here, and no proxy is substituted for any of these measures.
   `ucdp_partial`, `pages_failed`, `pages_total` and a `data_gaps` entry
   saying count and fatalities are lower bounds, and the conflict-trend
   prompt tells the model to report the list as incomplete.
+- With `ACLED_EMAIL` and `ACLED_PASSWORD` set but the ACLED sign-in
+  request refused or unreachable, every ACLED tool said the credentials
+  were not configured. That case now has its own reason,
+  `acled_auth_failed`, and the error says the sign-in failed.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

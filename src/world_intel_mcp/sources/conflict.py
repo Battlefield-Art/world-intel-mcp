@@ -111,12 +111,35 @@ async def acled_query(
     )
 
 
+_ACLED_FAILURE_MESSAGES = {
+    "acled_unconfigured": "ACLED credentials not configured (ACLED_EMAIL + ACLED_PASSWORD)",
+    "acled_auth_failed": (
+        "ACLED sign-in failed: ACLED_EMAIL and ACLED_PASSWORD are set, but the "
+        "token request was refused or did not complete"
+    ),
+    "acled_fetch_failed": "ACLED fetch failed (rate limited, API error, or malformed response)",
+}
+
+
+def acled_failure_message(reason: str | None) -> str:
+    """The error text for an ``acled_failure_reason()`` value."""
+    return _ACLED_FAILURE_MESSAGES.get(reason or "", _ACLED_FAILURE_MESSAGES["acled_fetch_failed"])
+
+
+def _acled_credentials_set() -> bool:
+    return bool(
+        (os.environ.get("ACLED_EMAIL") and os.environ.get("ACLED_PASSWORD"))
+        or _acled_refresh_token
+    )
+
+
 async def acled_failure_reason(data: dict | list | None) -> str | None:
     """Classify why an ``acled_query()``/``fetch_acled_events()`` call returned no data.
 
-    ``acled_query`` returns ``None`` for two structurally different reasons that
+    ``acled_query`` returns ``None`` for structurally different reasons that
     callers must not conflate: missing credentials (a config problem, not an
-    outage) versus a live fetch that failed after credentials were fine (a
+    outage), credentials that are set but whose token request failed (refused
+    or unreachable sign-in), and a live fetch that failed after sign-in (a
     transient outage). Callers use this to pick an honest message/marker
     instead of guessing.
 
@@ -125,12 +148,15 @@ async def acled_failure_reason(data: dict | list | None) -> str | None:
 
     Returns:
         ``None`` if *data* is present (no failure). Otherwise
-        ``"acled_unconfigured"`` (no ``ACLED_EMAIL``/``ACLED_PASSWORD``) or
-        ``"acled_fetch_failed"`` (credentials fine, the request itself failed).
+        ``"acled_unconfigured"`` (no ``ACLED_EMAIL``/``ACLED_PASSWORD``),
+        ``"acled_auth_failed"`` (both set, but no token could be obtained) or
+        ``"acled_fetch_failed"`` (signed in, the request itself failed).
     """
     if data is not None:
         return None
     if not await _acled_get_token():
+        if _acled_credentials_set():
+            return "acled_auth_failed"
         return "acled_unconfigured"
     return "acled_fetch_failed"
 
@@ -181,7 +207,7 @@ async def fetch_acled_events(
         reason = await acled_failure_reason(data)
         if reason == "acled_unconfigured":
             return {
-                "error": "ACLED credentials not configured (ACLED_EMAIL + ACLED_PASSWORD)",
+                "error": acled_failure_message(reason),
                 "note": "Free access at acleddata.com",
                 "reason": reason,
             }
@@ -193,9 +219,9 @@ async def fetch_acled_events(
         # peace. Surface it explicitly instead; keep events/count in their
         # normal shape so existing callers that don't check "error" or
         # "reason" still iterate an empty list rather than crashing.
-        logger.warning("ACLED API returned no data (post-auth fetch failure)")
+        logger.warning("ACLED API returned no data (%s)", reason)
         return {
-            "error": "ACLED fetch failed (rate limited, API error, or malformed response)",
+            "error": acled_failure_message(reason),
             "degraded": True,
             "reason": reason,
             "events": [],

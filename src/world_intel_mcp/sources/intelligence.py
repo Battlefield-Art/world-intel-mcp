@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from ..fetcher import Fetcher
-from .conflict import acled_query, acled_failure_reason
+from .conflict import acled_query, acled_failure_message, acled_failure_reason
 from ..analysis.focal_points import detect_focal_points
 from ..analysis.signals import aggregate_country_signals
 from ..analysis.temporal import TemporalBaseline
@@ -351,12 +351,12 @@ async def fetch_risk_scores(
                 "source": "risk-analysis",
                 "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
-        # Credentials are fine; the live fetch failed. Previously this
+        # Credentials are set; sign-in or the live fetch failed. Previously this
         # branch was unreachable in practice for a configured deployment
         # under outage — it fell through to the same "not configured"
         # message, misdiagnosing a transient failure as a config error.
         return {
-            "error": "ACLED fetch failed (rate limited, API error, or malformed response)",
+            "error": acled_failure_message(reason),
             "degraded": True,
             "source": "risk-analysis",
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -628,7 +628,7 @@ async def _instability_multi(fetcher: Fetcher, now: datetime) -> dict:
                 "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         return {
-            "error": "ACLED fetch failed (rate limited, API error, or malformed response)",
+            "error": acled_failure_message(reason),
             "degraded": True,
             "source": "instability-index-v2",
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1255,7 +1255,7 @@ async def fetch_unrest_events(
                 "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         return {
-            "error": "ACLED fetch failed (rate limited, API error, or malformed response)",
+            "error": acled_failure_message(reason),
             "degraded": True,
             "source": "acled-unrest",
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

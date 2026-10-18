@@ -896,6 +896,69 @@ async def test_unrest_events_cache_does_not_answer_a_larger_limit(
     assert sent == [2, 1000]
 
 
+@pytest.fixture
+def acled_signed_out(monkeypatch: pytest.MonkeyPatch):
+    """No cached ACLED token, so every call goes through sign-in."""
+    from world_intel_mcp.sources import conflict
+
+    monkeypatch.setattr(conflict, "_acled_token", None)
+    monkeypatch.setattr(conflict, "_acled_token_expires", 0.0)
+    monkeypatch.setattr(conflict, "_acled_refresh_token", None)
+    return conflict
+
+
+@pytest.mark.asyncio
+async def test_acled_refused_sign_in_is_not_reported_as_unconfigured(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, acled_signed_out
+) -> None:
+    """Both variables set, token request refused: the operator has to fix
+    the account or wait out the sign-in outage, not set variables that are
+    already set."""
+    from world_intel_mcp.sources import intelligence
+
+    conflict = acled_signed_out
+    monkeypatch.setenv("ACLED_EMAIL", "analyst@example.org")
+    monkeypatch.setenv("ACLED_PASSWORD", "offline-fake-value")
+    with respx.mock(assert_all_called=False) as router:
+        sign_in_route = router.post(conflict._ACLED_TOKEN_URL).mock(
+            return_value=httpx.Response(401, json={"error": "invalid_grant"})
+        )
+        read = router.get(conflict._ACLED_API_URL).mock(
+            return_value=httpx.Response(200, json={"data": []})
+        )
+        events = await conflict.fetch_acled_events(fetcher, country="Sudan", days=7)
+        risk = await intelligence.fetch_risk_scores(fetcher)
+        unrest = await intelligence.fetch_unrest_events(fetcher, country="Sudan")
+
+    assert sign_in_route.call_count >= 1
+    assert read.call_count == 0
+    assert events["reason"] == "acled_auth_failed"
+    assert events["degraded"] is True
+    assert events["error"].startswith("ACLED sign-in failed")
+    for result in (events, risk, unrest):
+        assert "not configured" not in result["error"]
+        assert "sign-in failed" in result["error"]
+        assert result["degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_acled_unset_variables_are_still_reported_as_unconfigured(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, acled_signed_out
+) -> None:
+    conflict = acled_signed_out
+    monkeypatch.delenv("ACLED_EMAIL", raising=False)
+    monkeypatch.delenv("ACLED_PASSWORD", raising=False)
+    with respx.mock(assert_all_called=False) as router:
+        sign_in_route = router.post(conflict._ACLED_TOKEN_URL).mock(
+            return_value=httpx.Response(401)
+        )
+        result = await conflict.fetch_acled_events(fetcher, country="Sudan", days=7)
+
+    assert sign_in_route.call_count == 0
+    assert result["reason"] == "acled_unconfigured"
+    assert "ACLED credentials not configured" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # News (GDELT search)
 # ---------------------------------------------------------------------------
