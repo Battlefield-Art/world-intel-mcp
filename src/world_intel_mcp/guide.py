@@ -417,6 +417,12 @@ _HEALTH_SCOPE = (
     "circuit_breakers covers requests made by this server process since it "
     "started; the collector, dashboard and CLI keep their own. An empty map "
     "means no requests yet, not that every source is healthy.",
+    "failing_sources lists every source whose last call from this process "
+    "failed, whether or not its breaker has opened. In circuit_breakers, "
+    "failures is the count of failed calls since the last success (0 after "
+    "a success), and a breaker opens only after several failures in a row; "
+    "total_successes and total_failures count every call since the process "
+    "started.",
     "stale_serves counts, per source, the stale cached copies this process "
     "served when a live fetch failed, whatever the payload type.",
     "cache_freshness reads the cache database: the newest entry per key "
@@ -453,6 +459,16 @@ def _read_cache(cache: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
     return {"available": True, **stats, **paths}, by_prefix
 
 
+def _failing_sources(breakers: dict[str, Any]) -> list[str]:
+    """Sources whose last call failed (failures resets to 0 on a success),
+    or whose breaker is open or half-open."""
+    return sorted(
+        name
+        for name, info in breakers.items()
+        if (info.get("failures") or 0) > 0 or info.get("status") != "closed"
+    )
+
+
 def _verdict(breakers: dict[str, Any], cache_info: dict[str, Any]) -> str:
     entries = cache_info.get("total_entries") or 0
     if not breakers and not entries:
@@ -468,12 +484,19 @@ def _verdict(breakers: dict[str, Any], cache_info: dict[str, Any]) -> str:
             "cache_freshness shows what any process sharing the cache fetched last"
         )
     else:
+        # A breaker opens only after several failures in a row, so a closed
+        # breaker can still mean the last call failed: count both.
+        failing = len(_failing_sources(breakers))
         unavailable = sum(1 for info in breakers.values() if info.get("status") != "closed")
+        stale = sum(1 for info in breakers.values() if info.get("total_stale_serves"))
         noun = "source" if len(breakers) == 1 else "sources"
         verdict = (
-            f"{len(breakers)} {noun} called by this process, {unavailable} "
-            "with an open or half-open circuit breaker"
+            f"{len(breakers)} {noun} called by this process, {failing} whose "
+            f"last call failed, {unavailable} with an open or half-open circuit "
+            "breaker"
         )
+        if stale:
+            verdict += f"; {stale} served a stale cached copy"
     if cache_info["fell_back"]:
         verdict += (
             "; the configured cache could not be opened, so this process uses "
@@ -509,6 +532,7 @@ def source_health(
         "generated_at": generated.isoformat(),
         "verdict": _verdict(breakers, cache_info),
         "scope": list(_HEALTH_SCOPE),
+        "failing_sources": _failing_sources(breakers),
         "open_breakers": sorted(
             name for name, info in breakers.items() if info.get("status") != "closed"
         ),

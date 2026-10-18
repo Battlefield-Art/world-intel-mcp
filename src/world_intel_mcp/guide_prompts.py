@@ -933,8 +933,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "An empty outage list, an all-clear corridor reading or zero "
             "cable warnings can each be a failed fetch: when the warning feed "
-            "is down every corridor reads clear. Check "
-            "intel://guide/source-health before calling {country} connected.",
+            "is down every corridor reads clear. Check failing_sources in "
+            "intel://guide/source-health before calling {country} connected: "
+            "it lists every source whose last call failed, even before its "
+            "circuit breaker opens.",
             "Cascade analysis is a simulation over curated cable "
             "dependencies, not a measurement of a real outage.",
             "BGP status checks one ASN or prefix at a time; it is not a "

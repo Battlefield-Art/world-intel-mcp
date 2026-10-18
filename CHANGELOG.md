@@ -316,6 +316,14 @@ source here, and no proxy is substituted for any of these measures.
   null, `index_is_lower_bound` marks a total that counts missing parts as
   zero, and with nothing measured the index is null and the risk level
   `unknown`. `ucdp_floor_basis` says the floor comes from a static table.
+- The source-health verdict counted only open or half-open circuit
+  breakers, and a breaker opens after three failures in a row, so after
+  one or two failed calls it read "0 with an open or half-open circuit
+  breaker" while the source was down. New `failing_sources` lists every
+  source whose last call failed, the verdict reads "N sources called by
+  this process, M whose last call failed, K with an open or half-open
+  circuit breaker" (plus how many served a stale copy), and the scope
+  notes explain `failures`, `total_successes` and `total_failures`.
 - `intel_internet_outages` returned an empty list with no marker when
   neither Cloudflare Radar nor IODA answered; it now carries `error`,
   `degraded` and reason `outages_unavailable`.

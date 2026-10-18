@@ -1527,3 +1527,73 @@ async def test_stale_serves_count_dict_payloads_end_to_end(tmp_path) -> None:
     assert (as_dict["_stale"], as_dict["rates"]) == (True, [1.0])
     assert as_list == [1, 2]
     assert health["stale_serves"] == {"probe-dict": 1, "probe-list": 1}
+
+
+# ---------------------------------------------------------------------------
+# Source health: a failing source is named before its breaker opens (R1)
+# ---------------------------------------------------------------------------
+
+
+def _health(tmp_path, breaker: CircuitBreaker) -> dict:
+    cache = Cache(db_path=tmp_path / "health.db")
+    try:
+        return guide.source_health(breaker, cache, environ={}, now=0)
+    finally:
+        cache.close()
+
+
+def test_source_health_names_sources_whose_last_call_failed(tmp_path) -> None:
+    """One research prompt rarely calls a source three times, so a failed
+    source usually still has a closed breaker; it must be named anyway."""
+    breaker = CircuitBreaker()
+    breaker.record_failure("ioda")
+    breaker.record_success("usgs")
+    breaker.record_failure("nga-msi")
+    breaker.record_failure("nga-msi")
+    health = _health(tmp_path, breaker)
+    assert health["failing_sources"] == ["ioda", "nga-msi"]
+    assert health["open_breakers"] == []
+    assert health["verdict"] == (
+        "3 sources called by this process, 2 whose last call failed, "
+        "0 with an open or half-open circuit breaker"
+    )
+
+
+def test_source_health_counts_a_half_open_breaker(tmp_path) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=0)
+    breaker.record_failure("gdelt")
+    health = _health(tmp_path, breaker)
+    assert health["circuit_breakers"]["gdelt"]["status"] == "half-open"
+    assert health["open_breakers"] == health["failing_sources"] == ["gdelt"]
+    assert health["verdict"] == (
+        "1 source called by this process, 1 whose last call failed, "
+        "1 with an open or half-open circuit breaker"
+    )
+
+
+def test_source_health_drops_a_source_that_recovered(tmp_path) -> None:
+    breaker = CircuitBreaker()
+    breaker.record_failure("ioda")
+    breaker.record_success("ioda")
+    health = _health(tmp_path, breaker)
+    assert health["failing_sources"] == []
+    assert health["verdict"].startswith("1 source called by this process, 0 whose last call failed")
+
+
+def test_source_health_verdict_counts_stale_serves(tmp_path) -> None:
+    breaker = CircuitBreaker()
+    breaker.record_failure("aaa")
+    breaker.record_stale_serve("aaa")
+    breaker.record_success("usgs")
+    health = _health(tmp_path, breaker)
+    assert health["verdict"].endswith("; 1 served a stale cached copy")
+    plain = CircuitBreaker()
+    plain.record_success("usgs")
+    assert "stale" not in _health(tmp_path, plain)["verdict"]
+
+
+def test_source_health_scope_explains_the_breaker_counters() -> None:
+    scope = " ".join(guide._HEALTH_SCOPE)
+    for term in ("failing_sources", "failures is the count of failed calls since the last success",
+                 "total_successes", "total_failures"):
+        assert term in scope, term
