@@ -115,9 +115,17 @@ KEYED_SOURCES: tuple[KeyedSource, ...] = (
         "ACLED",
         ("ACLED_EMAIL", "ACLED_PASSWORD"),
         "ACLED event, unrest and risk tools return an error naming the missing "
-        "credentials. When both are set but the sign-in request fails, the "
+        "credentials, and so does intel_instability_index without a "
+        "country_code. With a country_code the index still scores, without "
+        "its unrest and conflict inputs, and lists acled_unconfigured in "
+        "data_gaps. When both are set but the sign-in request fails, the "
         "error says ACLED sign-in failed instead (reason acled_auth_failed).",
-        needed_by=("intel_acled_events", "intel_unrest_events", "intel_risk_scores"),
+        needed_by=(
+            "intel_acled_events",
+            "intel_unrest_events",
+            "intel_risk_scores",
+            "intel_instability_index",
+        ),
     ),
     KeyedSource(
         "UCDP",

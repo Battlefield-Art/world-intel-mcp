@@ -1597,3 +1597,72 @@ def test_source_health_scope_explains_the_breaker_counters() -> None:
     for term in ("failing_sources", "failures is the count of failed calls since the last success",
                  "total_successes", "total_failures"):
         assert term in scope, term
+
+
+@pytest.mark.asyncio
+async def test_every_conflict_and_intelligence_tool_naming_a_key_is_marked(
+    monkeypatch, tmp_path
+) -> None:
+    """The reverse of the check above: a tool whose error names a keyed
+    variable when that variable is unset must carry [needs ...] in the
+    guide. Every upstream request is refused with 401, and rate-limit
+    waits are skipped."""
+    import asyncio as _asyncio
+    import json as _json
+
+    import httpx
+
+    async def _no_wait(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(_asyncio, "sleep", _no_wait)
+
+    from world_intel_mcp import runtime
+    from world_intel_mcp.fetcher import Fetcher
+    from world_intel_mcp.tools import ALL_HANDLERS, conflict, intelligence
+
+    keyed = {var for ks in guide.KEYED_SOURCES for var in ks.env}
+    for var in keyed:
+        monkeypatch.delenv(var, raising=False)
+    refuse = httpx.MockTransport(lambda request: httpx.Response(401))
+    client = httpx.AsyncClient(transport=refuse)
+    # intel_country_brief opens its own client for a local model; it gets
+    # the same refusal, so nothing leaves the process.
+    real_client = httpx.AsyncClient
+
+    def _offline_client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs["transport"] = refuse
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _offline_client)
+    cache = Cache(db_path=tmp_path / "reverse.db")
+    monkeypatch.setattr(runtime, "fetcher", Fetcher(cache, CircuitBreaker(), max_retries=0, client=client))
+    sample = {
+        "intel_aircraft_details": {"icao24": "abc123"},
+        "intel_aircraft_batch": {"icao24_list": ["abc123"]},
+    }
+    named: dict[str, list[str]] = {}
+    called = 0
+    try:
+        for module in (conflict, intelligence):
+            for tool in module.TOOLS:
+                result = await ALL_HANDLERS[tool.name](sample.get(tool.name, {}))
+                called += 1
+                error = _json.dumps(result.get("error") or "")
+                found = sorted(var for var in keyed if var in error)
+                if found:
+                    named[tool.name] = found
+    finally:
+        await client.aclose()
+        cache.close()
+    assert called == len(conflict.TOOLS) + len(intelligence.TOOLS) == 24
+    marked = {tool: sorted(env) for tool, env in guide._NEEDS.items() if tool in named}
+    assert named == marked
+    assert sorted(named) == [
+        "intel_acled_events",
+        "intel_instability_index",
+        "intel_risk_scores",
+        "intel_ucdp_events",
+        "intel_unrest_events",
+    ]

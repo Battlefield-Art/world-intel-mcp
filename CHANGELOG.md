@@ -327,6 +327,14 @@ source here, and no proxy is substituted for any of these measures.
 - `intel_internet_outages` returned an empty list with no marker when
   neither Cloudflare Radar nor IODA answered; it now carries `error`,
   `degraded` and reason `outages_unavailable`.
+- The guide did not mark `intel_instability_index` as needing ACLED
+  credentials, though without a `country_code` it returns the same
+  credentials error as the other ACLED tools. It now carries
+  `[needs ACLED_EMAIL, ACLED_PASSWORD]`, and the keyed-source note says a
+  `country_code` call still scores without ACLED and lists
+  `acled_unconfigured` in `data_gaps`. A new test calls every conflict and
+  intelligence tool with no keys set and checks that each one whose error
+  names a key is marked.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
