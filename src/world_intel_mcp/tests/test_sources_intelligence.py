@@ -314,6 +314,186 @@ async def test_fetch_instability_index_multi_unconfigured(
     assert result.get("degraded") is None
 
 
+def _instability_inputs(monkeypatch, *, acled=None, outages=None, flights=None, gdelt=None):
+    """Patch the four single-country inputs; record what each was asked."""
+    sent: dict = {"acled": [], "gdelt": [], "bbox": []}
+
+    async def _acled(fetcher, params, cache_key, cache_ttl=900):
+        sent["acled"].append(params.get("country"))
+        return acled
+
+    async def _gdelt(fetcher, query="", mode="artlist", limit=100):
+        sent["gdelt"].append(query)
+        return gdelt if gdelt is not None else {"count": 40}
+
+    async def _flights(fetcher, bbox=None):
+        sent["bbox"].append(bbox)
+        return flights if flights is not None else {"count": 10}
+
+    monkeypatch.setattr(intelligence, "acled_query", _acled)
+    monkeypatch.setattr(
+        infrastructure,
+        "fetch_internet_outages",
+        _async_return(outages if outages is not None else {"outages": []}),
+    )
+    monkeypatch.setattr(military, "fetch_military_flights", _flights)
+    monkeypatch.setattr(news, "fetch_gdelt_search", _gdelt)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_instability_unknown_code_is_an_error_not_zero_low(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = _instability_inputs(monkeypatch, acled={"data": []})
+    for bad in ("XYZ", "Sudan", ""):
+        result = await intelligence.fetch_instability_index(fetcher, country_code=bad)
+        assert "instability_index" not in result, bad
+        assert result["error"].startswith("Unknown or unsupported country code"), bad
+        assert {"SDN", "FRA", "BRA", "USA"} <= set(result["accepted_codes"])
+        assert len(result["accepted_codes"]) == 50
+    assert sent == {"acled": [], "gdelt": [], "bbox": []}
+
+
+@pytest.mark.asyncio
+async def test_instability_sends_the_country_name_upstream_and_ignores_case(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = _instability_inputs(monkeypatch, acled={"data": []})
+    bra = await intelligence.fetch_instability_index(fetcher, country_code="BRA")
+    syr = await intelligence.fetch_instability_index(fetcher, country_code=" syr ")
+    assert sent["acled"] == ["Brazil", "Syria"]
+    assert sent["gdelt"] == ["Brazil", "Syria"]
+    assert (bra["country_code"], bra["country_name"]) == ("BRA", "Brazil")
+    assert (syr["country_code"], syr["country_name"], syr["ucdp_floor"]) == ("SYR", "Syria", 70.0)
+    assert syr["ucdp_floor_basis"].startswith("static baseline_risk")
+    assert "ucdp_floor_basis" not in bra
+
+
+@pytest.mark.asyncio
+async def test_instability_names_every_input_it_could_not_obtain(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACLED unconfigured, outages, flights and GDELT all failed: nothing
+    was measured, so there is no index and no risk level from the floor."""
+    _instability_inputs(
+        monkeypatch,
+        acled=None,
+        outages={"outages": [], "error": "No internet outage source answered"},
+        flights={"count": 0, "source": "none", "error": "No military flight source available"},
+        gdelt={"count": 0, "error": "GDELT fetch failed", "degraded": True},
+    )
+    monkeypatch.setattr(intelligence, "acled_failure_reason", _fake_reason("acled_unconfigured"))
+
+    result = await intelligence.fetch_instability_index(fetcher, country_code="SDN")
+
+    assert result["components"] == {"unrest": None, "conflict": None, "security": None, "information": None}
+    assert (result["instability_index"], result["risk_level"]) == (None, "unknown")
+    assert result["index_is_lower_bound"] is True
+    assert result["data_gaps"] == [
+        "acled_unconfigured",
+        "military aircraft: No military flight source available",
+        "internet outages: No internet outage source answered",
+        "news velocity (GDELT): GDELT fetch failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_instability_without_a_bbox_says_military_was_not_measured(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """France has no military bounding box and GDELT failed: security rests
+    on outages alone, information is unknown, and the total is a lower bound."""
+    sent = _instability_inputs(
+        monkeypatch,
+        acled={"data": [{"event_type": "Protests", "fatalities": 0}] * 4},
+        gdelt={"count": 0, "error": "GDELT fetch failed"},
+    )
+
+    result = await intelligence.fetch_instability_index(fetcher, country_code="FRA")
+
+    assert sent["bbox"] == []
+    assert result["components"]["information"] is None
+    assert result["components"]["security"] == 0.0
+    assert result["components"]["unrest"] is not None
+    assert result["instability_index"] is not None
+    assert result["index_is_lower_bound"] is True
+    assert result["data_gaps"] == [
+        "military aircraft: no bounding box for FRA (the index has 16), not measured",
+        "news velocity (GDELT): GDELT fetch failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_instability_with_every_input_measured_has_no_gap(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _instability_inputs(monkeypatch, acled={"data": []})
+    result = await intelligence.fetch_instability_index(fetcher, country_code="SYR")
+    assert result["data_gaps"] == []
+    assert "index_is_lower_bound" not in result
+    assert None not in result["components"].values()
+
+
+@pytest.mark.asyncio
+async def test_instability_part_measured_security_makes_a_lower_bound(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the military part is missing (no bounding box): every component
+    has a value, but the total still leaves that part out."""
+    _instability_inputs(monkeypatch, acled={"data": []})
+    result = await intelligence.fetch_instability_index(fetcher, country_code="DEU")
+    assert None not in result["components"].values()
+    assert result["index_is_lower_bound"] is True
+    assert result["data_gaps"] == [
+        "military aircraft: no bounding box for DEU (the index has 16), not measured"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internet_outages_with_no_source_answering_is_marked(
+    cache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from world_intel_mcp.circuit_breaker import CircuitBreaker
+
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    quick = Fetcher(cache=cache, breaker=CircuitBreaker(), max_retries=0)
+    try:
+        with respx.mock(assert_all_called=False) as router:
+            router.route().mock(return_value=httpx.Response(503))
+            result = await infrastructure.fetch_internet_outages(quick)
+    finally:
+        await quick.close()
+    assert (result["degraded"], result["reason"]) == (True, "outages_unavailable")
+    assert result["error"].startswith("No internet outage source answered")
+    assert (result["outages"], result["total_7d"]) == ([], 0)
+
+
+def test_cli_instability_prints_unmeasured_components(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from click.testing import CliRunner
+
+    from world_intel_mcp import cli
+
+    monkeypatch.setenv("WORLD_INTEL_CACHE_DB", str(tmp_path / "cli-cache.db"))
+    monkeypatch.setattr(cli, "_fetcher", None)
+    monkeypatch.setattr(
+        intelligence,
+        "fetch_instability_index",
+        _async_return({
+            "instability_index": None,
+            "risk_level": "unknown",
+            "components": {"unrest": None, "information": 15.0},
+            "data_gaps": ["news velocity (GDELT): GDELT fetch failed"],
+        }),
+    )
+    result = CliRunner().invoke(cli.main, ["instability", "SDN"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.output
+    assert "SDN Instability Index: not measured (unknown)" in result.output
+    assert "unrest" in result.output and "not measured" in result.output
+    assert "15.0/20" in result.output
+    assert "gap: news velocity (GDELT): GDELT fetch failed" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Function 4: fetch_signal_convergence
 # ---------------------------------------------------------------------------

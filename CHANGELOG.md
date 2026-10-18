@@ -305,6 +305,20 @@ source here, and no proxy is substituted for any of these measures.
   and a failed download sets `match_count` to null with `error`,
   `degraded`, reason `sdn_unavailable` and a `data_gaps` entry. `intel
   dossier` prints "not screened" in that case.
+- `intel_instability_index` for one country: a code outside its name
+  table was sent upstream as-is and scored from inputs that never matched
+  the place, and any string (a name, a typo, lower case) gave a low score
+  with no error. Codes are now upper-cased, the 50 codes it can name are
+  sent as English names, and any other input returns an error listing
+  `accepted_codes`. Every input it could not obtain (ACLED, internet
+  outages, military flights, GDELT, or a country with no military bounding
+  box) is named in `data_gaps`, a component with no measured input is
+  null, `index_is_lower_bound` marks a total that counts missing parts as
+  zero, and with nothing measured the index is null and the risk level
+  `unknown`. `ucdp_floor_basis` says the floor comes from a static table.
+- `intel_internet_outages` returned an empty list with no marker when
+  neither Cloudflare Radar nor IODA answered; it now carries `error`,
+  `degraded` and reason `outages_unavailable`.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

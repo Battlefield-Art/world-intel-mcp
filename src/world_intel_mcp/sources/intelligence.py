@@ -429,9 +429,42 @@ async def fetch_instability_index(
     now = datetime.now(timezone.utc)
 
     if country_code is not None:
-        return await _instability_single(fetcher, country_code, now)
+        code = country_code.strip().upper()
+        names = _instability_country_names()
+        if code not in names:
+            # A code the index cannot name would be sent upstream as-is and
+            # score from inputs that never matched the place.
+            return {
+                "error": (
+                    f"Unknown or unsupported country code {country_code!r}: the "
+                    "instability index takes one of the ISO alpha-3 codes it can "
+                    "name, listed in accepted_codes"
+                ),
+                "accepted_codes": sorted(names),
+                "source": "instability-index-v2",
+                "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        return await _instability_single(fetcher, code, now)
 
     return await _instability_multi(fetcher, now)
+
+
+# ACLED spells this one differently from the sanctions-list form the
+# dossier's name table uses.
+_ACLED_NAME_OVERRIDES = {"KOR": "South Korea"}
+
+
+def _instability_country_names() -> dict[str, str]:
+    """ISO alpha-3 code -> English name for every country the single-country
+    index can query: its own table, the tier-1 countries and the dossier's
+    table."""
+    from ..analysis.dossier import _EXTRA_COUNTRY_NAMES
+
+    names = dict(_EXTRA_COUNTRY_NAMES)
+    names.update({code: cfg["name"] for code, cfg in TIER1_COUNTRIES.items() if cfg.get("name")})
+    names.update(_ISO3_TO_NAME)
+    names.update(_ACLED_NAME_OVERRIDES)
+    return names
 
 
 async def _instability_single(
@@ -443,8 +476,13 @@ async def _instability_single(
 
     Uses 4 weighted domains: unrest, conflict, security, information.
     Applies country-specific event multiplier and UCDP/displacement boosts.
+
+    Every input that could not be obtained is named in ``data_gaps``, and a
+    component with no measured input is null rather than 0. The total then
+    treats it as 0, so it is a lower bound (``index_is_lower_bound``); with
+    no component measured the index is null and the risk level "unknown".
     """
-    country_name = _ISO3_TO_NAME.get(country_code, country_code)
+    country_name = _instability_country_names()[country_code]
     event_multiplier = get_event_multiplier(country_code)
     start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
@@ -469,11 +507,13 @@ async def _instability_single(
         events = data.get("data", []) if isinstance(data, dict) else []
         return events, None
 
-    async def _fetch_outages() -> int:
+    async def _fetch_outages() -> tuple[int, str | None]:
         """Count internet outages mentioning this country."""
         from . import infrastructure
 
         result = await infrastructure.fetch_internet_outages(fetcher)
+        if result.get("error"):
+            return 0, f"internet outages: {result['error']}"
         count = 0
         for outage in result.get("outages", []):
             countries_list = outage.get("countries", [])
@@ -481,9 +521,9 @@ async def _instability_single(
                 for c in countries_list:
                     if isinstance(c, str) and country_code.lower() in c.lower():
                         count += 1
-        return count
+        return count, None
 
-    async def _fetch_military() -> int:
+    async def _fetch_military() -> tuple[int, str | None]:
         """Count military aircraft near this country."""
         _COUNTRY_BBOX = {
             "SYR": "32,35,37,42",
@@ -505,14 +545,19 @@ async def _instability_single(
         }
         bbox = _COUNTRY_BBOX.get(country_code)
         if bbox is None:
-            return 0
+            return 0, (
+                f"military aircraft: no bounding box for {country_code} (the index "
+                f"has {len(_COUNTRY_BBOX)}), not measured"
+            )
 
         from . import military as mil_mod
 
         result = await mil_mod.fetch_military_flights(fetcher, bbox=bbox)
-        return result.get("count", 0)
+        if result.get("error"):
+            return 0, f"military aircraft: {result['error']}"
+        return result.get("count", 0), None
 
-    async def _fetch_news_velocity() -> int:
+    async def _fetch_news_velocity() -> tuple[int, str | None]:
         """Estimate news velocity from GDELT."""
         from . import news
 
@@ -522,9 +567,16 @@ async def _instability_single(
             mode="artlist",
             limit=100,
         )
-        return result.get("count", 0)
+        if result.get("error"):
+            return 0, f"news velocity (GDELT): {result['error']}"
+        return result.get("count", 0), None
 
-    (acled_events, acled_gap), outage_count, mil_count, news_vel = await asyncio.gather(
+    (
+        (acled_events, acled_gap),
+        (outage_count, outage_gap),
+        (mil_count, mil_gap),
+        (news_vel, news_gap),
+    ) = await asyncio.gather(
         _fetch_acled(),
         _fetch_outages(),
         _fetch_military(),
@@ -582,6 +634,27 @@ async def _instability_single(
         displacement_boost=displacement_boost,
     )
 
+    # A component with no measured input is unknown, not 0.
+    unmeasured = []
+    if acled_gap:
+        unmeasured += ["unrest", "conflict"]
+    if mil_gap and outage_gap:
+        unmeasured.append("security")
+    if news_gap:
+        unmeasured.append("information")
+    for name in unmeasured:
+        cii["components"][name] = None
+    if unmeasured or mil_gap or outage_gap:
+        cii["index_is_lower_bound"] = True
+    if len(unmeasured) == len(cii["components"]):
+        cii["instability_index"] = None
+        cii["risk_level"] = "unknown"
+    if ucdp_floor is not None:
+        cii["ucdp_floor_basis"] = (
+            "static baseline_risk from the country table, not current UCDP data"
+        )
+    data_gaps = [g for g in (acled_gap, mil_gap, outage_gap, news_gap) if g]
+
     return {
         "country_code": country_code,
         "country_name": country_name,
@@ -596,7 +669,7 @@ async def _instability_single(
             "internet_outages": outage_count,
             "news_articles": news_vel,
         },
-        "data_gaps": [acled_gap] if acled_gap else [],
+        "data_gaps": data_gaps,
         "source": "instability-index-v2",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }

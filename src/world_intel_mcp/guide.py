@@ -394,8 +394,11 @@ caused the other.
 
 Escalation, instability, risk, macro composite and stress scores are
 weighted combinations of current inputs against stated baselines. They
-summarize their inputs, they are not probabilities, and they hold no
-information their inputs do not. Report the components with the score.
+summarize their inputs and are not probabilities. Some add a fixed amount
+from a static country table: the instability index's `ucdp_floor` and
+`displacement_boost` come from a baseline risk table, not from current
+data, so a floor score says nothing about this week. Report the
+components with the score; a null component was not measured.
 
 ## Missing data is not zero
 
@@ -405,8 +408,8 @@ unknown, not none. Not every tool does: some return an empty list, a
 zero count or a neutral score when every upstream request failed, so an
 empty list or a zero means nothing was returned, not that nothing
 happened. Zero events from a fetch that worked, in a region the source
-covers, is a measurement; zero events in a region it does not cover is
-nothing at all.
+covers and for a query that matched the place, is a measurement; zero
+events in a region it does not cover is nothing at all.
 """
 
 

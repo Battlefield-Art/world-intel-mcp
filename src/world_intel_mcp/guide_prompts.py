@@ -1244,7 +1244,11 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ),
             Step(
                 "intel_instability_index",
-                "the index with its four components",
+                "the index with its four components. It takes 50 ISO alpha-3 "
+                "codes and returns an error listing them for any other. Each "
+                "input it could not obtain is named in data_gaps and its "
+                "component is null; index_is_lower_bound then means the total "
+                "counts the missing parts as zero",
                 args=(("country_code", "{country}"),),
             ),
             Step(
@@ -1261,7 +1265,9 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         limits=(
             "The instability index is a weighted composite with country "
-            "multipliers. Quote its components, not only the total.",
+            "multipliers. Quote its components, not only the total. Its "
+            "ucdp_floor comes from a static baseline table, not from current "
+            "UCDP data: a total at the floor says nothing about this month.",
             "World Bank figures in the dossier are annual and often a year or "
             "more old. Give the year of each.",
         ),

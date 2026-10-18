@@ -267,12 +267,21 @@ async def fetch_internet_outages(fetcher: Fetcher) -> dict:
     if data is None:
         note = "Set CLOUDFLARE_API_TOKEN for detailed outage data" if not token else None
         logger.warning("Internet outages: no data from Cloudflare or IODA")
+        # No source answered: the empty list is missing data, not a quiet
+        # week, so it carries an error marker.
         result: dict = {
             "outages": [],
             "ongoing_count": 0,
             "total_7d": 0,
             "source": "cloudflare-radar",
             "timestamp": now_iso,
+            "error": (
+                "No internet outage source answered (Cloudflare Radar and IODA)"
+                if token
+                else "No internet outage source answered (IODA; Cloudflare Radar needs CLOUDFLARE_API_TOKEN)"
+            ),
+            "degraded": True,
+            "reason": "outages_unavailable",
         }
         if note:
             result["note"] = note
