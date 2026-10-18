@@ -2802,9 +2802,9 @@ function updateDrawer(data) {
 
     // ── FLEET ──
     // A component the report could not use is left out of its count, so that
-    // count reads '?'; readiness_score is null when nothing was scored and a
-    // lower bound (shown with a leading >=, never in the calm green) when
-    // inputs are missing.
+    // count reads '?'; readiness_score is null when nothing was scored, and
+    // when inputs are missing the score and level are lower bounds (shown
+    // with a leading >=, the score never in the calm green).
     if (data.fleet_report) {
         var fr = data.fleet_report;
         var frOut = fr.unavailable_components || [];
@@ -2814,8 +2814,9 @@ function updateDrawer(data) {
         var fKnown = typeof fScore === 'number';
         var fColor = !fKnown ? 'var(--dim)' : fScore >= 70 ? 'var(--red)' : fScore >= 40 ? 'var(--amber)' : fr.readiness_lower_bound ? 'var(--bright)' : 'var(--green)';
         h += '<div class="mini-row">';
-        h += '<div class="mini-box"><div class="v" style="color:' + fColor + '">' + (fKnown ? (fr.readiness_lower_bound ? '\u2265' : '') + fScore : '?') + '</div><div class="l">Readiness</div></div>';
-        h += '<div class="mini-box"><div class="v">' + esc(fr.readiness_level || '?') + '</div><div class="l">Level</div></div>';
+        var fFloor = fKnown && fr.readiness_lower_bound ? '\u2265' : '';
+        h += '<div class="mini-box"><div class="v" style="color:' + fColor + '">' + (fKnown ? fFloor + fScore : '?') + '</div><div class="l">Readiness</div></div>';
+        h += '<div class="mini-box"><div class="v">' + fFloor + esc(fr.readiness_level || '?') + '</div><div class="l">Level</div></div>';
         h += '<div class="mini-box"><div class="v">' + ((fr.unavailable_theaters || []).length ? '\u2265' : '') + frCount(fr.total_tracked_aircraft, 'theater_posture') + '</div><div class="l">Aircraft</div></div>';
         h += '<div class="mini-box"><div class="v">' + frCount(fr.surge_count, 'military_surge') + '</div><div class="l">Surges</div></div>';
         h += '</div>';
