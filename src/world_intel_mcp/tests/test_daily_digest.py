@@ -306,3 +306,48 @@ def test_intel_daily_digest_registered_and_dispatched() -> None:
 
     handler = tools_pkg.ALL_HANDLERS["intel_daily_digest"]
     assert "fetch_daily_digest" in inspect.getsource(handler)
+
+
+_REAL_FETCH_SPACE_WEATHER = space_weather.fetch_space_weather
+
+
+@pytest.mark.asyncio
+async def test_digest_survives_a_swpc_outage_and_names_the_gap(
+    cache, monkeypatch
+) -> None:
+    """The real space weather source answers a SWPC outage with
+    current_kp None and no error key; the digest must still render, cite
+    the healthy domains, and list the missing reading as a gap."""
+    import httpx
+    import respx
+
+    from world_intel_mcp.circuit_breaker import CircuitBreaker
+    from world_intel_mcp.fetcher import Fetcher
+
+    _patch_all_domains(monkeypatch)
+    monkeypatch.setattr(
+        space_weather, "fetch_space_weather", _REAL_FETCH_SPACE_WEATHER
+    )
+    real_fetcher = Fetcher(cache=cache, breaker=CircuitBreaker(), max_retries=0)
+    try:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(url__startswith="https://services.swpc.noaa.gov/").mock(
+                return_value=httpx.Response(503)
+            )
+            result = await fetch_daily_digest(real_fetcher, vector_store=None)
+    finally:
+        await real_fetcher.close()
+
+    assert "Space weather: no Kp reading" in result["data_gaps"]
+    assert "- Space weather: no Kp reading" in result["markdown"]
+    assert not any(s["domain"] == "space_weather" for s in result["sources"])
+    assert any(s["domain"] == "earthquakes" for s in result["sources"])
+
+
+@pytest.mark.asyncio
+async def test_digest_with_a_kp_reading_lists_no_space_weather_gap(
+    fetcher, monkeypatch
+) -> None:
+    _patch_all_domains(monkeypatch)
+    result = await fetch_daily_digest(fetcher, vector_store=None)
+    assert not any(g.startswith("Space weather") for g in result["data_gaps"])

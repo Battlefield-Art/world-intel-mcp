@@ -570,3 +570,53 @@ def test_intel_situation_brief_registered_and_dispatched() -> None:
 
     handler = tools_pkg.ALL_HANDLERS["intel_situation_brief"]
     assert "fetch_live_situation_brief" in inspect.getsource(handler)
+
+
+# A SWPC outage reaches the brief as the real source's failure shape,
+# {"current_kp": None, ...} with no error key, not as a fake {"error": ...}.
+_REAL_FETCH_SPACE_WEATHER = space_weather.fetch_space_weather
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_situation_brief_survives_a_swpc_outage(
+    monkeypatch: pytest.MonkeyPatch, cache
+) -> None:
+    from world_intel_mcp.circuit_breaker import CircuitBreaker
+    from world_intel_mcp.fetcher import Fetcher
+
+    _patch_all_compact_domains(monkeypatch)
+    monkeypatch.setattr(
+        space_weather, "fetch_space_weather", _REAL_FETCH_SPACE_WEATHER
+    )
+    respx.get(url__startswith="https://services.swpc.noaa.gov/").mock(
+        return_value=httpx.Response(503)
+    )
+    respx.post(_OLLAMA_GENERATE).mock(
+        side_effect=httpx.ConnectError("no ollama in test env")
+    )
+    real_fetcher = Fetcher(cache=cache, breaker=CircuitBreaker(), max_retries=0)
+    try:
+        result = await fetch_live_situation_brief(real_fetcher)
+    finally:
+        await real_fetcher.close()
+
+    assert result["metrics_snapshot"]["kp_index"] is None
+    assert not any(s["domain"] == "space_weather" for s in result["sources"])
+    assert "Kp unavailable" in result["brief"]
+    assert "Kp None" not in result["brief"]
+    assert "Kp 0" not in result["brief"]
+
+
+def test_missing_kp_is_unavailable_in_the_prompt_not_zero() -> None:
+    overview = _synthetic_overview()
+    overview["space_weather"] = {"current_kp": None, "timestamp": None}
+    metrics, sources, _ = _extract_metrics(overview)
+    from world_intel_mcp.analysis.situation import _build_prompt
+
+    prompt = _build_prompt(metrics, sources)
+    assert "SPACE WEATHER: Kp unavailable (no reading)" in prompt
+    assert metrics["kp_index"] is None
+    # A real reading still renders as before.
+    metrics_ok, sources_ok, _ = _extract_metrics(_synthetic_overview())
+    assert "SPACE WEATHER: Kp 6.0" in _build_prompt(metrics_ok, sources_ok)

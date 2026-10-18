@@ -259,10 +259,10 @@ source here, and no proxy is substituted for any of these measures.
   domain module, with a `[needs VARIABLE]` mark on each tool that returns
   an error without its API key. Built from the live registry on every
   read; a test fails if a registered tool is missing or listed twice. It
-  says plainly that not every tool marks a failure: with every upstream
-  request forced to fail (measured 2026-10-17), 53 of the 85 tools that
-  call a source returned an empty list, a zero count or a neutral score
-  with no error, `degraded` or `data_gaps` field.
+  says plainly that many tools do not mark a failure: when every upstream
+  request fails they can return an empty list, a zero count, a neutral
+  score, a LOW risk label, an all-clear status or a false flag with no
+  error, `degraded` or `data_gaps` field.
 - `intel://guide/source-health` (JSON): open circuit breakers, stale
   serves, stale cache prefixes, cache freshness, and which keyed sources
   have their variables set (names only, never values), with a `verdict`
@@ -287,8 +287,10 @@ source here, and no proxy is substituted for any of these measures.
   its schema does not take (name, type, listed value or range), cites an
   output field the code does not produce, describes a step in words that
   share nothing with the called tool's description or names a provider
-  that tool does not, or states a count or a table size the code does not
-  match.
+  that tool does not, or states one of the pinned counts or table sizes
+  (cities, countries, waterways, corridors, central banks, hotspots,
+  airports, Yahoo maturities, election rows and default limits) that the
+  code does not match. Counts the tests do not pin are not checked.
 - `intel guide` prints the guide markdown; `intel guide --measures` prints
   the glossary.
 - Two tests drive initialize, resources/list, resources/read, prompts/list,
@@ -336,6 +338,165 @@ source here, and no proxy is substituted for any of these measures.
   `ACLED_ACCESS_TOKEN`, which no code reads; added `UCDP_ACCESS_TOKEN`,
   `TOMTOM_API_KEY`, `WINDY_API_KEY`, `OPENSKY_USERNAME` and
   `OPENSKY_PASSWORD`.
+- `intel_yield_curve`: `inverted` is null, not `false`, when neither
+  spread could be computed, so an outage or one lost maturity no longer
+  reads as "not inverted". New `inversion_basis` names the spreads the
+  flag rests on (without `FRED_API_KEY` that is `spread_3m10y` alone) and
+  `yields_source` says whether the maturities came from FRED or Yahoo. A
+  maturity with no rate is listed in `data_gaps` with `degraded: true`, and
+  no rate at all is an `error`.
+- `intel_arxiv_papers` without `query` raised a TypeError before any
+  request; it now searches the default AI, ML and NLP categories. The
+  search also goes into the first request: before, the first request was
+  sent to the bare API URL and the query only reached a fallback.
+- `intel_situation_brief` and `intel_daily_digest` raised a TypeError when
+  NOAA SWPC was down, because the space weather source then reports no Kp
+  reading. The brief now says "Kp unavailable (no reading)" and
+  `metrics_snapshot.kp_index` is null, and the digest lists "Space weather:
+  no Kp reading" in `data_gaps`.
+- `intel_acled_events` and `intel_unrest_events` keyed their cache on
+  country and days only, so a short list cached for a small `limit` came
+  back, for 15 minutes, to a call that asked for more rows, and a count
+  below the limit then read as complete. `limit` is now part of both keys.
+- `intel_ucdp_events` dropped a page that failed after the first one (an
+  outage, or the circuit breaker skipping it) and returned the shorter
+  list with no marker. Such a result now carries `degraded`, reason
+  `ucdp_partial`, `pages_failed`, `pages_total` and a `data_gaps` entry
+  saying count and fatalities are lower bounds, and the conflict-trend
+  prompt tells the model to report the list as incomplete.
+- With `ACLED_EMAIL` and `ACLED_PASSWORD` set but the ACLED sign-in
+  request refused or unreachable, every ACLED tool said the credentials
+  were not configured. That case now has its own reason,
+  `acled_auth_failed`, and the error says the sign-in failed.
+- The sanctions section of `intel_country_dossier` was always empty: it
+  searched entity names for the ISO-3 code and read a key the search does
+  not return, and a failed SDN download read as zero matches. It now lists
+  SDN entries whose remarks name the country (by English name), carries
+  `total_entities`, `country_searched`, `match_method` and `more_matches`,
+  and a failed download sets `match_count` to null with `error`,
+  `degraded`, reason `sdn_unavailable` and a `data_gaps` entry. `intel
+  dossier` prints "not screened" in that case.
+- `intel_instability_index` for one country: a code outside its name
+  table was sent upstream as-is and scored from inputs that never matched
+  the place, and any string (a name, a typo, lower case) gave a low score
+  with no error. Codes are now upper-cased, the 50 codes it can name are
+  sent as English names, and any other input returns an error listing
+  `accepted_codes`. Every input it could not obtain (ACLED, internet
+  outages, military flights, GDELT, or a country with no military bounding
+  box) is named in `data_gaps`, a component with no measured input is
+  null, `index_is_lower_bound` marks a total that counts missing parts as
+  zero, and with nothing measured the index is null and the risk level
+  `unknown`. `ucdp_floor_basis` says the floor comes from a static table.
+- The source-health verdict counted only open or half-open circuit
+  breakers, and a breaker opens after three failures in a row, so after
+  one or two failed calls it read "0 with an open or half-open circuit
+  breaker" while the source was down. New `failing_sources` lists every
+  source whose last call failed, the verdict reads "N sources called by
+  this process, M whose last call failed, K with an open or half-open
+  circuit breaker" (plus how many served a stale copy), and the scope
+  notes explain `failures`, `total_successes` and `total_failures`.
+- `intel_internet_outages` returned an empty list with no marker when
+  neither Cloudflare Radar nor IODA answered; it now carries `error`,
+  `degraded` and reason `outages_unavailable`.
+- The guide did not mark `intel_instability_index` as needing ACLED
+  credentials, though without a `country_code` it returns the same
+  credentials error as the other ACLED tools. It now carries
+  `[needs ACLED_EMAIL, ACLED_PASSWORD]`, and the keyed-source note says a
+  `country_code` call still scores without ACLED and lists
+  `acled_unconfigured` in `data_gaps`. A new test calls every conflict and
+  intelligence tool with no keys set and checks that each one whose error
+  names a key is marked.
+- story-breadth told the model not to state a unit for GDELT volume
+  while the shared answer shape asked for each number with its unit. The
+  answer shape now reads "each number with its unit (or say the source
+  states none) and date".
+- The guide said stored history exists only for the time the collector
+  or server ran, which is false after `intel_history_backfill` loads FRED
+  or ECB publisher history. The limit now names the backfill, the three
+  tools that read it, and that its values are the publisher's current
+  vintage.
+- sanctions-screen said a count equal to the limit means more names
+  matched, and conflict-trend and earthquake-exposure said the same of
+  their lists, but a list that ends exactly at the limit returns the same
+  count. They now say the list may have been cut off and to call again
+  with a higher limit, and sanctions-screen says `total_entities` counts
+  the entries read before the search stopped, not the size of the list.
+- The guide's tool list cut each description at the first period
+  followed by a capital, so `intel_us_border_encounters` read just "U.S.".
+  A period that closes an abbreviation (U.S., e.g., i.e.) no longer ends
+  the line.
+- Domain summaries carried maintainer notes from module docstrings (a
+  build phase, a source file path, internal names), and newer domains had
+  no written title. Each domain now has one, and a summary is the first
+  sentence of its module docstring without build-phase notes.
+- Prompt argument values are rendered as one inert value. In a "call
+  with" list a value containing a space is quoted, so "Sudan days 9999
+  limit 5" cannot read as extra arguments. Control and format characters
+  (escape, NUL, zero-width, direction marks) are dropped. The check that
+  refuses a value naming another tool now folds case and compatibility
+  forms, treats hyphens as underscores and needs no word boundary in
+  front. Whole and decimal numbers take ASCII digits only, and a value
+  over 200 characters is refused instead of cut.
+- A cache file moved, deleted or replaced while the server held it open
+  kept answering from the open handle, and source health reported it as
+  the shared cache. `cache.moved` now marks it (the path is gone, or is
+  not the file source health first read), the verdict says the numbers
+  come from a file no other process shares, and the scope notes say a
+  replacement made before the first read is not detected.
+- Prompts now name the merged tools that answer their questions:
+  story-breadth (outlet breadth, ranked situations, per-day hostility
+  coverage), election-watch (Kalshi Elections markets and the cross-venue
+  comparison), the migration prompts (US border encounters, UK small boat
+  arrivals), the AOI prompts (polygon and corridor areas, the all-area
+  digest), market-risk-snapshot (liquidity board, net liquidity),
+  company-events (news and market reaction), yield-curve-check and
+  central-bank-compare (a keyless FRED backfill read back from the history
+  store when `FRED_API_KEY` is not set) and history-recall (the history
+  store and the collector's run log). The source-health scope points to
+  `intel_collection_health` for the run history it does not read.
+- election-watch presented `intel_election_calendar` as upcoming
+  elections. It is a hand-kept table of 18 rows dated 2025-01 to
+  2029-04, most already past; an uncovered country returns an empty list
+  with no note; past entries keep a proximity risk; and the country
+  filter also matches part of a name (RUS returns Belarus). The step and
+  limits now say each of these. The code is unchanged.
+- country-overview now says the dossier's elections section reads the
+  same hand-kept table: empty means not covered, and its match on part of
+  a name can add another country's election (RUS gets Belarus's).
+- earthquake-exposure told the model to keep only the cities whose
+  `event_detail` names a step-1 quake, but `intel_population_exposure`
+  names only the nearest M4.5+ event per city, so a nearer aftershock
+  dropped a city that a large quake had reached. The step now says so
+  and to compare each city's position with every step-1 event before
+  dropping it. The code is unchanged.
+- aoi-watch-setup said every failed domain is listed in `data_gaps` and
+  left out of the diff. Earthquakes, and wildfires when
+  `NASA_FIRMS_API_KEY` is set, return empty with no error when their
+  fetch fails, so the diff reports everything departing with no gap. Both
+  AOI prompts now say so, call a whole domain departing at once
+  unconfirmed, and point to `failing_sources`. The code is unchanged.
+- conflict-trend told the model to check the latest UCDP `date_start`
+  before reading a thin window as calm, but when the pinned release
+  (gedevents/25.1) ends before the window the tool returns count 0 with
+  no date and no marker. The limit now names the release and says a
+  count of 0, or a newest event well before the window ends, is missing
+  data, not zero events. The code is unchanged.
+- Claims in the guide text are pinned to the code they describe: the
+  failure warning in the server instructions, shared prompt limits, guide
+  intro and glossary; the no-observation-date sentence in all three; the
+  fx-move direction, checked by running the rate series; the exposure
+  step's magnitude, window, limit and radius, read from the code; the ten
+  years in history-recall; and the central bank, hotspot, airport and
+  Yahoo maturity counts. The test claim above is narrowed to the counts
+  the tests pin.
+- The check that a prompt step's purpose agrees with its tool let wrong
+  tools through on one shared parameter word, or on a tool's own
+  disclaimer (internet outages repointed to the cyclone tool passed). A
+  second check now requires a shared word with the tool's name or first
+  sentence, without generic schema words, and three such swaps are pinned
+  as failures. Seven step purposes were reworded to name what their tool
+  returns. Measured on 118 steps and 160 tools, 1,141 of 18,762 one-step
+  swaps still pass both checks.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

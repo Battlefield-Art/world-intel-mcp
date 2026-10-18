@@ -1820,7 +1820,10 @@ def dossier(ctx: click.Context, country: str) -> None:
 
     # Sanctions
     sanc = data.get("sanctions", {})
-    if sanc.get("match_count", 0) > 0:
+    if "match_count" in sanc and sanc["match_count"] is None:
+        # A failed SDN download is not zero matches.
+        console.print("[red]Sanctions:[/red] not screened (SDN list unavailable)")
+    elif (sanc.get("match_count") or 0) > 0:
         console.print(f"[red]Sanctions:[/red] {sanc['match_count']} OFAC matches")
 
     # News
@@ -1905,13 +1908,20 @@ def instability(ctx: click.Context, country_code: str | None) -> None:
     if country_code:
         idx = data.get("instability_index", 0)
         level = data.get("risk_level", "")
+        # A null index or component was not measured; it is not zero.
+        idx_text = "not measured" if idx is None else f"{idx}/100"
         console.print(
-            f"[bold]{country_code} Instability Index: {idx}/100 ({level})[/bold]\n"
+            f"[bold]{country_code} Instability Index: {idx_text} ({level})[/bold]\n"
         )
         components = data.get("components", {})
         for name, score in components.items():
+            if score is None:
+                console.print(f"  {name:30s} not measured")
+                continue
             bar = "█" * int(score) + "░" * (20 - int(score))
             console.print(f"  {name:30s} {bar} {score:.1f}/20")
+        for gap in data.get("data_gaps") or []:
+            console.print(f"  [yellow]gap:[/yellow] {escape(str(gap))}")
     else:
         table = Table(title="Instability Index (Focus Countries)", box=box.SIMPLE_HEAVY)
         table.add_column("Country", style="bold")

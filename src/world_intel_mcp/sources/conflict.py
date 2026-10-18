@@ -112,12 +112,35 @@ async def acled_query(
     )
 
 
+_ACLED_FAILURE_MESSAGES = {
+    "acled_unconfigured": "ACLED credentials not configured (ACLED_EMAIL + ACLED_PASSWORD)",
+    "acled_auth_failed": (
+        "ACLED sign-in failed: ACLED_EMAIL and ACLED_PASSWORD are set, but the "
+        "token request was refused or did not complete"
+    ),
+    "acled_fetch_failed": "ACLED fetch failed (rate limited, API error, or malformed response)",
+}
+
+
+def acled_failure_message(reason: str | None) -> str:
+    """The error text for an ``acled_failure_reason()`` value."""
+    return _ACLED_FAILURE_MESSAGES.get(reason or "", _ACLED_FAILURE_MESSAGES["acled_fetch_failed"])
+
+
+def _acled_credentials_set() -> bool:
+    return bool(
+        (os.environ.get("ACLED_EMAIL") and os.environ.get("ACLED_PASSWORD"))
+        or _acled_refresh_token
+    )
+
+
 async def acled_failure_reason(data: dict | list | None) -> str | None:
     """Classify why an ``acled_query()``/``fetch_acled_events()`` call returned no data.
 
-    ``acled_query`` returns ``None`` for two structurally different reasons that
+    ``acled_query`` returns ``None`` for structurally different reasons that
     callers must not conflate: missing credentials (a config problem, not an
-    outage) versus a live fetch that failed after credentials were fine (a
+    outage), credentials that are set but whose token request failed (refused
+    or unreachable sign-in), and a live fetch that failed after sign-in (a
     transient outage). Callers use this to pick an honest message/marker
     instead of guessing.
 
@@ -126,12 +149,15 @@ async def acled_failure_reason(data: dict | list | None) -> str | None:
 
     Returns:
         ``None`` if *data* is present (no failure). Otherwise
-        ``"acled_unconfigured"`` (no ``ACLED_EMAIL``/``ACLED_PASSWORD``) or
-        ``"acled_fetch_failed"`` (credentials fine, the request itself failed).
+        ``"acled_unconfigured"`` (no ``ACLED_EMAIL``/``ACLED_PASSWORD``),
+        ``"acled_auth_failed"`` (both set, but no token could be obtained) or
+        ``"acled_fetch_failed"`` (signed in, the request itself failed).
     """
     if data is not None:
         return None
     if not await _acled_get_token():
+        if _acled_credentials_set():
+            return "acled_auth_failed"
         return "acled_unconfigured"
     return "acled_fetch_failed"
 
@@ -186,7 +212,7 @@ async def fetch_acled_events(
         reason = await acled_failure_reason(data)
         if reason == "acled_unconfigured":
             return {
-                "error": "ACLED credentials not configured (ACLED_EMAIL + ACLED_PASSWORD)",
+                "error": acled_failure_message(reason),
                 "note": "Free access at acleddata.com",
                 "reason": reason,
             }
@@ -198,9 +224,9 @@ async def fetch_acled_events(
         # peace. Surface it explicitly instead; keep events/count in their
         # normal shape so existing callers that don't check "error" or
         # "reason" still iterate an empty list rather than crashing.
-        logger.warning("ACLED API returned no data (post-auth fetch failure)")
+        logger.warning("ACLED API returned no data (%s)", reason)
         return {
-            "error": "ACLED fetch failed (rate limited, API error, or malformed response)",
+            "error": acled_failure_message(reason),
             "degraded": True,
             "reason": reason,
             "events": [],
@@ -278,8 +304,9 @@ async def fetch_ucdp_events(
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
         days: Only include events whose ``date_start`` is within this
               many days from now.
-        limit: Page size (max 1000 per page). Every page is fetched, so
-               this does not cap the number of events returned.
+        limit: Page size (max 1000 per page). Every page is requested,
+               so this does not cap the number of events returned; a page
+               that cannot be fetched is named in the result (below).
 
     Returns:
         Dict with events list, count, total fatalities, query params,
@@ -288,7 +315,11 @@ async def fetch_ucdp_events(
         ``degraded`` and ``reason`` (``ucdp_unconfigured`` or
         ``ucdp_fetch_failed``) next to the empty events list, the same
         shape as ACLED's fetch failure, so a failure never reads as zero
-        events.
+        events. When a later page cannot be fetched (an outage, or the
+        circuit breaker skipping it), the events from the other pages are
+        kept and the result carries ``degraded``, ``reason``
+        ``ucdp_partial``, ``pages_failed``, ``pages_total`` and a
+        ``data_gaps`` entry: count and fatalities are then lower bounds.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
@@ -344,6 +375,7 @@ async def fetch_ucdp_events(
     all_results = list(page1_data.get("Result", []))
 
     # Fetch remaining pages in parallel
+    pages_failed: list[int] = []
     if total_pages > 1:
         page_tasks = [
             fetcher.get_json(
@@ -358,9 +390,11 @@ async def fetch_ucdp_events(
             for p in range(1, total_pages)
         ]
         page_results = await asyncio.gather(*page_tasks)
-        for page_data in page_results:
-            if page_data is not None:
+        for page_number, page_data in enumerate(page_results, start=1):
+            if isinstance(page_data, dict):
                 all_results.extend(page_data.get("Result", []))
+            else:
+                pages_failed.append(page_number)
 
     # Filter to recent events and extract fields
     events = []
@@ -440,7 +474,7 @@ async def fetch_ucdp_events(
             }
         )
 
-    return {
+    result = {
         "events": events,
         "count": len(events),
         "total_fatalities_best": total_fatalities_best,
@@ -448,6 +482,20 @@ async def fetch_ucdp_events(
         "source": "ucdp",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if pages_failed:
+        # A dropped page would otherwise shrink the count with no trace.
+        logger.warning(
+            "UCDP: %d of %d pages could not be fetched", len(pages_failed), total_pages
+        )
+        result["degraded"] = True
+        result["reason"] = "ucdp_partial"
+        result["pages_failed"] = pages_failed
+        result["pages_total"] = total_pages
+        result["data_gaps"] = [
+            f"UCDP: {len(pages_failed)} of {total_pages} pages could not be "
+            "fetched, so count and total_fatalities_best are lower bounds"
+        ]
+    return result
 
 
 # ---------------------------------------------------------------------------

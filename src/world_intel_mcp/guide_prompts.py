@@ -26,6 +26,7 @@ Gaps / not covered:
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,10 +35,11 @@ COMMON_LIMITS: tuple[str, ...] = (
     "A tool that returns an error, a note or a data_gaps entry has told you "
     "what is missing: report it as missing. Missing data is never zero, calm "
     "or peace.",
-    "Not every tool marks a failure. Some return an empty list, a zero count "
-    "or a neutral score when every upstream request failed. Read an empty "
-    "list or a zero as nothing returned, not nothing happened, and confirm "
-    "with a second tool before calling a place quiet.",
+    "Many tools do not mark a failure. When every upstream request fails "
+    "they return an empty list, a zero count, a neutral score, a LOW risk "
+    "label, an all-clear status or a false flag. Read an empty list or a "
+    "zero as nothing returned, not nothing happened, and confirm with a "
+    "second tool before calling a place quiet.",
     "Give each figure the date it describes (the observation date) as well "
     "as when it was fetched; they are often different. If a tool gives no "
     "observation date, say so.",
@@ -47,17 +49,25 @@ COMMON_LIMITS: tuple[str, ...] = (
 
 ANSWER_SHAPE = (
     "Answer with: the place, period and measure you used; each number with "
-    "its unit and date; the comparison you were asked for; every data gap; "
+    "its unit (or say the source states none) and date; the comparison you "
+    "were asked for; every data gap; "
     "and one line on what this data cannot tell."
 )
 
 _MAX_ARG_CHARS = 200
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
-_INTEGER = re.compile(r"[+-]?\d+")
+_INTEGER = re.compile(r"[+-]?\d+", re.ASCII)
+_DECIMAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
 # Values with these characters are quoted so they cannot run into the
-# next argument in "name value, name value".
+# next argument in "name value, name value". In a call, a value with a
+# space is quoted too, so "Sudan days 9999" cannot read as extra pairs.
 _QUOTE_IF = re.compile(r"[,;\"<>]")
+_QUOTE_IN_CALL = re.compile(r"[,;\"<>\s]")
 TOOL_NAME = re.compile(r"\bintel_[a-z0-9_]+\b")
+# The tool-name guard reads a value the way a model might: compatibility
+# forms folded (NFKC), case folded, hyphens as underscores, and no word
+# boundary in front, so INTEL_AOI_DELETE and _intel_aoi_delete are caught.
+_GUARD_NAME = re.compile(r"intel_[a-z0-9_]+")
 
 ARG_KINDS = ("text", "int", "number")
 
@@ -148,10 +158,24 @@ class PromptArgumentError(ValueError):
     """A prompt was requested with missing, unknown or invalid arguments."""
 
 
+def _clean(raw: Any) -> str:
+    kept = "".join(
+        ch for ch in str(raw) if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+    return " ".join(kept.split())
+
+
+def _guard_names(value: str) -> list[str]:
+    folded = unicodedata.normalize("NFKC", value).casefold().replace("-", "_")
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
+    return _GUARD_NAME.findall(folded)
+
+
 def _parse(prompt: ResearchPrompt, arg: PromptArg, value: str) -> Any:
     if arg.kind == "text":
         return value
     if arg.kind == "int":
+        # ASCII digits only: int() also reads other scripts' digits.
         if not _INTEGER.fullmatch(value):
             raise PromptArgumentError(
                 f"Prompt '{prompt.name}' argument '{arg.name}' must be a whole "
@@ -160,7 +184,9 @@ def _parse(prompt: ResearchPrompt, arg: PromptArg, value: str) -> Any:
         number: float = int(value)
     else:
         try:
-            number = float(value)
+            # ASCII digits only: float() also reads other scripts' digits,
+            # underscores, inf and nan.
+            number = float(value) if _DECIMAL.fullmatch(value) else math.nan
         except ValueError:
             number = math.nan
         if not math.isfinite(number):
@@ -192,9 +218,16 @@ def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[
     values: dict[str, Any] = {}
     for arg in prompt.arguments:
         raw = given.get(arg.name)
-        # Whitespace, newlines included, collapses to single spaces, so a
-        # value stays on its line and cannot add steps or limits.
-        value = " ".join(str(raw).split())[:_MAX_ARG_CHARS] if raw is not None else ""
+        # Control and format characters (escape, NUL, zero-width) are
+        # dropped, and whitespace, newlines included, collapses to single
+        # spaces, so a value stays on its line and cannot add steps or
+        # limits.
+        value = _clean(raw) if raw is not None else ""
+        if len(value) > _MAX_ARG_CHARS:
+            raise PromptArgumentError(
+                f"Prompt '{prompt.name}' argument '{arg.name}' is longer than "
+                f"{_MAX_ARG_CHARS} characters"
+            )
         if not value:
             if arg.required:
                 raise PromptArgumentError(
@@ -205,7 +238,7 @@ def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[
                 values[arg.name] = None
                 continue
             value = arg.default
-        foreign = sorted(set(TOOL_NAME.findall(value)) - set(prompt.tools))
+        foreign = sorted(set(_guard_names(value)) - set(prompt.tools))
         if foreign:
             raise PromptArgumentError(
                 f"Prompt '{prompt.name}' argument '{arg.name}' names "
@@ -250,7 +283,7 @@ def resolved_steps(
     return [(step, _step_args(step, values)) for step in prompt.steps]
 
 
-def _show(value: Any) -> str:
+def _show(value: Any, in_call: bool = False) -> str:
     if isinstance(value, Fill):
         return f"<{value.what}>"
     if isinstance(value, bool):
@@ -260,7 +293,8 @@ def _show(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return json.dumps(list(value), ensure_ascii=False)
     text = str(value)
-    return json.dumps(text, ensure_ascii=False) if _QUOTE_IF.search(text) else text
+    quote_if = _QUOTE_IN_CALL if in_call else _QUOTE_IF
+    return json.dumps(text, ensure_ascii=False) if quote_if.search(text) else text
 
 
 def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> str:
@@ -281,7 +315,7 @@ def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> s
         if args is None:
             lines.append(f"{i}. {step.tool}: skip this call; no {step.only_if} was given.")
             continue
-        pairs = ", ".join(f"{name} {_show(value)}" for name, value in args.items())
+        pairs = ", ".join(f"{name} {_show(value, in_call=True)}" for name, value in args.items())
         call = f"call with {pairs}; " if pairs else ""
         lines.append(f"{i}. {step.tool}: {call}{fill(step.purpose)}")
     lines += ["", "Limits to respect:"]
@@ -338,7 +372,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "has no country filter, so keep the events in {country} "
                 "yourself, split them at {days} days ago by date_start, and say "
                 "that you filtered. limit is the page size and every page is "
-                "fetched, so it does not cap the result",
+                "requested, so it does not cap the result. When a page could "
+                "not be fetched the result carries reason ucdp_partial and "
+                "pages_failed: its count and fatalities are then lower bounds, "
+                "so say the list is incomplete",
                 args=(("days", "{span}"), ("limit", 1000)),
             ),
             Step(
@@ -346,7 +383,8 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "ACLED events in {country} over both windows. It needs "
                 "ACLED_EMAIL and ACLED_PASSWORD; without them it returns an "
                 "error naming them. limit caps the result: a count equal to the "
-                "limit means the list was cut off, so say so",
+                "limit means the list may have been cut off, so say so or call "
+                "again with a higher limit",
                 args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
             ),
             Step(
@@ -354,16 +392,20 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "protests and riots in {country} (also ACLED, same credentials), "
                 "kept apart from armed violence. Nearby duplicates are merged: "
                 "count plus deduplicated is what was fetched, and when that "
-                "equals the limit the list was cut off",
+                "equals the limit the list may have been cut off",
                 args=(("country", "{country}"), ("days", "{span}"), ("limit", 1000)),
             ),
         ),
         limits=(
             "Event datasets are revised and arrive late, so the most recent "
             "days are the least complete. A quiet final week is not proof of calm.",
-            "UCDP is read from one pinned GED release, and a release only "
-            "holds events up to its own cutoff. Check the latest date_start "
-            "UCDP returned before reading a thin recent window as calm.",
+            "UCDP is read from one pinned GED release (gedevents/25.1), which "
+            "holds events only up to its own cutoff. The tool states neither "
+            "that cutoff nor a marker when your window lies after it: it "
+            "drops the older events and returns count 0. Check the latest "
+            "date_start UCDP returned; when count is 0, or the newest event "
+            "is well before the window ends, UCDP has no data for that span, "
+            "which is missing data, not zero events.",
             "Count events and fatalities separately: fewer events with more "
             "deaths is not de-escalation.",
             "ACLED and UCDP define an event differently. Compare each source "
@@ -415,6 +457,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_sector_heatmap", "which US equity sectors are leading and lagging"),
             ("intel_yield_curve", "curve shape and spreads"),
             ("intel_macro_composite", "the composite score and the inputs it weighs"),
+            (
+                "intel_liquidity_board",
+                "keyless liquidity readings (Fed balance sheet, Treasury General "
+                "Account, reverse repo, net liquidity, money supply), each with "
+                "its units and observation date",
+            ),
+            (
+                "intel_net_liquidity",
+                "only if liquidity matters to the answer: the weekly US net "
+                "liquidity series behind the board's row, with its formula",
+            ),
         ),
         limits=(
             "Report current readings and their recent change only. Quote the "
@@ -438,6 +491,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("series_id", "T10Y2Y"),),
             ),
             ("intel_central_bank_rates", "the policy rate the short end is anchored to"),
+            Step(
+                "intel_history_backfill",
+                "only if FRED_API_KEY is not set: loads the T10Y2Y history from "
+                "FRED's keyless graph CSV into the history store (it stores no "
+                "unit for this series; a failed fetch is an error capture)",
+                args=(("provider", "fred"), ("series", ["T10Y2Y"])),
+            ),
+            Step(
+                "intel_series_history",
+                "only after that backfill: the stored T10Y2Y observations with "
+                "their observed_at dates",
+                args=(("series_key", "backfill:fred:T10Y2Y"),),
+            ),
         ),
         limits=(
             "Spreads are in percentage points. A move from 0.10 to 0.30 is "
@@ -471,7 +537,20 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "the daily effective federal funds rate history (needs FRED_API_KEY)",
                 args=(("series_id", "DFF"),),
             ),
-            ("intel_major_crosses", "how the major currencies sit against each other today"),
+            ("intel_major_crosses", "the major currency cross rates: how they sit against each other today"),
+            Step(
+                "intel_history_backfill",
+                "only if FRED_API_KEY is not set: loads the effective federal "
+                "funds rate history from FRED's keyless graph CSV into the "
+                "history store (a failed fetch is an error capture)",
+                args=(("provider", "fred"), ("series", ["DFF"])),
+            ),
+            Step(
+                "intel_series_history",
+                "only after that backfill: the stored observations of that "
+                "rate with their observed_at dates",
+                args=(("series_key", "backfill:fred:DFF"),),
+            ),
         ),
         limits=(
             "Only the Fed, ECB and BoE rates can be live, read from FRED when "
@@ -552,6 +631,13 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "actual against estimated earnings",
                 args=(("symbol", "{ticker}"),),
             ),
+            (
+                "intel_news_market_reaction",
+                "companies named in recent news story clusters with the stock's "
+                "move on the story's session against a benchmark. If {ticker} "
+                "is not listed, no recent cluster was mapped to it, which is "
+                "not the same as no news",
+            ),
         ),
         limits=(
             "A filing date is when the company filed, not when the event "
@@ -623,8 +709,9 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             Step(
                 "intel_earthquakes",
-                "the events, newest first and at most 50 by default, so a "
-                "count of 50 means older ones were cut off",
+                "the earthquakes, newest first and at most 50 by default, so a "
+                "count of 50 means older ones may have been cut off; call again "
+                "with a higher limit to check",
                 args=(("min_magnitude", "{min_magnitude}"), ("hours", "{hours}")),
             ),
             Step(
@@ -632,9 +719,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "major cities within radius_km (default 200) of recent events. "
                 "It ignores the magnitude and hours above: it fetches its own "
                 "list of M4.5 and larger quakes from the last 48 hours, at most "
-                "50. Keep only the exposed_cities whose event_detail "
-                "(\"M<magnitude> <place>\") matches an event from step 1, and "
-                "check events_analyzed: 0 can mean its fetch failed",
+                "50, and names only the nearest of them for each city, so a "
+                "city's event_detail (\"M<magnitude> <place>\") can name a "
+                "smaller aftershock while a step-1 event is also within reach. "
+                "Before dropping a city, compare its lat and lon with each "
+                "step-1 event and keep it if any lies within radius_km; check "
+                "events_analyzed: 0 can mean its fetch failed",
                 args=(("event_types", ["earthquake"]),),
             ),
             Step(
@@ -772,6 +862,13 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("origin", "{country}"),),
             ),
             ("intel_displacement_summary", "UNHCR's global displacement totals, for context"),
+            Step(
+                "intel_us_border_encounters",
+                "only for the origin view: US CBP encounters per month of "
+                "{country} citizens, a flow of events (not people, not a "
+                "stock) that never adds to the displacement figures above",
+                args=(("citizenship", Fill("the country as CBP names it, in capitals, e.g. MEXICO")),),
+            ),
         ),
         limits=(
             "UNHCR figures are year-end stocks (people displaced at the end of "
@@ -803,6 +900,18 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ),
             ("intel_net_migration", "World Bank net migration for the leading countries"),
             ("intel_humanitarian_summary", "HDX crisis datasets for the leading origins"),
+            (
+                "intel_us_border_encounters",
+                "only if the question turns to arrivals in the US: CBP "
+                "encounters per month with same-month prior-year change, a "
+                "flow of events, not a stock",
+            ),
+            (
+                "intel_uk_small_boat_arrivals",
+                "only if the question turns to arrivals in the UK: Home Office "
+                "small boat crossings with year to date against last year, a "
+                "flow of arrivals, not a stock",
+            ),
         ),
         limits=(
             "World Bank net migration counts every reason, work included; "
@@ -930,8 +1039,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "An empty outage list, an all-clear corridor reading or zero "
             "cable warnings can each be a failed fetch: when the warning feed "
-            "is down every corridor reads clear. Check "
-            "intel://guide/source-health before calling {country} connected.",
+            "is down every corridor reads clear. Check failing_sources in "
+            "intel://guide/source-health before calling {country} connected: "
+            "it lists every source whose last call failed, even before its "
+            "circuit breaker opens.",
             "Cascade analysis is a simulation over curated cable "
             "dependencies, not a measurement of a real outage.",
             "BGP status checks one ASN or prefix at a time; it is not a "
@@ -945,7 +1056,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="Which cloud providers report active incidents, and which of their regions are involved?",
         steps=(
             ("intel_service_status", "active incidents at AWS, Azure, GCP, Cloudflare and GitHub"),
-            ("intel_cloud_regions", "where the named regions are"),
+            ("intel_cloud_regions", "where the named cloud regions are"),
         ),
         limits=(
             "Status pages are published by the providers themselves and can "
@@ -1010,18 +1121,40 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "saves the area",
                 args=(("name", "{name}"), ("lat", "{lat}"), ("lon", "{lon}"), ("radius_km", "{radius_km}")),
             ),
+            Step(
+                "intel_aoi_define_polygon",
+                "only if a circle does not fit the area (a border region or a "
+                "strait): define it under another name as a polygon of [lat, "
+                "lon] vertices, and use that name in the steps below",
+                args=(("name", Fill("a name for the polygon")), ("vertices", Fill("3 to 64 [lat, lon] vertices"))),
+            ),
+            Step(
+                "intel_aoi_define_corridor",
+                "only if the area is a route (a shipping lane or cable run): "
+                "define it under another name as a corridor of waypoints with "
+                "a width, and use that name in the steps below",
+                args=(
+                    ("name", Fill("a name for the corridor")),
+                    ("waypoints", Fill("2 to 64 [lat, lon] waypoints")),
+                    ("width_km", Fill("the total width in km, 1 to 500")),
+                ),
+            ),
             Step("intel_aoi_brief", "the cited picture inside {name} today", args=(("name", "{name}"),)),
             Step(
                 "intel_aoi_changes",
-                "the first call records a baseline for {name}",
+                "the first change detection call records a baseline for {name}",
                 args=(("name", "{name}"),),
             ),
         ),
         limits=(
             "The first change check records a baseline and claims nothing "
             "entered or left.",
-            "A domain that fails is listed in data_gaps and left out of the "
-            "diff. Never read it as everything leaving.",
+            "Most domains that fail are listed in data_gaps and left out of "
+            "the diff, but earthquakes, and wildfires when NASA_FIRMS_API_KEY "
+            "is set, can come back empty from a failed fetch with no data_gaps "
+            "entry, which reads as everything leaving. A whole domain "
+            "departing at once is unconfirmed: check failing_sources in "
+            "intel://guide/source-health and say it could not be confirmed.",
             "Each intel_aoi_changes call compares with the snapshot saved by "
             "the call before it (yours or a collector AOI sweep) and then "
             "replaces that snapshot.",
@@ -1047,6 +1180,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("name", "{name}"),),
             ),
             Step("intel_aoi_brief", "cited detail behind any change worth reporting", args=(("name", "{name}"),)),
+            (
+                "intel_aoi_digest",
+                "only if asked about every watched area: the change sweep "
+                "across all defined AOIs in one call. It advances each AOI's "
+                "snapshot as step 2 does, so never run both for {name}",
+            ),
         ),
         limits=(
             "Changes are relative to the previous snapshot, whenever it was "
@@ -1054,6 +1193,11 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "Every intel_aoi_changes call saves a new snapshot. Call it once: a "
             "retried call compares with the snapshot the first call just saved "
             "and reports that nothing changed.",
+            "Earthquakes, and wildfires when NASA_FIRMS_API_KEY is set, can "
+            "return empty from a failed fetch with no data_gaps entry, so a "
+            "whole domain departing at once may be an outage: check "
+            "failing_sources in intel://guide/source-health and report it as "
+            "unconfirmed.",
             "News for an AOI is found by place name near its centre, so a "
             "nearby place with the same name can leak in.",
         ),
@@ -1077,6 +1221,24 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step("intel_gdelt_search", "the articles themselves", args=(("query", "{topic}"), ("mode", "artlist"))),
             ("intel_news_clusters", "the clusters of related stories in the RSS set"),
             ("intel_news_feed", "the latest items from the RSS feeds"),
+            (
+                "intel_top_stories",
+                "stories carried by at least three distinct outlets in the RSS "
+                "feeds over the last 24 hours, ranked by outlet count: breadth "
+                "across outlets",
+            ),
+            (
+                "intel_situations",
+                "situations between and inside countries ranked by how many RSS "
+                "headlines cover them",
+            ),
+            Step(
+                "intel_hostility_timeline",
+                "only if the story is about one country or a pair: per-day "
+                "GDELT article counts for it, where a day GDELT did not return "
+                "is null and listed in data_gaps",
+                args=(("country", Fill("the country the story is about")),),
+            ),
         ),
         limits=(
             "Report the timelinevol series as GDELT returns it and compare it "
@@ -1096,13 +1258,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             Step(
                 "intel_election_calendar",
-                "upcoming elections and their proximity risk",
+                "entries from a hand-kept election table of 18 rows dated "
+                "2025-01 to 2029-04, each with a status and a proximity risk",
                 args=(("country", "{country}"),),
             ),
             Step(
                 "intel_country_dossier",
                 "economy, sanctions, news and conflict context. It knows only "
-                "the 50 countries in its own table and returns an error for others",
+                "the 50 countries in its own table and returns an error for others. "
+                "Its sanctions section lists sanctions-list entries whose remarks name the "
+                "country, which is not an exposure screen; match_count null means "
+                "the sanctions list could not be read, not zero matches",
                 args=(("country", "{country}"),),
                 only_if="country",
             ),
@@ -1113,8 +1279,30 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "volume. It has no topic filter, so most will be about other "
                 "things: keep any about this election and say so if there are none",
             ),
+            Step(
+                "intel_kalshi_markets",
+                "Kalshi open markets in its Elections category, ranked by "
+                "volume; keep only those about this election",
+                args=(("category", "Elections"),),
+            ),
+            Step(
+                "intel_prediction_compare",
+                "the same Elections markets on Kalshi and Polymarket side by "
+                "side with the price gap; match_confidence ranks pairs and is "
+                "not a probability",
+                args=(("category", "Elections"),),
+            ),
         ),
         limits=(
+            "The calendar is a fixed table, not a feed. An empty list means "
+            "the country is not in it, not that no election is due; say the "
+            "calendar does not cover it.",
+            "Entries with status past have already happened. Leave them out "
+            "of upcoming elections: their proximity risk scores the days "
+            "after an election like the days before it.",
+            "The country filter also matches part of a country name (RUS "
+            "returns Belarus), so keep only entries whose iso3 is the code "
+            "you asked for.",
             "Proximity risk rises as an election nears; it is a stated "
             "heuristic, not a forecast of unrest or of the result.",
             "Reddit and prediction markets reflect their own participants, "
@@ -1128,7 +1316,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="Does {query} appear on the US Treasury OFAC SDN list, and under which programs?",
         arguments=(PromptArg("query", "Name to search for", required=True),),
         steps=(
-            Step("intel_sanctions_search", "name matches on the SDN list", args=(("query", "{query}"),)),
+            Step("intel_sanctions_search", "name matches on the SDN sanctions list", args=(("query", "{query}"),)),
             Step(
                 "intel_company_profile",
                 "only if a match is a listed company: who it is",
@@ -1137,11 +1325,14 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         limits=(
             "If total_entities is 0, the list could not be read. That is a "
-            "failed search, not a clean result.",
+            "failed search, not a clean result. Otherwise total_entities "
+            "counts the entries read before the search stopped, not the size "
+            "of the list.",
             "Only the primary name of each entry is searched, not its "
             "aliases, so a listed party under another spelling will not match.",
             "Results stop at the limit (default 50): a count equal to the "
-            "limit means more names matched.",
+            "limit means more names may have matched, so search again with a "
+            "higher limit before saying how many did.",
             "Matching is by substring on names. A name match is not an "
             "identity match, and this is not a compliance screening service. "
             "Never answer that a party is not sanctioned.",
@@ -1191,7 +1382,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_domain_summary",
                 "the same over ten years: its earliest timestamps show when "
-                "storage began for each category",
+                "storage began for each domain",
                 args=(("hours", 87600),),
             ),
             Step(
@@ -1202,8 +1393,20 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_timeline", "the stored entries in time order for the matching domain"),
             Step(
                 "intel_similar_events",
-                "earlier stored entries that resemble the strongest match",
+                "earlier stored events similar to the strongest match",
                 args=(("text", Fill("the text of the strongest match from step 3")),),
+            ),
+            (
+                "intel_series_history",
+                "the numeric series the history store holds (a separate store "
+                "from the vector store), with observed_at, published_at and "
+                "collected_at for each",
+            ),
+            (
+                "intel_collection_health",
+                "the collector's run log per source: last success, consecutive "
+                "failures and whether it is overdue, which says how complete "
+                "that history is",
             ),
         ),
         limits=(
@@ -1230,12 +1433,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_country_dossier",
                 "economy, elections, sanctions, news and conflict. It knows only "
-                "the 50 countries in its own table and returns an error for others",
+                "the 50 countries in its own table and returns an error for others. "
+                "Its sanctions section lists sanctions-list entries whose remarks name the "
+                "country, which is not an exposure screen; match_count null means "
+                "the sanctions list could not be read, not zero matches",
                 args=(("country", "{country}"),),
             ),
             Step(
                 "intel_instability_index",
-                "the index with its four components",
+                "the index with its four components. It takes 50 ISO alpha-3 "
+                "codes and returns an error listing them for any other. Each "
+                "input it could not obtain is named in data_gaps and its "
+                "component is null; index_is_lower_bound then means the total "
+                "counts the missing parts as zero",
                 args=(("country_code", "{country}"),),
             ),
             Step(
@@ -1252,9 +1462,16 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         ),
         limits=(
             "The instability index is a weighted composite with country "
-            "multipliers. Quote its components, not only the total.",
+            "multipliers. Quote its components, not only the total. Its "
+            "ucdp_floor comes from a static baseline table, not from current "
+            "UCDP data: a total at the floor says nothing about this month.",
             "World Bank figures in the dossier are annual and often a year or "
             "more old. Give the year of each.",
+            "The dossier's elections section reads a hand-kept election "
+            "table: empty means the country is not covered, not that no vote "
+            "is due, and its match on part of a name can add another "
+            "country's election, so keep only entries whose iso3 is "
+            "{country}.",
         ),
     ),
 )

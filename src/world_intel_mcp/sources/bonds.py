@@ -121,7 +121,11 @@ async def fetch_yield_curve(fetcher: Fetcher) -> dict:
        10Y, 30Y).
 
     Returns a dict with ``yields`` list, ``spread_2s10s``, ``spread_3m10y``,
-    ``inverted`` flag, and metadata.
+    ``inverted`` flag, and metadata. ``inverted`` is None when neither
+    spread could be computed (a maturity it needs was not read), so an
+    outage never reads as "not inverted"; ``inversion_basis`` names the
+    spreads the flag rests on. A maturity with no rate is listed in
+    ``data_gaps`` (with ``degraded``), and no rate at all is an ``error``.
     """
     # --- Treasury Fiscal Data API (always attempted) -------------------------
     treasury_data = await fetcher.get_json(
@@ -155,17 +159,19 @@ async def fetch_yield_curve(fetcher: Fetcher) -> dict:
 
     spread_2s10s: float | None = None
     spread_3m10y: float | None = None
-    inverted = False
 
     if rate_2y is not None and rate_10y is not None:
         spread_2s10s = round(rate_10y - rate_2y, 4)
     if rate_3m is not None and rate_10y is not None:
         spread_3m10y = round(rate_10y - rate_3m, 4)
 
-    if spread_2s10s is not None and spread_2s10s < 0:
-        inverted = True
-    elif spread_3m10y is not None and spread_3m10y < 0:
-        inverted = True
+    spreads = {"spread_2s10s": spread_2s10s, "spread_3m10y": spread_3m10y}
+    inversion_basis = [name for name, value in spreads.items() if value is not None]
+    inverted: bool | None = (
+        any(spreads[name] < 0 for name in inversion_basis) if inversion_basis else None
+    )
+    provider = "fred" if fred_key else "yahoo-finance"
+    missing = [y["maturity"] for y in yields if y["rate"] is None]
 
     # --- Parse Treasury Fiscal Data for supplementary info -------------------
     treasury_records: list[dict] = []
@@ -175,15 +181,28 @@ async def fetch_yield_curve(fetcher: Fetcher) -> dict:
         except (AttributeError, TypeError):
             pass
 
-    return {
+    result = {
         "yields": yields,
         "spread_2s10s": spread_2s10s,
         "spread_3m10y": spread_3m10y,
         "inverted": inverted,
+        "inversion_basis": inversion_basis,
+        "yields_source": provider,
         "treasury_records": len(treasury_records),
         "fetched_at": _utc_now_iso(),
         "source": "treasury",
     }
+    if missing:
+        result["degraded"] = True
+        result["data_gaps"] = [f"No {m} yield from {provider}" for m in missing]
+        if inverted is None:
+            result["data_gaps"].append(
+                "inverted is null: no spread could be computed, so the curve's "
+                "shape is unknown, not normal"
+            )
+    if yields and len(missing) == len(yields):
+        result["error"] = f"No Treasury yield could be read from {provider}"
+    return result
 
 
 async def _fetch_yields_from_fred(

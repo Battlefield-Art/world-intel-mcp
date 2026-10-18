@@ -9,8 +9,10 @@ cache and HOME.
 
 Beyond the guide's structure, these tests pin the claims its text makes:
 every argument a prompt passes against the tool's inputSchema, every
-field name it cites against the package source, every count it states
-against the code, and the failure behaviour its limits warn about.
+field name it cites against the package source, the counts and table
+sizes that test_prompt_counts_and_tables_match_the_code and the claim pins
+check against the code (not every number in the text), and the failure
+behaviour its limits warn about.
 """
 
 import asyncio
@@ -21,6 +23,7 @@ import os
 import re
 import sys
 import types
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -735,9 +738,10 @@ def test_no_prompt_repeats_a_call() -> None:
 # the tool says about itself: it shares a word with the tool's name,
 # description or parameter descriptions, and any upper-case name it uses (a
 # provider such as AAA or NWS) appears there too, as written or spelled out.
-# A step pointed at a wrong but registered tool fails one or both (review F14
-# M7). Measured 2026-10-17: the check catches 12,006 of the 13,524 ways of
-# pointing one step at another registered tool.
+# It catches many steps pointed at a wrong but registered tool (review F14
+# M7), not all: measured 2026-10-18 on 118 steps and 160 tools, 2,731 of the
+# 18,762 ways of pointing one step at another tool pass it, and 1,141 also
+# pass the summary check further down (review R8).
 _COMMON_WORDS = frozenset(
     "about after also and any each every for from into its latest most only "
     "over recent that the their them then this today were what when where "
@@ -1527,3 +1531,629 @@ async def test_stale_serves_count_dict_payloads_end_to_end(tmp_path) -> None:
     assert (as_dict["_stale"], as_dict["rates"]) == (True, [1.0])
     assert as_list == [1, 2]
     assert health["stale_serves"] == {"probe-dict": 1, "probe-list": 1}
+
+
+# ---------------------------------------------------------------------------
+# Source health: a failing source is named before its breaker opens (R1)
+# ---------------------------------------------------------------------------
+
+
+def _health(tmp_path, breaker: CircuitBreaker) -> dict:
+    cache = Cache(db_path=tmp_path / "health.db")
+    try:
+        return guide.source_health(breaker, cache, environ={}, now=0)
+    finally:
+        cache.close()
+
+
+def test_source_health_names_sources_whose_last_call_failed(tmp_path) -> None:
+    """One research prompt rarely calls a source three times, so a failed
+    source usually still has a closed breaker; it must be named anyway."""
+    breaker = CircuitBreaker()
+    breaker.record_failure("ioda")
+    breaker.record_success("usgs")
+    breaker.record_failure("nga-msi")
+    breaker.record_failure("nga-msi")
+    health = _health(tmp_path, breaker)
+    assert health["failing_sources"] == ["ioda", "nga-msi"]
+    assert health["open_breakers"] == []
+    assert health["verdict"] == (
+        "3 sources called by this process, 2 whose last call failed, "
+        "0 with an open or half-open circuit breaker"
+    )
+
+
+def test_source_health_counts_a_half_open_breaker(tmp_path) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=0)
+    breaker.record_failure("gdelt")
+    health = _health(tmp_path, breaker)
+    assert health["circuit_breakers"]["gdelt"]["status"] == "half-open"
+    assert health["open_breakers"] == health["failing_sources"] == ["gdelt"]
+    assert health["verdict"] == (
+        "1 source called by this process, 1 whose last call failed, "
+        "1 with an open or half-open circuit breaker"
+    )
+
+
+def test_source_health_drops_a_source_that_recovered(tmp_path) -> None:
+    breaker = CircuitBreaker()
+    breaker.record_failure("ioda")
+    breaker.record_success("ioda")
+    health = _health(tmp_path, breaker)
+    assert health["failing_sources"] == []
+    assert health["verdict"].startswith("1 source called by this process, 0 whose last call failed")
+
+
+def test_source_health_verdict_counts_stale_serves(tmp_path) -> None:
+    breaker = CircuitBreaker()
+    breaker.record_failure("aaa")
+    breaker.record_stale_serve("aaa")
+    breaker.record_success("usgs")
+    health = _health(tmp_path, breaker)
+    assert health["verdict"].endswith("; 1 served a stale cached copy")
+    plain = CircuitBreaker()
+    plain.record_success("usgs")
+    assert "stale" not in _health(tmp_path, plain)["verdict"]
+
+
+def test_source_health_scope_explains_the_breaker_counters() -> None:
+    scope = " ".join(guide._HEALTH_SCOPE)
+    for term in ("failing_sources", "failures is the count of failed calls since the last success",
+                 "total_successes", "total_failures"):
+        assert term in scope, term
+
+
+@pytest.mark.asyncio
+async def test_every_conflict_and_intelligence_tool_naming_a_key_is_marked(
+    monkeypatch, tmp_path
+) -> None:
+    """The reverse of the check above: a tool whose error names a keyed
+    variable when that variable is unset must carry [needs ...] in the
+    guide. Every upstream request is refused with 401, and rate-limit
+    waits are skipped."""
+    import asyncio as _asyncio
+    import json as _json
+
+    import httpx
+
+    async def _no_wait(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(_asyncio, "sleep", _no_wait)
+
+    from world_intel_mcp import runtime
+    from world_intel_mcp.fetcher import Fetcher
+    from world_intel_mcp.tools import ALL_HANDLERS, conflict, intelligence
+
+    keyed = {var for ks in guide.KEYED_SOURCES for var in ks.env}
+    for var in keyed:
+        monkeypatch.delenv(var, raising=False)
+    refuse = httpx.MockTransport(lambda request: httpx.Response(401))
+    client = httpx.AsyncClient(transport=refuse)
+    # intel_country_brief opens its own client for a local model; it gets
+    # the same refusal, so nothing leaves the process.
+    real_client = httpx.AsyncClient
+
+    def _offline_client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs["transport"] = refuse
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _offline_client)
+    cache = Cache(db_path=tmp_path / "reverse.db")
+    monkeypatch.setattr(runtime, "fetcher", Fetcher(cache, CircuitBreaker(), max_retries=0, client=client))
+    sample = {
+        "intel_aircraft_details": {"icao24": "abc123"},
+        "intel_aircraft_batch": {"icao24_list": ["abc123"]},
+    }
+    named: dict[str, list[str]] = {}
+    called = 0
+    try:
+        for module in (conflict, intelligence):
+            for tool in module.TOOLS:
+                result = await ALL_HANDLERS[tool.name](sample.get(tool.name, {}))
+                called += 1
+                error = _json.dumps(result.get("error") or "")
+                found = sorted(var for var in keyed if var in error)
+                if found:
+                    named[tool.name] = found
+    finally:
+        await client.aclose()
+        cache.close()
+    assert called == len(conflict.TOOLS) + len(intelligence.TOOLS) == 24
+    marked = {tool: sorted(env) for tool, env in guide._NEEDS.items() if tool in named}
+    assert named == marked
+    assert sorted(named) == [
+        "intel_acled_events",
+        "intel_instability_index",
+        "intel_risk_scores",
+        "intel_ucdp_events",
+        "intel_unrest_events",
+    ]
+
+
+def test_story_breadth_unit_rule_agrees_with_the_answer_shape() -> None:
+    """story-breadth says not to state a unit for GDELT volume; the shared
+    answer shape must leave room for a number the source gives no unit."""
+    text = _text("story-breadth")
+    assert "Do not state a unit for it" in text
+    assert "each number with its unit (or say the source states none) and date" in text
+    assert "each number with its unit and date" not in text
+
+
+def test_guide_says_backfilled_history_predates_collection(registered) -> None:
+    """After intel_history_backfill the store holds publisher values from
+    before the collector ran; the guide must not say none exist."""
+    text = guide.render_guide()
+    start = text.index("- Show history it did not record.")
+    bullet = text[start : text.index("\n- ", start + 1)]
+    assert "exists only for the time" not in bullet
+    named = re.findall(r"intel_[a-z_]+", bullet)
+    assert named == [
+        "intel_history_backfill",
+        "intel_series_history",
+        "intel_revisions",
+        "intel_day_timeline",
+    ]
+    assert set(named) <= registered
+    assert "current vintage" in bullet
+    assert "revisions made before the backfill do not show" in " ".join(bullet.split())
+
+
+@pytest.mark.asyncio
+async def test_limit_wording_allows_a_list_that_ends_exactly_at_the_limit() -> None:
+    """A count equal to the limit is what an exact fit also returns, and
+    total_entities stops counting where the search stopped."""
+    from world_intel_mcp.sources import sanctions
+
+    class _ThreeAcme(_DownFetcher):
+        async def get_text(self, *args, **kwargs):
+            return "\n".join(
+                f'{i},"ACME {i}","Entity","SDGT","","","","","","","",""' for i in range(1, 4)
+            ) + '\n4,"ZENITH","Entity","SDGT","","","","","","","",""'
+
+    exact = await sanctions.fetch_sanctions_search(_ThreeAcme(), query="acme", limit=3)
+    more = await sanctions.fetch_sanctions_search(_ThreeAcme(), query="acme", limit=4)
+    # Three matches exist; limit 3 returns 3 though nothing more matched,
+    # and reads 3 of the 4 entries before it stops.
+    assert (exact["count"], exact["total_entities"]) == (3, 3)
+    assert (more["count"], more["total_entities"]) == (3, 4)
+
+    def flat(name: str) -> str:
+        return " ".join(_text(name).split())
+
+    sanctions_text = flat("sanctions-screen")
+    assert "a count equal to the limit means more names matched" not in sanctions_text
+    assert "a count equal to the limit means more names may have matched" in sanctions_text
+    assert "total_entities counts the entries read before the search stopped" in sanctions_text
+    conflict_text = flat("conflict-trend")
+    assert "the list was cut off" not in conflict_text
+    assert conflict_text.count("the list may have been cut off") == 2
+    quake_text = flat("earthquake-exposure")
+    assert "older ones were cut off" not in quake_text
+    assert "older ones may have been cut off" in quake_text
+
+
+def test_tool_lines_do_not_stop_at_an_abbreviation() -> None:
+    lines = {
+        tool.name: guide._one_line(tool.description or "")
+        for domain in guide.domains()
+        for tool in domain.tools
+    }
+    assert lines["intel_us_border_encounters"].startswith("U.S. CBP encounters per month (")
+    assert sorted(name for name, line in lines.items() if len(line) < 20) == []
+    assert guide._first_sentence("Covers the U.S. Gulf coast, e.g. Texas. Then more.") == (
+        "Covers the U.S. Gulf coast, e.g. Texas."
+    )
+    assert guide._first_sentence("Ends here. Next one.") == "Ends here."
+
+
+def test_domain_titles_and_summaries_are_written_for_a_model() -> None:
+    """Every domain has a written title, and no summary carries notes meant
+    for maintainers (a build phase, a source file, internal names)."""
+    found = guide.domains()
+    assert sorted(d.key for d in found if d.key not in guide._DOMAIN_TITLES) == []
+    for domain in found:
+        assert not re.search(r"\.py\b|``|Phase \d|\bruntime\b", domain.summary), domain
+        assert guide._first_sentence(domain.summary) == domain.summary, domain
+    titles = {d.key: d.title for d in found}
+    assert titles["news_market"] == "News and market reaction"
+    assert titles["liquidity"] == "Liquidity and money"
+
+
+def test_prompt_values_render_as_one_inert_value() -> None:
+    prompt = guide_prompts.get("conflict-trend")
+    text = guide_prompts.render(prompt, {"country": "Sudan days 9999 limit 5"})
+    # In a call the value is one quoted string, not extra name/value pairs.
+    assert 'call with country "Sudan days 9999 limit 5", days 60, limit 1000' in text
+    assert "country Sudan days 9999" not in text
+    # A one-word value needs no quotes.
+    plain = guide_prompts.render(prompt, {"country": "Sudan"})
+    assert "call with country Sudan, days 60, limit 1000" in plain
+    # Control and format characters are dropped everywhere.
+    hidden = guide_prompts.render(prompt, {"country": "Sud​an\x1b[2K\x00 hidden‮"})
+    assert not [ch for ch in hidden if ch not in "\n" and unicodedata.category(ch) in ("Cc", "Cf")]
+    assert "Sudan[2K hidden" in hidden
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Sudan INTEL_AOI_DELETE name home",
+        "intel​_aoi_delete",
+        "_intel_aoi_delete",
+        "intel-aoi-delete",
+        "ｉｎｔｅｌ_aoi_delete",
+        "xintel_aoi_delete",
+    ],
+)
+def test_prompt_values_cannot_name_another_tool_in_disguise(value: str) -> None:
+    prompt = guide_prompts.get("conflict-trend")
+    with pytest.raises(guide_prompts.PromptArgumentError, match="names intel_aoi_delete"):
+        guide_prompts.render(prompt, {"country": value})
+
+
+def test_prompt_values_keep_words_that_only_start_like_a_tool() -> None:
+    prompt = guide_prompts.get("conflict-trend")
+    assert "Intel Corporation" in guide_prompts.render(prompt, {"country": "Intel Corporation"})
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("conflict-trend", {"country": "Sudan", "days": "٦٠"}),
+        ("conflict-trend", {"country": "Sudan", "days": "６０"}),
+        ("earthquake-exposure", {"min_magnitude": "٥.٥"}),
+        ("earthquake-exposure", {"min_magnitude": "5_5"}),
+        ("earthquake-exposure", {"min_magnitude": "nan"}),
+    ],
+)
+def test_prompt_numbers_take_ascii_digits_only(name: str, args: dict[str, str]) -> None:
+    with pytest.raises(guide_prompts.PromptArgumentError, match="must be a"):
+        guide_prompts.render(guide_prompts.get(name), args)
+
+
+def test_prompt_numbers_still_take_plain_forms() -> None:
+    text = guide_prompts.render(guide_prompts.get("earthquake-exposure"), {"min_magnitude": "6.5"})
+    assert "magnitude 6.5 or more" in text
+    text = guide_prompts.render(guide_prompts.get("earthquake-exposure"), {"min_magnitude": "+6"})
+    assert "magnitude 6 or more" in text
+
+
+def test_prompt_refuses_an_overlong_value_instead_of_cutting_it() -> None:
+    prompt = guide_prompts.get("displacement-history")
+    assert "y" * 200 in guide_prompts.render(prompt, {"country": "y" * 200})
+    with pytest.raises(guide_prompts.PromptArgumentError, match="longer than 200 characters"):
+        guide_prompts.render(prompt, {"country": "y" * 201})
+
+
+def test_source_health_marks_a_cache_file_moved_or_replaced_under_it(tmp_path) -> None:
+    """The open handle keeps answering after the file is moved or a new
+    file takes its path; source health must say so."""
+    path = tmp_path / "held.db"
+    cache = Cache(db_path=path)
+    other = None
+    try:
+        cache.set("markets:quote:SPY", {"price": 1}, 60)
+        before = guide.source_health(CircuitBreaker(), cache)
+        assert before["cache"]["moved"] is False
+        assert "moved or replaced" not in before["verdict"]
+
+        for suffix in ("", "-wal", "-shm"):
+            moved_from = Path(f"{path}{suffix}")
+            if moved_from.exists():
+                moved_from.rename(tmp_path / f"away.db{suffix}")
+        gone = guide.source_health(CircuitBreaker(), cache)
+        assert (gone["cache"]["available"], gone["cache"]["total_entries"]) == (True, 1)
+        assert gone["cache"]["moved"] is True
+        assert "moved or replaced while this process held it open" in gone["verdict"]
+
+        other = Cache(db_path=path)
+        other.set("conflict:acled:SDN", {"events": []}, 60)
+        replaced = guide.source_health(CircuitBreaker(), cache)
+        assert replaced["cache"]["moved"] is True
+        assert guide.source_health(CircuitBreaker(), other)["cache"]["moved"] is False
+    finally:
+        cache.close()
+        if other is not None:
+            other.close()
+    scope = " ".join(guide._HEALTH_SCOPE)
+    assert "cache.moved is true when the file at db_path is gone" in scope
+
+
+def test_prompts_point_to_the_tools_that_answer_them_best(registered) -> None:
+    """Merged tools that answer a prompt's question are steps in it, so a
+    model is not left with a weaker tool or told a key is needed."""
+    expected = {
+        "story-breadth": {"intel_top_stories", "intel_situations", "intel_hostility_timeline"},
+        "election-watch": {"intel_kalshi_markets", "intel_prediction_compare"},
+        "displacement-history": {"intel_us_border_encounters"},
+        "migration-surges": {"intel_us_border_encounters", "intel_uk_small_boat_arrivals"},
+        "aoi-watch-setup": {"intel_aoi_define_polygon", "intel_aoi_define_corridor"},
+        "aoi-review": {"intel_aoi_digest"},
+        "market-risk-snapshot": {"intel_liquidity_board", "intel_net_liquidity"},
+        "company-events": {"intel_news_market_reaction"},
+        "yield-curve-check": {"intel_history_backfill", "intel_series_history"},
+        "central-bank-compare": {"intel_history_backfill", "intel_series_history"},
+        "history-recall": {"intel_series_history", "intel_collection_health"},
+    }
+    missing = {
+        name: sorted(tools - set(guide_prompts.get(name).tools))
+        for name, tools in expected.items()
+        if tools - set(guide_prompts.get(name).tools)
+    }
+    assert missing == {}
+    assert set().union(*expected.values()) <= registered
+    # The keyless route reads the key the backfill stores the series under.
+    for name, series in (("yield-curve-check", "T10Y2Y"), ("central-bank-compare", "DFF")):
+        calls = {s.tool: c for s, c in guide_prompts.resolved_steps(guide_prompts.get(name), {})}
+        assert calls["intel_history_backfill"] == {"provider": "fred", "series": [series]}
+        assert calls["intel_series_history"] == {"series_key": f"backfill:fred:{series}"}
+    assert "(intel_collection_health)" in " ".join(guide._HEALTH_SCOPE)
+
+
+@pytest.mark.asyncio
+async def test_election_watch_says_what_the_calendar_table_is() -> None:
+    from world_intel_mcp.config.countries import UPCOMING_ELECTIONS
+    from world_intel_mcp.sources import elections
+
+    dates = sorted(e["date"] for e in UPCOMING_ELECTIONS)
+    text = " ".join(_text("election-watch").split())
+    assert (
+        f"hand-kept election table of {len(UPCOMING_ELECTIONS)} rows dated "
+        f"{dates[0][:7]} to {dates[-1][:7]}"
+    ) in text
+    # An uncovered country is an empty list with no note.
+    uncovered = await elections.fetch_election_calendar(None, country="JPN")
+    assert uncovered["elections"] == [] and "note" not in uncovered and "error" not in uncovered
+    assert "An empty list means the country is not in it" in text
+    # The filter matches part of a name; past entries keep a proximity score.
+    rus = await elections.fetch_election_calendar(None, country="RUS")
+    assert [e["iso3"] for e in rus["elections"]] == ["BLR"]
+    assert "(RUS returns Belarus)" in text
+    assert elections._proximity_score(-13) == elections._proximity_score(13) > 0
+    assert "Entries with status past have already happened" in text
+
+
+@pytest.mark.asyncio
+async def test_country_overview_says_the_dossier_elections_can_be_another_country() -> None:
+    from world_intel_mcp.analysis import dossier
+
+    async def calendar_only(coro, label):
+        if label == "elections":
+            return await coro
+        coro.close()
+        return {"_error": "not called"}
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(dossier, "_safe", calendar_only):
+        result = await dossier.fetch_country_dossier(_DownFetcher(), country="RUS")
+    entries = result["elections"]["upcoming"] + result["elections"]["past"]
+    assert [e["iso3"] for e in entries] == ["BLR"]
+    text = " ".join(_text("country-overview", {"country": "RUS"}).split())
+    assert "keep only entries whose iso3 is RUS" in text
+    assert "empty means the country is not covered" in text
+
+
+def test_earthquake_exposure_says_each_city_names_only_its_nearest_event() -> None:
+    """A smaller, nearer aftershock replaces the main shock in a city's
+    entry, so the step must not drop a city by event_detail alone."""
+    from world_intel_mcp.analysis.exposure import _find_exposed_cities
+
+    city = {"name": "Tokyo", "country": "Japan", "lat": 35.68, "lon": 139.69, "pop": 37_000_000}
+    events = [
+        {"type": "earthquake", "detail": "M6.5 100 km S of Tokyo", "lat": 34.78, "lon": 139.69},
+        {"type": "earthquake", "detail": "M4.7 50 km S of Tokyo", "lat": 35.23, "lon": 139.69},
+    ]
+    (entry,) = _find_exposed_cities(events, [city], 200.0)
+    assert entry["event_detail"].startswith("M4.7")
+    assert (entry["lat"], entry["lon"]) == (city["lat"], city["lon"])
+    text = " ".join(_text("earthquake-exposure").split())
+    assert "names only the nearest of them for each city" in text
+    assert "compare its lat and lon with each step-1 event" in text
+    assert "Keep only the exposed_cities whose event_detail" not in text
+
+
+@pytest.mark.asyncio
+async def test_aoi_prompts_say_which_domains_fail_silently(monkeypatch, tmp_path) -> None:
+    """Earthquakes, and FIRMS regions with a key set, come back empty with
+    no error when the fetch fails, so the AOI diff cannot list them as a
+    gap; the prompts must not promise it does. Every request gets a 503."""
+    from world_intel_mcp.fetcher import Fetcher
+    from world_intel_mcp.sources import seismology, wildfire
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+    cache = Cache(db_path=tmp_path / "aoi-silent.db")
+    down = Fetcher(cache, CircuitBreaker(), max_retries=0, client=client)
+    monkeypatch.setenv("NASA_FIRMS_API_KEY", "test-only")
+
+    async def _no_wait(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    try:
+        quakes = await seismology.fetch_earthquakes(down)
+        fires = await wildfire.fetch_wildfires(down)
+    finally:
+        await client.aclose()
+        cache.close()
+    assert (quakes["earthquakes"], "error" in quakes) == ([], False)
+    assert "error" not in fires
+    assert fires["total_fires"] == 0
+    assert {r["count"] for r in fires["fires_by_region"].values()} == {0}
+    for name in ("aoi-watch-setup", "aoi-review"):
+        text = " ".join(_text(name).split())
+        assert "A domain that fails is listed in data_gaps" not in text
+        assert "earthquakes, and wildfires when NASA_FIRMS_API_KEY" in text.replace("Earthquakes", "earthquakes")
+        assert "failing_sources in intel://guide/source-health" in text
+
+
+@pytest.mark.asyncio
+async def test_conflict_trend_says_a_ucdp_release_can_end_before_the_window(monkeypatch) -> None:
+    """With the token set and the API answering, a release whose newest
+    event predates the window gives count 0 with no marker and no date."""
+    from world_intel_mcp.sources import conflict
+
+    class _OldRelease(_DownFetcher):
+        async def get_json(self, *args, **kwargs):
+            return {
+                "TotalPages": 1,
+                "Result": [{"id": 1, "date_start": "2024-12-31", "best": 3, "type_of_violence": 1}],
+            }
+
+    monkeypatch.setenv("UCDP_ACCESS_TOKEN", "test-only")
+    result = await conflict.fetch_ucdp_events(_OldRelease(), days=60)
+    assert result["count"] == 0
+    assert not {"error", "degraded", "reason", "data_gaps"} & set(result)
+    assert "date_start" not in json.dumps(result)
+    assert conflict._UCDP_GED_URL.endswith("/gedevents/25.1")
+    text = " ".join(_text("conflict-trend").split())
+    assert "one pinned GED release (gedevents/25.1)" in text
+    assert "when count is 0, or the newest event is well before the window ends, UCDP has no data" in text
+
+
+# ---------------------------------------------------------------------------
+# Claim pins (review R7): each sentence below is checked against the code
+# or the constant it describes, so changing either side fails a test.
+# ---------------------------------------------------------------------------
+
+_FAILURE_SHAPES = ("an empty list", "a LOW", "an all-clear", "a false flag")
+
+
+def test_failure_warning_is_in_every_surface_a_model_reads() -> None:
+    surfaces = {
+        "SERVER_INSTRUCTIONS": guide.SERVER_INSTRUCTIONS,
+        "COMMON_LIMITS": guide_prompts.COMMON_LIMITS[1],
+        "guide intro": guide.render_guide().split("## What an answer from this server contains", 1)[1][:1500],
+        "MEASURES": guide.MEASURES.split("## Missing data is not zero", 1)[1],
+    }
+    for name, text in surfaces.items():
+        flat = " ".join(text.split())
+        assert "Many tools do not mark a failure" in flat or "Many do not" in flat or "Many tools do not:" in flat, name
+        missing = [shape for shape in _FAILURE_SHAPES if shape not in flat]
+        assert missing == [], (name, missing)
+        assert "ever an empty success" not in flat.lower(), name
+
+
+def test_no_observation_date_sentence_is_in_every_surface() -> None:
+    assert "If a tool gives no observation date, say so." in " ".join(" ".join(guide_prompts.COMMON_LIMITS).split())
+    intro = " ".join(guide.render_guide().split("## What an answer from this server contains", 1)[1][:800].split())
+    assert "Some tools return no observation date at all; say so" in intro
+    assert "Some tools return no observation date; say so." in " ".join(guide.MEASURES.split())
+
+
+@pytest.mark.asyncio
+async def test_fx_move_direction_matches_the_code() -> None:
+    """0.92 to 0.94 EUR per USD: one USD buys more EUR, so EUR weakened."""
+    from world_intel_mcp.sources.forex import fetch_forex_timeseries
+
+    class _Rates(_DownFetcher):
+        async def get_json(self, *args, **kwargs):
+            return {"base": "USD", "rates": {"2026-10-01": {"EUR": 0.92}, "2026-10-02": {"EUR": 0.94}}}
+
+    result = await fetch_forex_timeseries(_Rates(), base="USD", symbol="EUR", days=30)
+    assert result["trend"]["change_pct"] > 0
+    text = " ".join(_text("fx-move", {"symbol": "EUR"}).split())
+    assert "a positive change means one USD buys more EUR, so EUR weakened against USD" in text
+
+
+@pytest.mark.asyncio
+async def test_exposure_step_states_the_fetch_the_code_makes(monkeypatch) -> None:
+    from world_intel_mcp.analysis import exposure
+    from world_intel_mcp.sources import seismology
+
+    asked: dict = {}
+
+    async def record(fetcher, **kwargs):
+        asked.update(kwargs)
+        return {"earthquakes": []}
+
+    monkeypatch.setattr(seismology, "fetch_earthquakes", record)
+    await exposure.fetch_population_exposure(_DownFetcher(), event_types=["earthquake"])
+    radius = inspect.signature(exposure.fetch_population_exposure).parameters["radius_km"].default
+    text = " ".join(_text("earthquake-exposure").split())
+    magnitude = _number_text_for_test(asked["min_magnitude"])
+    assert (
+        f"its own list of M{magnitude} and larger quakes from the last {asked['hours']} hours, "
+        f"at most {asked['limit']}"
+    ) in text
+    assert f"radius_km (default {_number_text_for_test(radius)})" in text
+
+
+def _number_text_for_test(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def test_history_recall_ten_years_is_the_argument_maximum() -> None:
+    prompt = guide_prompts.get("history-recall")
+    hours = next(a for a in prompt.arguments if a.name == "hours")
+    calls = guide_prompts.resolved_steps(prompt, {"topic": "x"})
+    assert calls[1][1] == {"hours": hours.maximum}
+    assert hours.maximum == 10 * 8760
+    assert "the same over ten years" in calls[1][0].purpose
+
+
+def test_prompt_counts_match_their_tables() -> None:
+    from world_intel_mcp.config.countries import INTEL_HOTSPOTS
+    from world_intel_mcp.sources import aviation, bonds, central_banks
+
+    banks = len(central_banks._CURATED_RATES) + len(central_banks._FRED_RATE_SERIES)
+    assert f"rates for {banks} central banks" in _text("central-bank-compare")
+    assert f"the {len(INTEL_HOTSPOTS)} hotspots" in _text("hotspot-escalation")
+    assert f"FAA delays at {len(aviation._MAJOR_AIRPORTS)} major US airports" in _text("airport-disruption")
+    maturities = list(bonds._YAHOO_YIELD_SYMBOLS.values())
+    words = {3: "three", 4: "four", 5: "five"}
+    flat = " ".join(_text("yield-curve-check").split())
+    assert f"falls back to {words[len(maturities)]} Yahoo maturities ({', '.join(maturities)})" in flat
+
+
+# A stronger purpose check (review R8). One shared word anywhere in a tool's
+# text let wrong tools through: parameter words such as country or days, and
+# a tool's own disclaimer (intel_cyclones says "not an outage"). Here the
+# purpose must share a word with the tool's own summary, its name and the
+# first sentence of its description, leaving out words most tools share.
+_GENERIC_SCHEMA_WORDS = frozenset(
+    "active call country current data days default filter first flag intel "
+    "limit list major name recent region tool".split()
+)
+
+
+def _summary_words(tool: Tool) -> set[str]:
+    summary = guide._first_sentence(" ".join((tool.description or "").split()))
+    return _content_words(f"{tool.name.replace('_', ' ')} {summary}") - _GENERIC_SCHEMA_WORDS
+
+
+def _summary_problem(tool: Tool, purpose: str) -> str | None:
+    if _content_words(purpose) & _summary_words(tool):
+        return None
+    return f"{tool.name}: the purpose shares no word with the tool's name or first sentence"
+
+
+def test_step_purposes_share_a_word_with_their_tools_summary(tools_pkg) -> None:
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    problems = {
+        f"{prompt.name} step {i + 1}": found
+        for prompt in guide_prompts.PROMPTS
+        for i, step in enumerate(prompt.steps)
+        if (found := _summary_problem(by_name[step.tool], step.purpose))
+    }
+    assert problems == {}
+
+
+@pytest.mark.parametrize(
+    ("prompt_name", "index", "wrong_tool"),
+    [
+        ("internet-disruption", 0, "intel_cyclones"),
+        ("internet-disruption", 0, "intel_acled_events"),
+        ("yield-curve-check", 0, "intel_disease_outbreaks"),
+    ],
+)
+def test_summary_check_catches_swaps_the_word_check_let_through(
+    tools_pkg, prompt_name: str, index: int, wrong_tool: str
+) -> None:
+    """Each of these passed the shared-word check; the summary check fails it."""
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    purpose = guide_prompts.get(prompt_name).steps[index].purpose
+    assert _purpose_problems(by_name[wrong_tool], purpose) == []
+    assert _summary_problem(by_name[wrong_tool], purpose) is not None

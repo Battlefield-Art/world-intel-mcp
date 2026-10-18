@@ -274,3 +274,98 @@ async def test_fetch_bond_indices_partial_failure(fetcher: Fetcher) -> None:
     # Only AGG should survive
     assert len(result["indices"]) >= 1
     assert result["indices"][0]["symbol"] == "AGG"
+
+
+# ---------------------------------------------------------------------------
+# Yield Curve — outages never read as "not inverted"
+# ---------------------------------------------------------------------------
+
+
+def _quick_fetcher(cache: Cache, monkeypatch) -> Fetcher:
+    """No retries and no Yahoo spacing, so an outage test runs at once."""
+    from world_intel_mcp import fetcher as fetcher_module
+
+    monkeypatch.setattr(fetcher_module, "_YAHOO_MIN_INTERVAL", 0.0)
+    return Fetcher(cache=cache, breaker=CircuitBreaker(failure_threshold=1000), max_retries=0)
+
+
+def _chart(price: float) -> dict:
+    return {"chart": {"result": [{"meta": {"regularMarketPrice": price, "currency": "USD"}}]}}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_yield_curve_total_outage_has_no_inversion_reading(cache: Cache, monkeypatch) -> None:
+    from world_intel_mcp.sources.bonds import fetch_yield_curve
+
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    respx.get(url__regex=r".*").mock(return_value=httpx.Response(503))
+    fetcher = _quick_fetcher(cache, monkeypatch)
+    try:
+        result = await fetch_yield_curve(fetcher)
+    finally:
+        await fetcher.close()
+
+    assert [y["rate"] for y in result["yields"]] == [None, None, None, None]
+    assert (result["spread_2s10s"], result["spread_3m10y"]) == (None, None)
+    assert result["inverted"] is None
+    assert result["inversion_basis"] == []
+    assert result["error"] == "No Treasury yield could be read from yahoo-finance"
+    assert result["degraded"] is True
+    assert result["data_gaps"][:4] == [f"No {m} yield from yahoo-finance" for m in ("3M", "5Y", "10Y", "30Y")]
+    assert result["data_gaps"][4].startswith("inverted is null")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_yield_curve_one_missing_maturity_is_named_not_read_as_normal(cache: Cache, monkeypatch) -> None:
+    """3M above 10Y is inverted; with the 3M quote lost, the flag must not
+    say otherwise, and no breaker opens to hint at it."""
+    from world_intel_mcp.sources.bonds import fetch_yield_curve
+
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    respx.get(url__regex=r".*fiscaldata.*").mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get(url__regex=r".*chart/(\^|%5E)IRX.*").mock(return_value=httpx.Response(429))
+    prices = {"FVX": 4.0, "TNX": 4.2, "TYX": 4.5}
+    for symbol, price in prices.items():
+        respx.get(url__regex=rf".*chart/(\^|%5E){symbol}.*").mock(return_value=httpx.Response(200, json=_chart(price)))
+    fetcher = _quick_fetcher(cache, monkeypatch)
+    try:
+        result = await fetch_yield_curve(fetcher)
+    finally:
+        await fetcher.close()
+
+    assert {y["maturity"]: y["rate"] for y in result["yields"]} == {"3M": None, "5Y": 4.0, "10Y": 4.2, "30Y": 4.5}
+    assert result["inverted"] is None and result["inversion_basis"] == []
+    assert "error" not in result
+    assert result["data_gaps"][0] == "No 3M yield from yahoo-finance"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_yield_curve_flag_names_the_spread_it_rests_on(cache: Cache, monkeypatch) -> None:
+    """With FRED, a lost 2Y leaves the flag resting on 3m10y alone."""
+    from world_intel_mcp.sources.bonds import fetch_yield_curve
+
+    monkeypatch.setenv("FRED_API_KEY", "test-fred-key")
+    values = {"DGS3MO": "5.10", "DGS10": "4.20"}
+
+    def _fred(request: httpx.Request) -> httpx.Response:
+        series = dict(request.url.params).get("series_id", "")
+        if series == "DGS2":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"observations": [{"date": "2026-10-16", "value": values.get(series, "4.0")}]})
+
+    respx.get(url__regex=r".*fiscaldata.*").mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get("https://api.stlouisfed.org/fred/series/observations").mock(side_effect=_fred)
+    fetcher = _quick_fetcher(cache, monkeypatch)
+    try:
+        result = await fetch_yield_curve(fetcher)
+    finally:
+        await fetcher.close()
+
+    assert result["spread_2s10s"] is None and result["spread_3m10y"] == -0.9
+    assert result["inverted"] is True
+    assert result["inversion_basis"] == ["spread_3m10y"]
+    assert result["yields_source"] == "fred"
+    assert result["data_gaps"] == ["No 2Y yield from fred"]

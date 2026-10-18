@@ -117,6 +117,15 @@ async def _fetch_current_events(fetcher) -> tuple[dict, list[str]]:
             )
             domain_gaps.append(f"{label}: {reason or 'unavailable'}")
 
+    # The space weather source returns current_kp None (no error key) when
+    # SWPC fails: that is a missing reading, not a quiet sky.
+    if (
+        isinstance(space_weather_data, dict)
+        and not space_weather_data.get("error")
+        and space_weather_data.get("current_kp") is None
+    ):
+        domain_gaps.append("Space weather: no Kp reading")
+
     # Conflict is a fallback pair (ACLED, then UCDP): only a gap if both failed.
     acled_ok = isinstance(acled_events, dict) and not acled_events.get("error")
     ucdp_ok = isinstance(ucdp_events, dict) and not ucdp_events.get("error")

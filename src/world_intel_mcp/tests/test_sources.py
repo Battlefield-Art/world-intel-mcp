@@ -818,6 +818,147 @@ async def test_fetch_acled_events_genuine_zero_has_no_error(
     assert result["count"] == 0
 
 
+def _acled_pool_route(pool_size: int):
+    """A respx side effect for the ACLED read endpoint that, like the real
+    API, returns at most `limit` rows from a pool, and records each limit."""
+    sent: list[int] = []
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        sent.append(limit)
+        rows = [
+            {
+                "event_id_cnty": f"SDN{i}",
+                "event_date": "2026-10-01",
+                "event_type": "Battles",
+                "country": "Sudan",
+                "latitude": str(10.0 + i),
+                "longitude": str(30.0 + i),
+                "fatalities": "1",
+            }
+            for i in range(min(limit, pool_size))
+        ]
+        return httpx.Response(200, json={"data": rows})
+
+    return _answer, sent
+
+
+@pytest.mark.asyncio
+async def test_acled_events_cache_does_not_answer_a_larger_limit(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short list cached for a small limit must not come back, inside the
+    cache TTL, for a call that asked for more rows: a count below the limit
+    would then read as a complete list."""
+    from world_intel_mcp.sources import conflict
+
+    async def _fake_token() -> str:
+        return "fake-token"
+
+    monkeypatch.setattr(conflict, "_acled_get_token", _fake_token)
+    answer, sent = _acled_pool_route(5)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(conflict._ACLED_API_URL).mock(side_effect=answer)
+        small = await conflict.fetch_acled_events(
+            fetcher, country="Sudan", days=60, limit=2
+        )
+        large = await conflict.fetch_acled_events(
+            fetcher, country="Sudan", days=60, limit=1000
+        )
+
+    assert small["count"] == 2
+    assert large["count"] == 5
+    assert sent == [2, 1000]
+
+
+@pytest.mark.asyncio
+async def test_unrest_events_cache_does_not_answer_a_larger_limit(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from world_intel_mcp.sources import conflict, intelligence
+
+    async def _fake_token() -> str:
+        return "fake-token"
+
+    monkeypatch.setattr(conflict, "_acled_get_token", _fake_token)
+    answer, sent = _acled_pool_route(5)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(conflict._ACLED_API_URL).mock(side_effect=answer)
+        small = await intelligence.fetch_unrest_events(
+            fetcher, country="Sudan", days=60, limit=2
+        )
+        large = await intelligence.fetch_unrest_events(
+            fetcher, country="Sudan", days=60, limit=1000
+        )
+
+    assert small["count"] + small["deduplicated"] == 2
+    assert large["count"] + large["deduplicated"] == 5
+    assert sent == [2, 1000]
+
+
+@pytest.fixture
+def acled_signed_out(monkeypatch: pytest.MonkeyPatch):
+    """No cached ACLED token, so every call goes through sign-in."""
+    from world_intel_mcp.sources import conflict
+
+    monkeypatch.setattr(conflict, "_acled_token", None)
+    monkeypatch.setattr(conflict, "_acled_token_expires", 0.0)
+    monkeypatch.setattr(conflict, "_acled_refresh_token", None)
+    return conflict
+
+
+@pytest.mark.asyncio
+async def test_acled_refused_sign_in_is_not_reported_as_unconfigured(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, acled_signed_out
+) -> None:
+    """Both variables set, token request refused: the operator has to fix
+    the account or wait out the sign-in outage, not set variables that are
+    already set."""
+    from world_intel_mcp.sources import intelligence
+
+    conflict = acled_signed_out
+    monkeypatch.setenv("ACLED_EMAIL", "analyst@example.org")
+    monkeypatch.setenv("ACLED_PASSWORD", "offline-fake-value")
+    with respx.mock(assert_all_called=False) as router:
+        sign_in_route = router.post(conflict._ACLED_TOKEN_URL).mock(
+            return_value=httpx.Response(401, json={"error": "invalid_grant"})
+        )
+        read = router.get(conflict._ACLED_API_URL).mock(
+            return_value=httpx.Response(200, json={"data": []})
+        )
+        events = await conflict.fetch_acled_events(fetcher, country="Sudan", days=7)
+        risk = await intelligence.fetch_risk_scores(fetcher)
+        unrest = await intelligence.fetch_unrest_events(fetcher, country="Sudan")
+
+    assert sign_in_route.call_count >= 1
+    assert read.call_count == 0
+    assert events["reason"] == "acled_auth_failed"
+    assert events["degraded"] is True
+    assert events["error"].startswith("ACLED sign-in failed")
+    for result in (events, risk, unrest):
+        assert "not configured" not in result["error"]
+        assert "sign-in failed" in result["error"]
+        assert result["degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_acled_unset_variables_are_still_reported_as_unconfigured(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch, acled_signed_out
+) -> None:
+    conflict = acled_signed_out
+    monkeypatch.delenv("ACLED_EMAIL", raising=False)
+    monkeypatch.delenv("ACLED_PASSWORD", raising=False)
+    with respx.mock(assert_all_called=False) as router:
+        sign_in_route = router.post(conflict._ACLED_TOKEN_URL).mock(
+            return_value=httpx.Response(401)
+        )
+        result = await conflict.fetch_acled_events(fetcher, country="Sudan", days=7)
+
+    assert sign_in_route.call_count == 0
+    assert result["reason"] == "acled_unconfigured"
+    assert "ACLED credentials not configured" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # News (GDELT search)
 # ---------------------------------------------------------------------------
@@ -1005,6 +1146,58 @@ async def test_fetch_arxiv_papers(fetcher: Fetcher) -> None:
     assert result["count"] == 1
     assert "Attention" in result["papers"][0]["title"]
     assert len(result["papers"][0]["authors"]) == 2
+
+
+_ARXIV_ONE_ENTRY = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+<id>http://arxiv.org/abs/2610.00001v1</id><title>One paper</title>
+<summary>s</summary><published>2026-10-16T00:00:00Z</published>
+</entry></feed>"""
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_tool_without_query_searches_the_default(fetcher: Fetcher, monkeypatch) -> None:
+    """The schema and the guide present query as optional; the handler
+    used to pass None into the source, which raised before any request."""
+    from types import SimpleNamespace
+
+    from world_intel_mcp.sources import arxiv_papers
+    from world_intel_mcp.tools import society
+
+    default = "cat:cs.AI OR cat:cs.LG OR cat:cs.CL"
+    route = respx.get(url__regex=r".*export\.arxiv\.org/api/query.*").mock(
+        return_value=httpx.Response(200, text=_ARXIV_ONE_ENTRY)
+    )
+    monkeypatch.setattr(society, "runtime", SimpleNamespace(fetcher=fetcher))
+    result = await society.HANDLERS["intel_arxiv_papers"]({})
+
+    assert result["count"] == 1
+    assert result["query"] == default == getattr(arxiv_papers, "DEFAULT_QUERY", default)
+    assert route.call_count == 1
+    assert dict(route.calls[0].request.url.params) == {
+        "search_query": default,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+        "max_results": "25",
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_first_request_carries_the_search(fetcher: Fetcher) -> None:
+    """A bare request to the API URL searches for nothing; the query must
+    be in the first request, not only in a fallback."""
+    from world_intel_mcp.sources.arxiv_papers import fetch_arxiv_papers
+
+    route = respx.get(url__regex=r".*export\.arxiv\.org/api/query.*").mock(
+        return_value=httpx.Response(200, text=_ARXIV_ONE_ENTRY)
+    )
+    result = await fetch_arxiv_papers(fetcher, query="cat:cs.CV", limit=3)
+
+    assert result["count"] == 1
+    assert [dict(c.request.url.params).get("search_query") for c in route.calls] == ["cat:cs.CV"]
+    assert dict(route.calls[0].request.url.params)["max_results"] == "3"
 
 
 # ---------------------------------------------------------------------------
