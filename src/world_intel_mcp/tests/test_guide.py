@@ -1910,3 +1910,24 @@ async def test_election_watch_says_what_the_calendar_table_is() -> None:
     assert "(RUS returns Belarus)" in text
     assert elections._proximity_score(-13) == elections._proximity_score(13) > 0
     assert "Entries with status past have already happened" in text
+
+
+@pytest.mark.asyncio
+async def test_country_overview_says_the_dossier_elections_can_be_another_country() -> None:
+    from world_intel_mcp.analysis import dossier
+
+    async def calendar_only(coro, label):
+        if label == "elections":
+            return await coro
+        coro.close()
+        return {"_error": "not called"}
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(dossier, "_safe", calendar_only):
+        result = await dossier.fetch_country_dossier(_DownFetcher(), country="RUS")
+    entries = result["elections"]["upcoming"] + result["elections"]["past"]
+    assert [e["iso3"] for e in entries] == ["BLR"]
+    text = " ".join(_text("country-overview", {"country": "RUS"}).split())
+    assert "keep only entries whose iso3 is RUS" in text
+    assert "empty means the country is not covered" in text

@@ -1451,6 +1451,11 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "UCDP data: a total at the floor says nothing about this month.",
             "World Bank figures in the dossier are annual and often a year or "
             "more old. Give the year of each.",
+            "The dossier's elections section reads a hand-kept election "
+            "table: empty means the country is not covered, not that no vote "
+            "is due, and its match on part of a name can add another "
+            "country's election, so keep only entries whose iso3 is "
+            "{country}.",
         ),
     ),
 )

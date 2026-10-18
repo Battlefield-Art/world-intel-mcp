@@ -389,6 +389,9 @@ source here, and no proxy is substituted for any of these measures.
   with no note; past entries keep a proximity risk; and the country
   filter also matches part of a name (RUS returns Belarus). The step and
   limits now say each of these. The code is unchanged.
+- country-overview now says the dossier's elections section reads the
+  same hand-kept table: empty means not covered, and its match on part of
+  a name can add another country's election (RUS gets Belarus's).
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
