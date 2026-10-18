@@ -105,13 +105,15 @@ class CircuitBreaker:
             )
 
     def record_stale_serve(self, source: str) -> None:
-        """Record that a non-dict response was served from stale cache.
+        """Record that a response was served from stale cache.
 
-        Dict responses served stale get an inline ``_stale`` marker
-        (fetcher.py); other payload shapes (raw text/XML, lists) can't
-        carry one the same way, so this counter — surfaced via
-        ``status()`` — is the only signal that a caller received old data
-        for that source.
+        The fetcher counts every stale copy it serves, whatever the payload
+        type. Dict responses also carry an inline ``_stale`` marker
+        (fetcher.py); other payload shapes (raw text/XML, lists) cannot, so
+        for them this counter, surfaced via ``status()``, is the only signal
+        that a caller received old data for that source. A stale copy
+        served without the Fetcher's stale path is counted only when its
+        code calls this (sources/liquidity.py does).
         """
         state = self._get(source)
         state.total_stale_serves += 1
