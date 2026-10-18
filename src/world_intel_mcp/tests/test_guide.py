@@ -1984,3 +1984,27 @@ async def test_aoi_prompts_say_which_domains_fail_silently(monkeypatch, tmp_path
         assert "A domain that fails is listed in data_gaps" not in text
         assert "earthquakes, and wildfires when NASA_FIRMS_API_KEY" in text.replace("Earthquakes", "earthquakes")
         assert "failing_sources in intel://guide/source-health" in text
+
+
+@pytest.mark.asyncio
+async def test_conflict_trend_says_a_ucdp_release_can_end_before_the_window(monkeypatch) -> None:
+    """With the token set and the API answering, a release whose newest
+    event predates the window gives count 0 with no marker and no date."""
+    from world_intel_mcp.sources import conflict
+
+    class _OldRelease(_DownFetcher):
+        async def get_json(self, *args, **kwargs):
+            return {
+                "TotalPages": 1,
+                "Result": [{"id": 1, "date_start": "2024-12-31", "best": 3, "type_of_violence": 1}],
+            }
+
+    monkeypatch.setenv("UCDP_ACCESS_TOKEN", "test-only")
+    result = await conflict.fetch_ucdp_events(_OldRelease(), days=60)
+    assert result["count"] == 0
+    assert not {"error", "degraded", "reason", "data_gaps"} & set(result)
+    assert "date_start" not in json.dumps(result)
+    assert conflict._UCDP_GED_URL.endswith("/gedevents/25.1")
+    text = " ".join(_text("conflict-trend").split())
+    assert "one pinned GED release (gedevents/25.1)" in text
+    assert "when count is 0, or the newest event is well before the window ends, UCDP has no data" in text

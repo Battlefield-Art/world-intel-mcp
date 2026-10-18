@@ -399,9 +399,13 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "Event datasets are revised and arrive late, so the most recent "
             "days are the least complete. A quiet final week is not proof of calm.",
-            "UCDP is read from one pinned GED release, and a release only "
-            "holds events up to its own cutoff. Check the latest date_start "
-            "UCDP returned before reading a thin recent window as calm.",
+            "UCDP is read from one pinned GED release (gedevents/25.1), which "
+            "holds events only up to its own cutoff. The tool states neither "
+            "that cutoff nor a marker when your window lies after it: it "
+            "drops the older events and returns count 0. Check the latest "
+            "date_start UCDP returned; when count is 0, or the newest event "
+            "is well before the window ends, UCDP has no data for that span, "
+            "which is missing data, not zero events.",
             "Count events and fatalities separately: fewer events with more "
             "deaths is not de-escalation.",
             "ACLED and UCDP define an event differently. Compare each source "

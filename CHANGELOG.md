@@ -404,6 +404,12 @@ source here, and no proxy is substituted for any of these measures.
   fetch fails, so the diff reports everything departing with no gap. Both
   AOI prompts now say so, call a whole domain departing at once
   unconfirmed, and point to `failing_sources`. The code is unchanged.
+- conflict-trend told the model to check the latest UCDP `date_start`
+  before reading a thin window as calm, but when the pinned release
+  (gedevents/25.1) ends before the window the tool returns count 0 with
+  no date and no marker. The limit now names the release and says a
+  count of 0, or a newest event well before the window ends, is missing
+  data, not zero events. The code is unchanged.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
