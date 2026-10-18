@@ -1728,3 +1728,30 @@ async def test_limit_wording_allows_a_list_that_ends_exactly_at_the_limit() -> N
     quake_text = flat("earthquake-exposure")
     assert "older ones were cut off" not in quake_text
     assert "older ones may have been cut off" in quake_text
+
+
+def test_tool_lines_do_not_stop_at_an_abbreviation() -> None:
+    lines = {
+        tool.name: guide._one_line(tool.description or "")
+        for domain in guide.domains()
+        for tool in domain.tools
+    }
+    assert lines["intel_us_border_encounters"].startswith("U.S. CBP encounters per month (")
+    assert sorted(name for name, line in lines.items() if len(line) < 20) == []
+    assert guide._first_sentence("Covers the U.S. Gulf coast, e.g. Texas. Then more.") == (
+        "Covers the U.S. Gulf coast, e.g. Texas."
+    )
+    assert guide._first_sentence("Ends here. Next one.") == "Ends here."
+
+
+def test_domain_titles_and_summaries_are_written_for_a_model() -> None:
+    """Every domain has a written title, and no summary carries notes meant
+    for maintainers (a build phase, a source file, internal names)."""
+    found = guide.domains()
+    assert sorted(d.key for d in found if d.key not in guide._DOMAIN_TITLES) == []
+    for domain in found:
+        assert not re.search(r"\.py\b|``|Phase \d|\bruntime\b", domain.summary), domain
+        assert guide._first_sentence(domain.summary) == domain.summary, domain
+    titles = {d.key: d.title for d in found}
+    assert titles["news_market"] == "News and market reaction"
+    assert titles["liquidity"] == "Liquidity and money"

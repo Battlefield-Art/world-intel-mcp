@@ -94,6 +94,14 @@ _DOMAIN_TITLES = {
     "vector": "Stored history (vector store)",
     "aoi": "Areas of interest, briefs and reports",
     "system": "System",
+    "prediction_markets": "Prediction markets",
+    "news_signals": "News signals",
+    "liquidity": "Liquidity and money",
+    "news_market": "News and market reaction",
+    "history": "Stored history (history store)",
+    "lagged_connections": "Lagged connections between stored series",
+    "day_timeline": "Day timeline",
+    "history_backfill": "History backfill",
 }
 
 
@@ -191,10 +199,15 @@ class Domain:
     tools: tuple[Any, ...]
 
 
+# Notes for maintainers in a module docstring (a build phase, a pointer
+# to a source file) stay out of the guide a model reads.
+_DEVELOPER_NOTE = re.compile(r"\s*\(Phase \d+\)")
+
+
 def _module_summary(module: Any) -> str:
     doc = (module.__doc__ or "").strip()
     first_paragraph = doc.split("\n\n", 1)[0]
-    return " ".join(first_paragraph.split())
+    return _DEVELOPER_NOTE.sub("", _first_sentence(" ".join(first_paragraph.split())))
 
 
 def domains(modules: list | None = None) -> list[Domain]:
@@ -212,10 +225,20 @@ def domains(modules: list | None = None) -> list[Domain]:
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
+# A period that closes an abbreviation (U.S., e.g., i.e.) does not end a
+# sentence, though a capital may follow it.
+_ABBREVIATION = re.compile(r"(?:\b(?:[A-Za-z]\.){2,}|\b(?:etc|vs|approx|Inc|No|St)\.)$")
+
+
+def _first_sentence(text: str) -> str:
+    for end in _SENTENCE_END.finditer(text):
+        if not _ABBREVIATION.search(text[: end.start()]):
+            return text[: end.start()]
+    return text
 
 
 def _one_line(description: str) -> str:
-    first = _SENTENCE_END.split(" ".join(description.split()), 1)[0]
+    first = _first_sentence(" ".join(description.split()))
     # Em dashes in tool descriptions become hyphens: the guide is
     # published text.
     return first.replace(" — ", " - ").replace("—", "-")

@@ -350,6 +350,14 @@ source here, and no proxy is substituted for any of these measures.
   count. They now say the list may have been cut off and to call again
   with a higher limit, and sanctions-screen says `total_entities` counts
   the entries read before the search stopped, not the size of the list.
+- The guide's tool list cut each description at the first period
+  followed by a capital, so `intel_us_border_encounters` read just "U.S.".
+  A period that closes an abbreviation (U.S., e.g., i.e.) no longer ends
+  the line.
+- Domain summaries carried maintainer notes from module docstrings (a
+  build phase, a source file path, internal names), and newer domains had
+  no written title. Each domain now has one, and a summary is the first
+  sentence of its module docstring without build-phase notes.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
