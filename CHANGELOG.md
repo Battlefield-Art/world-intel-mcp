@@ -287,6 +287,12 @@ source here, and no proxy is substituted for any of these measures.
   country and days only, so a short list cached for a small `limit` came
   back, for 15 minutes, to a call that asked for more rows, and a count
   below the limit then read as complete. `limit` is now part of both keys.
+- `intel_ucdp_events` dropped a page that failed after the first one (an
+  outage, or the circuit breaker skipping it) and returned the shorter
+  list with no marker. Such a result now carries `degraded`, reason
+  `ucdp_partial`, `pages_failed`, `pages_total` and a `data_gaps` entry
+  saying count and fatalities are lower bounds, and the conflict-trend
+  prompt tells the model to report the list as incomplete.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

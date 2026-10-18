@@ -116,3 +116,64 @@ async def test_a_different_page_size_does_not_reuse_cached_pages(cache, monkeypa
     assert sorted(e["id"] for e in first["events"]) == list(range(7))
     assert sorted(e["id"] for e in second["events"]) == list(range(7))
     assert upstream.pages(seen) == [("3", "0"), ("3", "1"), ("3", "2")]
+
+
+class _PageDown(_Upstream):
+    """Like _Upstream, but the listed pages answer 503."""
+
+    def __init__(self, events: list[int], down: set[int]):
+        super().__init__(events=events)
+        self.down = down
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if int(request.url.params["page"]) in self.down:
+            self.requests.append(request)
+            return httpx.Response(503)
+        return super().__call__(request)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_later_page_is_a_named_gap_not_a_silent_drop(cache, monkeypatch) -> None:
+    """Pages of 3 over 7 events with page 1 down: the 4 events from pages 0
+    and 2 stay, and the result says the count is a lower bound."""
+    monkeypatch.setenv("UCDP_ACCESS_TOKEN", "t")
+    upstream = _PageDown(events=list(range(7)), down={1})
+    result = await _fetch(cache, upstream, days=30, limit=3)
+    assert sorted(e["id"] for e in result["events"]) == [0, 1, 2, 6]
+    assert (result["count"], result["total_fatalities_best"]) == (4, 4)
+    assert (result["degraded"], result["reason"]) == (True, "ucdp_partial")
+    assert (result["pages_failed"], result["pages_total"]) == ([1], 3)
+    assert result["data_gaps"] == [
+        "UCDP: 1 of 3 pages could not be fetched, so count and "
+        "total_fatalities_best are lower bounds"
+    ]
+    assert "error" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_page_the_breaker_skips_is_also_named(cache, monkeypatch) -> None:
+    """Once the breaker opens on a failed page, a later call skips that page
+    without a request; it must still be named, not dropped."""
+    monkeypatch.setenv("UCDP_ACCESS_TOKEN", "t")
+    upstream = _PageDown(events=list(range(7)), down={2})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        fetcher = Fetcher(
+            cache, CircuitBreaker(failure_threshold=1), max_retries=0, client=client
+        )
+        first = await fetch_ucdp_events(fetcher, days=30, limit=3)
+        upstream.down = set()
+        seen = len(upstream.requests)
+        second = await fetch_ucdp_events(fetcher, days=30, limit=3)
+    assert first["pages_failed"] == [2]
+    assert len(upstream.requests) == seen
+    assert (second["count"], second["pages_failed"], second["reason"]) == (6, [2], "ucdp_partial")
+
+
+@pytest.mark.asyncio
+async def test_all_pages_fetched_carries_no_partial_marker(cache, monkeypatch) -> None:
+    monkeypatch.setenv("UCDP_ACCESS_TOKEN", "t")
+    upstream = _Upstream(events=list(range(7)))
+    result = await _fetch(cache, upstream, days=30, limit=3)
+    assert result["count"] == 7
+    for key in ("degraded", "reason", "pages_failed", "pages_total", "data_gaps"):
+        assert key not in result

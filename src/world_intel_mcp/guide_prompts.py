@@ -338,7 +338,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "has no country filter, so keep the events in {country} "
                 "yourself, split them at {days} days ago by date_start, and say "
                 "that you filtered. limit is the page size and every page is "
-                "fetched, so it does not cap the result",
+                "requested, so it does not cap the result. When a page could "
+                "not be fetched the result carries reason ucdp_partial and "
+                "pages_failed: its count and fatalities are then lower bounds, "
+                "so say the list is incomplete",
                 args=(("days", "{span}"), ("limit", 1000)),
             ),
             Step(

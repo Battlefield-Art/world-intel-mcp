@@ -272,8 +272,9 @@ async def fetch_ucdp_events(
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
         days: Only include events whose ``date_start`` is within this
               many days from now.
-        limit: Page size (max 1000 per page). Every page is fetched, so
-               this does not cap the number of events returned.
+        limit: Page size (max 1000 per page). Every page is requested,
+               so this does not cap the number of events returned; a page
+               that cannot be fetched is named in the result (below).
 
     Returns:
         Dict with events list, count, total fatalities, query params,
@@ -282,7 +283,11 @@ async def fetch_ucdp_events(
         ``degraded`` and ``reason`` (``ucdp_unconfigured`` or
         ``ucdp_fetch_failed``) next to the empty events list, the same
         shape as ACLED's fetch failure, so a failure never reads as zero
-        events.
+        events. When a later page cannot be fetched (an outage, or the
+        circuit breaker skipping it), the events from the other pages are
+        kept and the result carries ``degraded``, ``reason``
+        ``ucdp_partial``, ``pages_failed``, ``pages_total`` and a
+        ``data_gaps`` entry: count and fatalities are then lower bounds.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
@@ -338,6 +343,7 @@ async def fetch_ucdp_events(
     all_results = list(page1_data.get("Result", []))
 
     # Fetch remaining pages in parallel
+    pages_failed: list[int] = []
     if total_pages > 1:
         page_tasks = [
             fetcher.get_json(
@@ -352,9 +358,11 @@ async def fetch_ucdp_events(
             for p in range(1, total_pages)
         ]
         page_results = await asyncio.gather(*page_tasks)
-        for page_data in page_results:
-            if page_data is not None:
+        for page_number, page_data in enumerate(page_results, start=1):
+            if isinstance(page_data, dict):
                 all_results.extend(page_data.get("Result", []))
+            else:
+                pages_failed.append(page_number)
 
     # Filter to recent events and extract fields
     events = []
@@ -434,7 +442,7 @@ async def fetch_ucdp_events(
             }
         )
 
-    return {
+    result = {
         "events": events,
         "count": len(events),
         "total_fatalities_best": total_fatalities_best,
@@ -442,6 +450,20 @@ async def fetch_ucdp_events(
         "source": "ucdp",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if pages_failed:
+        # A dropped page would otherwise shrink the count with no trace.
+        logger.warning(
+            "UCDP: %d of %d pages could not be fetched", len(pages_failed), total_pages
+        )
+        result["degraded"] = True
+        result["reason"] = "ucdp_partial"
+        result["pages_failed"] = pages_failed
+        result["pages_total"] = total_pages
+        result["data_gaps"] = [
+            f"UCDP: {len(pages_failed)} of {total_pages} pages could not be "
+            "fetched, so count and total_fatalities_best are lower bounds"
+        ]
+    return result
 
 
 # ---------------------------------------------------------------------------
