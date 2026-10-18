@@ -3496,11 +3496,18 @@ def history_health(ctx: click.Context, source: str | None) -> None:
     for row in data.get("backfills", []):
         console.print(
             f"Backfill [bold]{escape(row['source'])}[/bold]: {row['captures']} capture(s), "
-            f"last {row['last_run_at']} ({row['last_status']}), {row['observations']} "
+            f"last {row['last_run_at']} ({row['last_status']}"
+            + (
+                f", {row['last_run_failed']} of {row['last_run_requests']} request(s) failed"
+                if row.get("last_run_failed") else ""
+            )
+            + f"), {row['observations']} "
             f"observations in {row['series']} series, observed "
             f"{escape(str(row['first_observed_at'] or '-'))} to "
             f"{escape(str(row['latest_observed_at'] or '-'))}."
         )
+        if row.get("last_run_failed"):
+            console.print(f"  Last run failed: {escape(str(row['last_reason']))}")
     counts = ", ".join(f"{k} {v}" for k, v in sorted(data["state_counts"].items())) or "none"
     storage = data["storage"]
     console.print(
@@ -4020,10 +4027,25 @@ def _run_backfill(
 
 
 def _print_backfill(data: dict) -> None:
-    if not data.get("requests"):
+    if data.get("error"):
         console.print(f"[red]Error:[/red] {escape(str(data['error']))}")
+    # A store write failure (history_backfill._store_failure) names what it
+    # did not write; the committed requests follow as a table.
+    for label, key in (
+        ("Write failed on", "failed_request"),
+        ("Fetched but not written", "fetched_not_written"),
+        ("Upstream failures logged", "upstream_failures_logged"),
+        ("Upstream failures not logged", "upstream_failures_not_logged"),
+    ):
+        value = data.get(key)
+        if value:
+            names = value if isinstance(value, list) else [value]
+            console.print(f"{label}: {escape(', '.join(names))}")
+    if not data.get("requests"):
         return
-    title = f"Backfill into {data['source']} at {data['collected_at']}"
+    title = f"Backfill into {data['source']}"
+    if data.get("collected_at"):
+        title += f" at {data['collected_at']}"
     if data.get("start"):
         title += f" from {data['start']}"
     table = Table(title=escape(title), box=box.SIMPLE_HEAVY)
@@ -4053,11 +4075,12 @@ def _print_backfill(data: dict) -> None:
                 _cell(s["last_observed_at"] or "-"),
             )
     console.print(table)
-    totals = data["totals"]
-    console.print(
-        f"Stored {totals['stored_new']} new and {totals['stored_revised']} revised values, "
-        f"{totals['unchanged']} unchanged, in {escape(data['db_path'])}."
-    )
+    totals = data.get("totals")
+    if totals:
+        console.print(
+            f"Stored {totals['stored_new']} new and {totals['stored_revised']} revised values, "
+            f"{totals['unchanged']} unchanged, in {escape(data['db_path'])}."
+        )
     _print_data_gaps(data)
 
 
