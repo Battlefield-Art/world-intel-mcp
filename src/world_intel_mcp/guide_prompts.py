@@ -1242,7 +1242,8 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             Step(
                 "intel_election_calendar",
-                "upcoming elections and their proximity risk",
+                "entries from a hand-kept election table of 18 rows dated "
+                "2025-01 to 2029-04, each with a status and a proximity risk",
                 args=(("country", "{country}"),),
             ),
             Step(
@@ -1277,6 +1278,15 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ),
         ),
         limits=(
+            "The calendar is a fixed table, not a feed. An empty list means "
+            "the country is not in it, not that no election is due; say the "
+            "calendar does not cover it.",
+            "Entries with status past have already happened. Leave them out "
+            "of upcoming elections: their proximity risk scores the days "
+            "after an election like the days before it.",
+            "The country filter also matches part of a country name (RUS "
+            "returns Belarus), so keep only entries whose iso3 is the code "
+            "you asked for.",
             "Proximity risk rises as an election nears; it is a stated "
             "heuristic, not a forecast of unrest or of the result.",
             "Reddit and prediction markets reflect their own participants, "

@@ -1887,3 +1887,26 @@ def test_prompts_point_to_the_tools_that_answer_them_best(registered) -> None:
         assert calls["intel_history_backfill"] == {"provider": "fred", "series": [series]}
         assert calls["intel_series_history"] == {"series_key": f"backfill:fred:{series}"}
     assert "(intel_collection_health)" in " ".join(guide._HEALTH_SCOPE)
+
+
+@pytest.mark.asyncio
+async def test_election_watch_says_what_the_calendar_table_is() -> None:
+    from world_intel_mcp.config.countries import UPCOMING_ELECTIONS
+    from world_intel_mcp.sources import elections
+
+    dates = sorted(e["date"] for e in UPCOMING_ELECTIONS)
+    text = " ".join(_text("election-watch").split())
+    assert (
+        f"hand-kept election table of {len(UPCOMING_ELECTIONS)} rows dated "
+        f"{dates[0][:7]} to {dates[-1][:7]}"
+    ) in text
+    # An uncovered country is an empty list with no note.
+    uncovered = await elections.fetch_election_calendar(None, country="JPN")
+    assert uncovered["elections"] == [] and "note" not in uncovered and "error" not in uncovered
+    assert "An empty list means the country is not in it" in text
+    # The filter matches part of a name; past entries keep a proximity score.
+    rus = await elections.fetch_election_calendar(None, country="RUS")
+    assert [e["iso3"] for e in rus["elections"]] == ["BLR"]
+    assert "(RUS returns Belarus)" in text
+    assert elections._proximity_score(-13) == elections._proximity_score(13) > 0
+    assert "Entries with status past have already happened" in text

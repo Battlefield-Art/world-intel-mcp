@@ -383,6 +383,12 @@ source here, and no proxy is substituted for any of these measures.
   store when `FRED_API_KEY` is not set) and history-recall (the history
   store and the collector's run log). The source-health scope points to
   `intel_collection_health` for the run history it does not read.
+- election-watch presented `intel_election_calendar` as upcoming
+  elections. It is a hand-kept table of 18 rows dated 2025-01 to
+  2029-04, most already past; an uncovered country returns an empty list
+  with no note; past entries keep a proximity risk; and the country
+  filter also matches part of a name (RUS returns Belarus). The step and
+  limits now say each of these. The code is unchanged.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
