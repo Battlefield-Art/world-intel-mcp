@@ -1,7 +1,7 @@
 """Research guide served over MCP as resources and prompts.
 
-A model connecting to this server sees 139 tools and, before this module,
-nothing else: no map of which tool answers which question, and no
+A model connecting to this server sees every registered tool and, before
+this module, nothing else: no map of which tool answers which question, and no
 statement of what the data cannot support. The guide fills that gap with
 three read-only resources, a set of worked research prompts
 (``guide_prompts.py``) and the server's ``instructions`` at initialize:
@@ -28,8 +28,14 @@ Gaps / not covered:
   key is valid or within quota.
 - A cache file moved or deleted while the server holds it open keeps
   answering from the open handle; source health cannot tell.
-- The guide's count of tools that return no failure marker under a total
-  outage is a measurement of one commit; it is not recomputed at runtime.
+- The guide states no count of tools that return no failure marker under
+  a total outage, because the count changes as tools are added. A review
+  sweep at 7782d22 (137 of its 139 tools, each in a fresh process with a
+  fresh breaker and cache, every request failing) found 68 of the
+  105 tools that called a source returned no error, degraded or data_gaps
+  field; an earlier single-process sweep read 53 of 85 because shared
+  circuit breakers stopped 17 tools from calling at all. Neither figure
+  is recomputed here.
 """
 
 import json
@@ -68,9 +74,9 @@ SERVER_INSTRUCTIONS = (
     "research questions to tools, says what the data cannot support, and "
     "marks the tools that need an API key. prompts/list has worked research "
     "prompts. intel://guide/source-health shows which sources are failing, "
-    "serving stale copies or missing keys. Not every tool marks a failure: "
-    "an empty list or a zero can mean a source failed, not that nothing "
-    "happened."
+    "serving stale copies or missing keys. Many tools do not mark a failure: "
+    "an empty list, a zero, a LOW label, an all-clear or a false flag can "
+    "mean a source failed, not that nothing happened."
 )
 
 # Display names for the domain modules under tools/. A module missing
@@ -260,13 +266,14 @@ with none of them invites a story.
   and carry a fetch timestamp; the date a value describes is often earlier
   than the fetch, so give both. Some tools return no observation date at
   all; say so rather than using the fetch time.
-- Failures, most of the time. Many tools return `error`, `degraded` or
-  `data_gaps` when a source is down or not configured. Not all do: some
-  return empty lists, zero counts or a neutral score when every upstream
-  request failed (measured 2026-10-17 with every request forced to fail:
-  53 of the 85 tools that call a source). Read an empty list or a zero
-  count as nothing returned, not nothing happened, and confirm with a
-  second tool before calling a place quiet.
+- Failures, sometimes. Some tools return `error`, `degraded` or
+  `data_gaps` when a source is down or not configured. Many do not: when
+  every upstream request fails they return an empty list, a zero count, a
+  neutral score, a LOW risk label, an all-clear status or a false flag,
+  with no marker. Read an empty list or a zero count as nothing returned,
+  not nothing happened, and confirm with a second tool before calling a
+  place quiet. `failing_sources` in the source-health resource names the
+  sources whose last call failed.
 - Citations. Briefs and digests number their sources.
 - Old copies, counted. When a live fetch fails and an older cached copy
   exists, that copy is served. Dictionary responses carry `_stale` and
@@ -404,10 +411,10 @@ components with the score; a null component was not measured.
 
 Many tools report a source that failed, is not configured, or does not
 cover a place with an error, a note or a `data_gaps` entry. That means
-unknown, not none. Not every tool does: some return an empty list, a
-zero count or a neutral score when every upstream request failed, so an
-empty list or a zero means nothing was returned, not that nothing
-happened. Zero events from a fetch that worked, in a region the source
+unknown, not none. Many tools do not: when every upstream request fails
+they return an empty list, a zero count, a neutral score, a LOW risk
+label, an all-clear status or a false flag, so an empty list or a zero
+means nothing was returned, not that nothing happened. Zero events from a fetch that worked, in a region the source
 covers and for a query that matched the place, is a measurement; zero
 events in a region it does not cover is nothing at all.
 """

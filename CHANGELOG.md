@@ -190,10 +190,10 @@ source here, and no proxy is substituted for any of these measures.
   domain module, with a `[needs VARIABLE]` mark on each tool that returns
   an error without its API key. Built from the live registry on every
   read; a test fails if a registered tool is missing or listed twice. It
-  says plainly that not every tool marks a failure: with every upstream
-  request forced to fail (measured 2026-10-17), 53 of the 85 tools that
-  call a source returned an empty list, a zero count or a neutral score
-  with no error, `degraded` or `data_gaps` field.
+  says plainly that many tools do not mark a failure: when every upstream
+  request fails they can return an empty list, a zero count, a neutral
+  score, a LOW risk label, an all-clear status or a false flag with no
+  error, `degraded` or `data_gaps` field.
 - `intel://guide/source-health` (JSON): open circuit breakers, stale
   serves, stale cache prefixes, cache freshness, and which keyed sources
   have their variables set (names only, never values), with a `verdict`

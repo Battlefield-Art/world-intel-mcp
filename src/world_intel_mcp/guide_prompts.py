@@ -34,10 +34,11 @@ COMMON_LIMITS: tuple[str, ...] = (
     "A tool that returns an error, a note or a data_gaps entry has told you "
     "what is missing: report it as missing. Missing data is never zero, calm "
     "or peace.",
-    "Not every tool marks a failure. Some return an empty list, a zero count "
-    "or a neutral score when every upstream request failed. Read an empty "
-    "list or a zero as nothing returned, not nothing happened, and confirm "
-    "with a second tool before calling a place quiet.",
+    "Many tools do not mark a failure. When every upstream request fails "
+    "they return an empty list, a zero count, a neutral score, a LOW risk "
+    "label, an all-clear status or a false flag. Read an empty list or a "
+    "zero as nothing returned, not nothing happened, and confirm with a "
+    "second tool before calling a place quiet.",
     "Give each figure the date it describes (the observation date) as well "
     "as when it was fetched; they are often different. If a tool gives no "
     "observation date, say so.",
