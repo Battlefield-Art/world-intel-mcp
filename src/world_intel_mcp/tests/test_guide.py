@@ -738,9 +738,10 @@ def test_no_prompt_repeats_a_call() -> None:
 # the tool says about itself: it shares a word with the tool's name,
 # description or parameter descriptions, and any upper-case name it uses (a
 # provider such as AAA or NWS) appears there too, as written or spelled out.
-# A step pointed at a wrong but registered tool fails one or both (review F14
-# M7). Measured 2026-10-17: the check catches 12,006 of the 13,524 ways of
-# pointing one step at another registered tool.
+# It catches many steps pointed at a wrong but registered tool (review F14
+# M7), not all: measured 2026-10-18 on 118 steps and 160 tools, 2,731 of the
+# 18,762 ways of pointing one step at another tool pass it, and 1,141 also
+# pass the summary check further down (review R8).
 _COMMON_WORDS = frozenset(
     "about after also and any each every for from into its latest most only "
     "over recent that the their them then this today were what when where "
@@ -2105,3 +2106,54 @@ def test_prompt_counts_match_their_tables() -> None:
     words = {3: "three", 4: "four", 5: "five"}
     flat = " ".join(_text("yield-curve-check").split())
     assert f"falls back to {words[len(maturities)]} Yahoo maturities ({', '.join(maturities)})" in flat
+
+
+# A stronger purpose check (review R8). One shared word anywhere in a tool's
+# text let wrong tools through: parameter words such as country or days, and
+# a tool's own disclaimer (intel_cyclones says "not an outage"). Here the
+# purpose must share a word with the tool's own summary, its name and the
+# first sentence of its description, leaving out words most tools share.
+_GENERIC_SCHEMA_WORDS = frozenset(
+    "active call country current data days default filter first flag intel "
+    "limit list major name recent region tool".split()
+)
+
+
+def _summary_words(tool: Tool) -> set[str]:
+    summary = guide._first_sentence(" ".join((tool.description or "").split()))
+    return _content_words(f"{tool.name.replace('_', ' ')} {summary}") - _GENERIC_SCHEMA_WORDS
+
+
+def _summary_problem(tool: Tool, purpose: str) -> str | None:
+    if _content_words(purpose) & _summary_words(tool):
+        return None
+    return f"{tool.name}: the purpose shares no word with the tool's name or first sentence"
+
+
+def test_step_purposes_share_a_word_with_their_tools_summary(tools_pkg) -> None:
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    problems = {
+        f"{prompt.name} step {i + 1}": found
+        for prompt in guide_prompts.PROMPTS
+        for i, step in enumerate(prompt.steps)
+        if (found := _summary_problem(by_name[step.tool], step.purpose))
+    }
+    assert problems == {}
+
+
+@pytest.mark.parametrize(
+    ("prompt_name", "index", "wrong_tool"),
+    [
+        ("internet-disruption", 0, "intel_cyclones"),
+        ("internet-disruption", 0, "intel_acled_events"),
+        ("yield-curve-check", 0, "intel_disease_outbreaks"),
+    ],
+)
+def test_summary_check_catches_swaps_the_word_check_let_through(
+    tools_pkg, prompt_name: str, index: int, wrong_tool: str
+) -> None:
+    """Each of these passed the shared-word check; the summary check fails it."""
+    by_name = {t.name: t for t in tools_pkg.ALL_TOOLS}
+    purpose = guide_prompts.get(prompt_name).steps[index].purpose
+    assert _purpose_problems(by_name[wrong_tool], purpose) == []
+    assert _summary_problem(by_name[wrong_tool], purpose) is not None

@@ -537,7 +537,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "the daily effective federal funds rate history (needs FRED_API_KEY)",
                 args=(("series_id", "DFF"),),
             ),
-            ("intel_major_crosses", "how the major currencies sit against each other today"),
+            ("intel_major_crosses", "the major currency cross rates: how they sit against each other today"),
             Step(
                 "intel_history_backfill",
                 "only if FRED_API_KEY is not set: loads the effective federal "
@@ -709,7 +709,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         steps=(
             Step(
                 "intel_earthquakes",
-                "the events, newest first and at most 50 by default, so a "
+                "the earthquakes, newest first and at most 50 by default, so a "
                 "count of 50 means older ones may have been cut off; call again "
                 "with a higher limit to check",
                 args=(("min_magnitude", "{min_magnitude}"), ("hours", "{hours}")),
@@ -1056,7 +1056,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="Which cloud providers report active incidents, and which of their regions are involved?",
         steps=(
             ("intel_service_status", "active incidents at AWS, Azure, GCP, Cloudflare and GitHub"),
-            ("intel_cloud_regions", "where the named regions are"),
+            ("intel_cloud_regions", "where the named cloud regions are"),
         ),
         limits=(
             "Status pages are published by the providers themselves and can "
@@ -1142,7 +1142,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step("intel_aoi_brief", "the cited picture inside {name} today", args=(("name", "{name}"),)),
             Step(
                 "intel_aoi_changes",
-                "the first call records a baseline for {name}",
+                "the first change detection call records a baseline for {name}",
                 args=(("name", "{name}"),),
             ),
         ),
@@ -1316,7 +1316,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         question="Does {query} appear on the US Treasury OFAC SDN list, and under which programs?",
         arguments=(PromptArg("query", "Name to search for", required=True),),
         steps=(
-            Step("intel_sanctions_search", "name matches on the SDN list", args=(("query", "{query}"),)),
+            Step("intel_sanctions_search", "name matches on the SDN sanctions list", args=(("query", "{query}"),)),
             Step(
                 "intel_company_profile",
                 "only if a match is a listed company: who it is",
@@ -1382,7 +1382,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_domain_summary",
                 "the same over ten years: its earliest timestamps show when "
-                "storage began for each category",
+                "storage began for each domain",
                 args=(("hours", 87600),),
             ),
             Step(
@@ -1393,7 +1393,7 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_timeline", "the stored entries in time order for the matching domain"),
             Step(
                 "intel_similar_events",
-                "earlier stored entries that resemble the strongest match",
+                "earlier stored events similar to the strongest match",
                 args=(("text", Fill("the text of the strongest match from step 3")),),
             ),
             (

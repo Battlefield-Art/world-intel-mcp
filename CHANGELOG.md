@@ -420,6 +420,14 @@ source here, and no proxy is substituted for any of these measures.
   years in history-recall; and the central bank, hotspot, airport and
   Yahoo maturity counts. The test claim above is narrowed to the counts
   the tests pin.
+- The check that a prompt step's purpose agrees with its tool let wrong
+  tools through on one shared parameter word, or on a tool's own
+  disclaimer (internet outages repointed to the cyclone tool passed). A
+  second check now requires a shared word with the tool's name or first
+  sentence, without generic schema words, and three such swaps are pinned
+  as failures. Seven step purposes were reworded to name what their tool
+  returns. Measured on 118 steps and 160 tools, 1,141 of 18,762 one-step
+  swaps still pass both checks.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
