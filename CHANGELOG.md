@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Tools 139 -> 160. Collector sources 55 -> 61. New MCP surface: 29 prompts and 3
+resources (none before).
+
 ### Added: dashboard research panels (Phase 29)
 - RESEARCH in the dashboard top bar (or the `p` key) opens four tabs:
   liquidity board, situations, top stories and collection health. Each tab
@@ -110,13 +113,6 @@
   Measured with 8 processes on one fresh file: 29 to 67 failed opens in 80
   to 160 before, none in 160 after.
 
-### Fixed: collection health names the per-user cache fallback
-- `intel_collection_health` says when its run log is the temp-directory
-  fallback, but it compared against the old shared `world-intel-mcp`
-  directory after the fallback moved to the per-user
-  `world-intel-mcp-<uid>` directory, so a run log in the real fallback was
-  never named as one. The cache and history now read one path helper.
-
 ### Fixed: the collector cycle summary separates data from errors
 - A source that answers with an upstream error (`{"error": ...}`) still
   counts as a completed fetch, but the cycle summary now lists it under
@@ -200,6 +196,7 @@ responses say so. `limit=0` returns the full history.
 - Live reading 2026-10-17: net liquidity for Wednesday 2026-10-14 was
   USD 5,869.615 billion (WALCL 6,755,639 million, WDTGAL 885,823 million,
   RRPONTSYD 0.201 billion, all observed 2026-10-14).
+- Adds 5 tools.
 
 Not added, measured 2026-10-17: ICI money market fund assets and ETF net issuance
 (403 on every path, robots.txt included); FINRA margin statistics (the finra.org
@@ -249,15 +246,17 @@ source here, and no proxy is substituted for any of these measures.
   the headlines use its name; one named only by a demonym, capital or code,
   or inside a longer name such as "Gulf of Mexico", is listed as excluded.
   Responses say they describe same-session co-movement, not causation, and
-  are not a trading signal. Tools 139 -> 140.
+  are not a trading signal. Adds 1 tool.
 
 ### Added: research guide over MCP (prompts and resources)
 - The server now answers `resources/list`, `resources/read`, `prompts/list`
   and `prompts/get`, and advertises the resources and prompts capabilities
-  at initialize. Before this it exposed tools only. No tools were added or
-  removed, and no tool name, parameter or existing response key changed;
-  the corrected tool descriptions and the new UCDP failure fields are
-  listed under Fixed.
+  at initialize. Before this it exposed tools only. This change adds no
+  tools and renames no tool or parameter. Changes to existing tools made
+  alongside it (the corrected tool descriptions, the UCDP failure fields,
+  `intel_yield_curve` returning `inverted: null` instead of `false` when no
+  spread could be computed, and the arXiv, Kp, ACLED, sanctions and
+  instability fixes) are listed under the two Fixed sections below.
 - At initialize the server sends `instructions` that point a model at
   `intel://guide` before its first tool call.
 - `intel://guide` (markdown): how to ask a strong question (period,
@@ -320,7 +319,7 @@ source here, and no proxy is substituted for any of these measures.
   hold each statement against the code through a real fetcher with every
   upstream mocked.
 
-### Fixed
+### Fixed: tool error reporting and server fixes
 - `intel_ucdp_events`: a missing token or a refused request (the UCDP API
   answers 401 without a token) now returns `error`, `degraded: true` and
   `reason` (`ucdp_unconfigured` or `ucdp_fetch_failed`) next to the empty
@@ -405,6 +404,8 @@ source here, and no proxy is substituted for any of these measures.
 - `intel_internet_outages` returned an empty list with no marker when
   neither Cloudflare Radar nor IODA answered; it now carries `error`,
   `degraded` and reason `outages_unavailable`.
+
+### Fixed: research guide
 - The guide did not mark `intel_instability_index` as needing ACLED
   credentials, though without a `country_code` it returns the same
   credentials error as the other ACLED tools. It now carries
@@ -661,7 +662,7 @@ source here, and no proxy is substituted for any of these measures.
   synthetic store of 475,200 captures and 1.75 million observations
   (10,982 series), one call took 24 to 46 ms (measured before the review
   fixes, not re-measured).
-- Tools 152 -> 153.
+- Adds 1 tool.
 
 ### Added: observation history and collection health
 - A history store in the cache SQLite file. Every collector source run is a
@@ -719,15 +720,19 @@ source here, and no proxy is substituted for any of these measures.
   (`2026-02-30`, `0000` and fullwidth digits are rejected).
 - MCP tools `intel_collection_health`, `intel_capture_history`,
   `intel_series_history` and `intel_revisions`, and the CLI group
-  `intel history health|captures|series|revisions`. History accrues only
-  while the collector runs.
+  `intel history health|captures|series|revisions`. Adds 4 tools. History
+  accrues only while the collector runs, except the `backfill:*` series
+  that `intel_history_backfill` (`intel history backfill fred|ecb`) loads
+  from the publisher's current data.
 - Collection health counts a success only from a live capture. A source
   served from stale cache reads `stale`, keeps its last live success time
   and goes overdue on schedule; consecutive failures count errors and
   stale replays since the last live capture. Health also reports the last
   fully ok capture (`last_ok_at`, `last_ok_age_s`; a Last ok column in
   `intel history health`), `data_gaps` (an empty run log names the file
-  it read), lost history writes and what it cannot prove.
+  it read, and a run log at the cache's temp-directory fallback,
+  `world-intel-mcp-<uid>/cache.db` under the system temp directory, is named
+  as the fallback), lost history writes and what it cannot prove.
   `intel_revisions` reports how many observations and dated series it
   checked, and its data gaps.
 - The collector records every source outcome of a cycle in one
@@ -746,14 +751,14 @@ source here, and no proxy is substituted for any of these measures.
   `WORLD_INTEL_HISTORY_CADENCE_S` and
   `WORLD_INTEL_HISTORY_CADENCES=source=seconds,...` override it.
 
-### Fixed
+### Fixed: observation history (collector BaseException)
 - A collector source task that ended in a `BaseException` that is not an
   `Exception` (for example a cancelled task) made the cycle raise a
   `TypeError` while tallying results, after the fetches finished, so that
   cycle returned no summary and recorded no history. It now counts as a
   failure and is recorded as an error capture.
 
-### Notes
+### Known limits: observation history
 - Known limits, stated in `intel_collection_health`'s `cannot_prove` and
   the `history` module docs: stale data are seen only through the
   fetcher's expired-cache fallback or a top-level `_stale` marker (a
@@ -765,7 +770,6 @@ source here, and no proxy is substituted for any of these measures.
 - The cycle summary's `successes` still counts a source that returned
   `{"error": ...}` (unchanged, pinned by an existing test); that run's
   history capture is an error.
-- Tools 139 -> 143.
 
 ### Added: connections with timing offsets (Phase 29)
 - `intel_lagged_connections` (CLI: `intel history connections`): Pearson
@@ -846,7 +850,7 @@ source here, and no proxy is substituted for any of these measures.
   (`WORLD_INTEL_HISTORY_DAYS`), a store filled only by the collector spans
   about a year, so the month grid cannot reach the 20-point floor without a
   longer retention or backfilled history.
-- Tools 152 -> 153.
+- Adds 1 tool.
 
 ### Added: history backfill and more history extractors (Phase 29)
 - `intel history backfill fred SERIES... [--start YYYY-MM-DD]`,
@@ -923,7 +927,7 @@ source here, and no proxy is substituted for any of these measures.
   and M3 stored 0.
 - FRED's terms of use speak of personal, non-commercial use of FRED data;
   whether a deployment fits them is the operator's call.
-- Tools 152 -> 153; the `intel history` group gains `backfill fred|ecb`.
+- Adds 1 tool; the `intel history` group gains `backfill fred|ecb`.
 
 ### Added: news signals (ROADMAP Phase 29)
 - `intel_hostility_timeline`: per UTC day, GDELT DOC 2.0 coverage of a
@@ -966,9 +970,10 @@ source here, and no proxy is substituted for any of these measures.
   marked `*` (and each count from a partial column), today `~`, and
   expired columns are named with their age; unmeasured change and
   attention print as not measured.
-- Collector: `situations` and `top_stories` (57 sources).
+- Collector: `situations` and `top_stories` join the `news` group.
+- Adds 3 tools.
 
-### Changed
+### Changed: news signals (shared feed requests, GDELT spacing)
 - Concurrent `fetch_news_feed` reads of the same feed set share one
   request per feed. The collector starts its four news sources in one
   gather, and each used to request every feed itself; measured live
@@ -991,7 +996,7 @@ source here, and no proxy is substituted for any of these measures.
   of the collector's 240 s `aoi_digest` budget and 50 AOIs timed out
   after 48 calls (measured 2026-10-17, every other AOI domain stubbed).
 
-### Fixed
+### Fixed: news signals
 - RSS outage read as a slow news day (ROADMAP Phase 24.5):
   `fetch_news_feed` returned `count: 0` with no marker when every feed
   failed. It now reports `feeds_attempted`, `feeds_ok`, `feeds_failed` and
@@ -1226,7 +1231,23 @@ source here, and no proxy is substituted for any of these measures.
   maritime data". It now shows the nine waterways' statuses, a STALE note
   for a frozen feed, the outage error, and the first data gaps.
 
-### Tests
+### Fixed: dashboard nav-warnings and fleet panels
+- The nav-warnings panel read `navArea` and `dtg`, so Area was always '?'
+  and Issued blank. It now reads `navarea` and `issue_date`, marks a stale
+  NGA feed (`feed_stale`) STALE and a degraded one DEGRADED, still renders
+  when the payload has `error`, and lists that error and the payload's
+  `data_gaps`.
+- The fleet panel was hidden when the report had `error` and showed 0 for
+  a missing score. It now shows '?' for a null `readiness_score` and for
+  the aircraft or surge count of a component listed in
+  `unavailable_components`. When `readiness_lower_bound` is set, the score
+  and level get a leading >= and the score is never shown in green; the
+  aircraft total gets a leading >= when theaters are unavailable. The panel
+  lists the error and `data_gaps`, marks DEGRADED and names the
+  unavailable components.
+- Warn and crit values in mini boxes are now coloured.
+
+### Tests: navigational warnings and fleet
 - Failing-first regression tests built on live NGA records captured
   2026-10-17, and `test_maritime_honesty.py` and `test_fleet_honesty.py`
   for the second review round: each finding test fails on the previous
@@ -1240,10 +1261,10 @@ source here, and no proxy is substituted for any of these measures.
   short reuse of an empty answer, both lookbehinds, longitude-only tokens,
   decimal minutes followed by seconds) is killed by this file.
 
-### Still open
-- The dashboard's nav-warnings table and fleet panel do not yet read
-  `feed_stale`, `stale`, `unknown`, `readiness_lower_bound` or `UNKNOWN`,
-  and the collector counts error results as successful collections.
+### Still open: navigational warnings and fleet
+- The collector cycle summary's `successes` still counts a source that
+  answered with an upstream error; it is also listed under
+  `upstream_errors`.
 - Strategic posture and temporal anomalies still read a posture outage as
   zero activity; posture now marks it, but they do not check.
 - A naval warning that cannot be placed leaves every waterway's status
@@ -1306,7 +1327,7 @@ source here, and no proxy is substituted for any of these measures.
   makes that component null in `components`, listed in
   `unavailable_components` and explained in `data_gaps`, never a 0.
 
-### Fixed
+### Fixed: AOI inputs (earthquakes, wildfires, GDELT, geocoding, brief aviation)
 - `fetch_earthquakes` and `fetch_wildfires` mark a failed fetch (`error`,
   `degraded`, `reason`; per region for FIRMS, with `failed_regions` and,
   when other regions answered, `partial_errors`) instead of answering a
@@ -1320,23 +1341,29 @@ source here, and no proxy is substituted for any of these measures.
 - `fetch_gdelt_search`'s cache key holds a digest of every request
   parameter. The old key reduced a non-Latin query to underscores, so
   "Київ" and "Суми" shared one entry and one AOI was scored on the other's
-  timeline. The USGS and ACLED keys now hold the result limit, so a short
-  answer cached for one caller is not served to another as complete.
+  timeline.
+- `fetch_earthquakes`'s cache key now holds the result limit (ACLED's
+  change is under Fixed: tool error reporting and server fixes), so a
+  short answer cached for one caller is not served to another as complete.
 - The FIRMS docstring states what the request asks for: a day range of 2
   (FIRMS's two most recent days), not the last 24 hours.
 - A reverse-geocoding failure no longer repeats its prefix ("Reverse
   geocoding failed: Reverse geocoding unavailable: ...").
+- The AOI brief's aviation section reads the `positions` list that the
+  domestic-flights source returns. It used to read a `sampled` key the
+  source never returns, so every live brief showed 0 aircraft in the
+  area. It now counts the sampled aircraft inside the area, and reports
+  aviation as a data gap only when the fetch fails or its answer has no
+  `positions` list.
 
-### Changed
+### Changed: AOI escalation
 - The escalation also fetches earthquakes and wildfires (convergence
   inputs) and one GDELT timeline, in parallel with ACLED and military
   flights; their failures are named in `data_gaps`. The brief, the change
   sweep and the escalation now share one AOI scoping helper, which reads
   an answer without its list (an unrecognized shape) as unknown rather
   than as an empty area, and names a failed FIRMS region next to answered
-  ones. The brief's aviation section reads a `sampled` list the
-  domestic-flights source does not return, so it now reports that as a
-  data gap where it used to show 0 aircraft.
+  ones.
 - `intel aoi escalation` prints a zero-filled component as not measured,
   marks lower bounds, and shows the score ceiling and `computed_from`.
 - `test_aoi.py` stubs every network-bound source by default: its older
@@ -1413,7 +1440,7 @@ source here, and no proxy is substituted for any of these measures.
   Content API 2 MiB, Home Office ODS 8 MiB), and the refusal names the cap.
 - Frontex is not built: its only data file is an XLSX under `/assets/`,
   which its robots.txt disallows (measured 2026-10-17, see ROADMAP Phase 28).
-- Tools 139 -> 141.
+- Adds 2 tools.
 
 ### Added: Kalshi and cross-venue prediction markets
 - `intel_kalshi_markets`: Kalshi open markets from its public market-data
@@ -1446,7 +1473,7 @@ source here, and no proxy is substituted for any of these measures.
   and refuse a value that is not a number before any request.
 - CLI: `intel kalshi`, `intel prediction-compare`, `intel prediction-settled`.
 - Collector: `kalshi_markets` and `prediction_compare` (Economics
-  category) join the `prediction` domain. Sources 55 -> 57. Tools 139 -> 142.
+  category) join the `prediction` domain. Adds 3 tools.
 
 ### Fixed: prediction markets outage read as "no markets"
 - `intel_prediction_markets` returned `{"markets": [], "count": 0}` with no
