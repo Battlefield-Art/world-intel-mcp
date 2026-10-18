@@ -55,6 +55,16 @@
   default 1,024 open-file limit. Test runs also no longer leave
   `wim-server-test-*` directories in the system temp directory.
 
+### Fixed: the collector cycle summary separates data from errors
+- A source that answers with an upstream error (`{"error": ...}`) still
+  counts as a completed fetch, but the cycle summary now lists it under
+  `upstream_errors`, and `intel-collector` prints how many of the
+  "succeeded" sources stored nothing. Before, such a cycle read as data
+  collected.
+- A stale cache copy (`_stale`) is no longer stored in the vector store as
+  if it were collected this cycle; the summary lists it under
+  `stale_not_stored`.
+
 ### Added: liquidity and money (Phase 29)
 Keyless sources only: the FRED graph CSV (`fred.stlouisfed.org/graph/fredgraph.csv`,
 allowed by robots.txt with `Crawl-delay: 1`, honored by a 1 s `fred-graph` rate
