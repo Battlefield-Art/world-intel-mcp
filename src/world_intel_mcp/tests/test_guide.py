@@ -1856,3 +1856,34 @@ def test_source_health_marks_a_cache_file_moved_or_replaced_under_it(tmp_path) -
             other.close()
     scope = " ".join(guide._HEALTH_SCOPE)
     assert "cache.moved is true when the file at db_path is gone" in scope
+
+
+def test_prompts_point_to_the_tools_that_answer_them_best(registered) -> None:
+    """Merged tools that answer a prompt's question are steps in it, so a
+    model is not left with a weaker tool or told a key is needed."""
+    expected = {
+        "story-breadth": {"intel_top_stories", "intel_situations", "intel_hostility_timeline"},
+        "election-watch": {"intel_kalshi_markets", "intel_prediction_compare"},
+        "displacement-history": {"intel_us_border_encounters"},
+        "migration-surges": {"intel_us_border_encounters", "intel_uk_small_boat_arrivals"},
+        "aoi-watch-setup": {"intel_aoi_define_polygon", "intel_aoi_define_corridor"},
+        "aoi-review": {"intel_aoi_digest"},
+        "market-risk-snapshot": {"intel_liquidity_board", "intel_net_liquidity"},
+        "company-events": {"intel_news_market_reaction"},
+        "yield-curve-check": {"intel_history_backfill", "intel_series_history"},
+        "central-bank-compare": {"intel_history_backfill", "intel_series_history"},
+        "history-recall": {"intel_series_history", "intel_collection_health"},
+    }
+    missing = {
+        name: sorted(tools - set(guide_prompts.get(name).tools))
+        for name, tools in expected.items()
+        if tools - set(guide_prompts.get(name).tools)
+    }
+    assert missing == {}
+    assert set().union(*expected.values()) <= registered
+    # The keyless route reads the key the backfill stores the series under.
+    for name, series in (("yield-curve-check", "T10Y2Y"), ("central-bank-compare", "DFF")):
+        calls = {s.tool: c for s, c in guide_prompts.resolved_steps(guide_prompts.get(name), {})}
+        assert calls["intel_history_backfill"] == {"provider": "fred", "series": [series]}
+        assert calls["intel_series_history"] == {"series_key": f"backfill:fred:{series}"}
+    assert "(intel_collection_health)" in " ".join(guide._HEALTH_SCOPE)

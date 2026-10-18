@@ -484,7 +484,8 @@ _HEALTH_SCOPE = (
     "keyed_sources says whether each variable is set in this server's "
     "environment. It never shows values and does not check that a key works.",
     "Not read here: vector store statistics (intel_vector_stats) and the "
-    "collector's run history. Reading this resource starts no fetches.",
+    "collector's run history (intel_collection_health). Reading this "
+    "resource starts no fetches.",
 )
 
 

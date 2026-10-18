@@ -453,6 +453,17 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ("intel_sector_heatmap", "which US equity sectors are leading and lagging"),
             ("intel_yield_curve", "curve shape and spreads"),
             ("intel_macro_composite", "the composite score and the inputs it weighs"),
+            (
+                "intel_liquidity_board",
+                "keyless liquidity readings (Fed balance sheet, Treasury General "
+                "Account, reverse repo, net liquidity, money supply), each with "
+                "its units and observation date",
+            ),
+            (
+                "intel_net_liquidity",
+                "only if liquidity matters to the answer: the weekly US net "
+                "liquidity series behind the board's row, with its formula",
+            ),
         ),
         limits=(
             "Report current readings and their recent change only. Quote the "
@@ -476,6 +487,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("series_id", "T10Y2Y"),),
             ),
             ("intel_central_bank_rates", "the policy rate the short end is anchored to"),
+            Step(
+                "intel_history_backfill",
+                "only if FRED_API_KEY is not set: loads the T10Y2Y history from "
+                "FRED's keyless graph CSV into the history store (it stores no "
+                "unit for this series; a failed fetch is an error capture)",
+                args=(("provider", "fred"), ("series", ["T10Y2Y"])),
+            ),
+            Step(
+                "intel_series_history",
+                "only after that backfill: the stored T10Y2Y observations with "
+                "their observed_at dates",
+                args=(("series_key", "backfill:fred:T10Y2Y"),),
+            ),
         ),
         limits=(
             "Spreads are in percentage points. A move from 0.10 to 0.30 is "
@@ -510,6 +534,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("series_id", "DFF"),),
             ),
             ("intel_major_crosses", "how the major currencies sit against each other today"),
+            Step(
+                "intel_history_backfill",
+                "only if FRED_API_KEY is not set: loads the effective federal "
+                "funds rate history from FRED's keyless graph CSV into the "
+                "history store (a failed fetch is an error capture)",
+                args=(("provider", "fred"), ("series", ["DFF"])),
+            ),
+            Step(
+                "intel_series_history",
+                "only after that backfill: the stored observations of that "
+                "rate with their observed_at dates",
+                args=(("series_key", "backfill:fred:DFF"),),
+            ),
         ),
         limits=(
             "Only the Fed, ECB and BoE rates can be live, read from FRED when "
@@ -589,6 +626,13 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "intel_earnings_surprise",
                 "actual against estimated earnings",
                 args=(("symbol", "{ticker}"),),
+            ),
+            (
+                "intel_news_market_reaction",
+                "companies named in recent news story clusters with the stock's "
+                "move on the story's session against a benchmark. If {ticker} "
+                "is not listed, no recent cluster was mapped to it, which is "
+                "not the same as no news",
             ),
         ),
         limits=(
@@ -811,6 +855,13 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("origin", "{country}"),),
             ),
             ("intel_displacement_summary", "UNHCR's global displacement totals, for context"),
+            Step(
+                "intel_us_border_encounters",
+                "only for the origin view: US CBP encounters per month of "
+                "{country} citizens, a flow of events (not people, not a "
+                "stock) that never adds to the displacement figures above",
+                args=(("citizenship", Fill("the country as CBP names it, in capitals, e.g. MEXICO")),),
+            ),
         ),
         limits=(
             "UNHCR figures are year-end stocks (people displaced at the end of "
@@ -842,6 +893,18 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             ),
             ("intel_net_migration", "World Bank net migration for the leading countries"),
             ("intel_humanitarian_summary", "HDX crisis datasets for the leading origins"),
+            (
+                "intel_us_border_encounters",
+                "only if the question turns to arrivals in the US: CBP "
+                "encounters per month with same-month prior-year change, a "
+                "flow of events, not a stock",
+            ),
+            (
+                "intel_uk_small_boat_arrivals",
+                "only if the question turns to arrivals in the UK: Home Office "
+                "small boat crossings with year to date against last year, a "
+                "flow of arrivals, not a stock",
+            ),
         ),
         limits=(
             "World Bank net migration counts every reason, work included; "
@@ -1051,6 +1114,24 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "saves the area",
                 args=(("name", "{name}"), ("lat", "{lat}"), ("lon", "{lon}"), ("radius_km", "{radius_km}")),
             ),
+            Step(
+                "intel_aoi_define_polygon",
+                "only if a circle does not fit the area (a border region or a "
+                "strait): define it under another name as a polygon of [lat, "
+                "lon] vertices, and use that name in the steps below",
+                args=(("name", Fill("a name for the polygon")), ("vertices", Fill("3 to 64 [lat, lon] vertices"))),
+            ),
+            Step(
+                "intel_aoi_define_corridor",
+                "only if the area is a route (a shipping lane or cable run): "
+                "define it under another name as a corridor of waypoints with "
+                "a width, and use that name in the steps below",
+                args=(
+                    ("name", Fill("a name for the corridor")),
+                    ("waypoints", Fill("2 to 64 [lat, lon] waypoints")),
+                    ("width_km", Fill("the total width in km, 1 to 500")),
+                ),
+            ),
             Step("intel_aoi_brief", "the cited picture inside {name} today", args=(("name", "{name}"),)),
             Step(
                 "intel_aoi_changes",
@@ -1088,6 +1169,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 args=(("name", "{name}"),),
             ),
             Step("intel_aoi_brief", "cited detail behind any change worth reporting", args=(("name", "{name}"),)),
+            (
+                "intel_aoi_digest",
+                "only if asked about every watched area: the change sweep "
+                "across all defined AOIs in one call. It advances each AOI's "
+                "snapshot as step 2 does, so never run both for {name}",
+            ),
         ),
         limits=(
             "Changes are relative to the previous snapshot, whenever it was "
@@ -1118,6 +1205,24 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step("intel_gdelt_search", "the articles themselves", args=(("query", "{topic}"), ("mode", "artlist"))),
             ("intel_news_clusters", "the clusters of related stories in the RSS set"),
             ("intel_news_feed", "the latest items from the RSS feeds"),
+            (
+                "intel_top_stories",
+                "stories carried by at least three distinct outlets in the RSS "
+                "feeds over the last 24 hours, ranked by outlet count: breadth "
+                "across outlets",
+            ),
+            (
+                "intel_situations",
+                "situations between and inside countries ranked by how many RSS "
+                "headlines cover them",
+            ),
+            Step(
+                "intel_hostility_timeline",
+                "only if the story is about one country or a pair: per-day "
+                "GDELT article counts for it, where a day GDELT did not return "
+                "is null and listed in data_gaps",
+                args=(("country", Fill("the country the story is about")),),
+            ),
         ),
         limits=(
             "Report the timelinevol series as GDELT returns it and compare it "
@@ -1156,6 +1261,19 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "the 20 active Polymarket questions with the most 24-hour "
                 "volume. It has no topic filter, so most will be about other "
                 "things: keep any about this election and say so if there are none",
+            ),
+            Step(
+                "intel_kalshi_markets",
+                "Kalshi open markets in its Elections category, ranked by "
+                "volume; keep only those about this election",
+                args=(("category", "Elections"),),
+            ),
+            Step(
+                "intel_prediction_compare",
+                "the same Elections markets on Kalshi and Polymarket side by "
+                "side with the price gap; match_confidence ranks pairs and is "
+                "not a probability",
+                args=(("category", "Elections"),),
             ),
         ),
         limits=(
@@ -1251,6 +1369,18 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
                 "intel_similar_events",
                 "earlier stored entries that resemble the strongest match",
                 args=(("text", Fill("the text of the strongest match from step 3")),),
+            ),
+            (
+                "intel_series_history",
+                "the numeric series the history store holds (a separate store "
+                "from the vector store), with observed_at, published_at and "
+                "collected_at for each",
+            ),
+            (
+                "intel_collection_health",
+                "the collector's run log per source: last success, consecutive "
+                "failures and whether it is overdue, which says how complete "
+                "that history is",
             ),
         ),
         limits=(

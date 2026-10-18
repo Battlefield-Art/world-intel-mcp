@@ -372,6 +372,17 @@ source here, and no proxy is substituted for any of these measures.
   not the file source health first read), the verdict says the numbers
   come from a file no other process shares, and the scope notes say a
   replacement made before the first read is not detected.
+- Prompts now name the merged tools that answer their questions:
+  story-breadth (outlet breadth, ranked situations, per-day hostility
+  coverage), election-watch (Kalshi Elections markets and the cross-venue
+  comparison), the migration prompts (US border encounters, UK small boat
+  arrivals), the AOI prompts (polygon and corridor areas, the all-area
+  digest), market-risk-snapshot (liquidity board, net liquidity),
+  company-events (news and market reaction), yield-curve-check and
+  central-bank-compare (a keyless FRED backfill read back from the history
+  store when `FRED_API_KEY` is not set) and history-recall (the history
+  store and the collector's run log). The source-health scope points to
+  `intel_collection_health` for the run history it does not read.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
