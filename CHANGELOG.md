@@ -335,6 +335,10 @@ source here, and no proxy is substituted for any of these measures.
   `acled_unconfigured` in `data_gaps`. A new test calls every conflict and
   intelligence tool with no keys set and checks that each one whose error
   names a key is marked.
+- story-breadth told the model not to state a unit for GDELT volume
+  while the shared answer shape asked for each number with its unit. The
+  answer shape now reads "each number with its unit (or say the source
+  states none) and date".
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

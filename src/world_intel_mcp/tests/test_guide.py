@@ -1666,3 +1666,12 @@ async def test_every_conflict_and_intelligence_tool_naming_a_key_is_marked(
         "intel_ucdp_events",
         "intel_unrest_events",
     ]
+
+
+def test_story_breadth_unit_rule_agrees_with_the_answer_shape() -> None:
+    """story-breadth says not to state a unit for GDELT volume; the shared
+    answer shape must leave room for a number the source gives no unit."""
+    text = _text("story-breadth")
+    assert "Do not state a unit for it" in text
+    assert "each number with its unit (or say the source states none) and date" in text
+    assert "each number with its unit and date" not in text

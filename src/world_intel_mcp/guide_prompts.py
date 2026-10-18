@@ -48,7 +48,8 @@ COMMON_LIMITS: tuple[str, ...] = (
 
 ANSWER_SHAPE = (
     "Answer with: the place, period and measure you used; each number with "
-    "its unit and date; the comparison you were asked for; every data gap; "
+    "its unit (or say the source states none) and date; the comparison you "
+    "were asked for; every data gap; "
     "and one line on what this data cannot tell."
 )
 
