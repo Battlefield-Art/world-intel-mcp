@@ -1,16 +1,16 @@
-"""ECB 404s: the portal's own "no series" answer versus an error page.
+"""ECB 404s: the portal's own "no series" answer versus everything else.
 
 The ECB Data Portal answers a key that matches no series with a 404
-whose body is empty or a JSON problem object; that stays a final
-no-data answer (not retried, not a breaker failure, no stale copy). A
-404 with any other body (an HTML or plain-text error page, JSON that is
-not an object) came from something in front of the portal: it is
+whose body is a JSON problem object with a "detail" that starts "No
+Series was returned for the query"; only that stays a final no-data
+answer (not retried, not a breaker failure, no stale copy). Any other
+404 (an empty body, an HTML or plain-text error page, other JSON) is
 retried per the fetcher's rules, counted as a breaker failure, and the
 last good copy is served marked, with the failure named in data_gaps.
 
 Gaps / not covered: live ECB responses (fixtures and respx only). The
-residual risk stays: a JSON-object 404 from a moved gateway still reads
-as no-data.
+residual risk: if the portal rewords that detail, its real no-series
+answers take the outage path.
 """
 
 import time
@@ -41,6 +41,13 @@ _ERROR_PAGES = [
     pytest.param(httpx.Response(404, text=_HTML_404, headers={"content-type": "text/html"}), id="html"),
     pytest.param(httpx.Response(404, text="Not Found", headers={"content-type": "text/plain"}), id="plain-text"),
     pytest.param(httpx.Response(404, content=b"[]", headers={"content-type": "application/json"}), id="json-array"),
+    pytest.param(httpx.Response(404, content=b""), id="empty"),
+    pytest.param(httpx.Response(404, content=b"\r\n"), id="crlf"),
+    pytest.param(httpx.Response(404, content=b'{"title":"No results"}', headers={"content-type": "application/json"}),
+                 id="json-object-without-detail"),
+    pytest.param(httpx.Response(404, content=b'{"title":"Not Found","status":404,"detail":"No results found."}',
+                                headers={"content-type": "application/problem+json"}),
+                 id="problem-json-other-detail"),
 ]
 
 
@@ -76,6 +83,7 @@ async def test_error_page_404_on_the_board_serves_the_marked_stale_copy(fetcher,
     await liquidity.fetch_liquidity_board(fetcher)
     _age(fetcher, 7200)
     before = [fetcher.cache.get_stale_meta(k) for k in _BOARD_KEYS]
+    assert None not in before  # the keys name the board's copies, so the restamp check below is not vacuous
     fetcher.max_retries = 2
     bsi = respx.get(_ECB_BSI_URL).mock(return_value=response)
     ilm = respx.get(_ECB_ILM_URL).mock(return_value=response)
@@ -174,3 +182,37 @@ def test_changelog_states_the_ecb_404_rule():
         "page, is retried, counted as a breaker failure and takes the outage path."
     ) in text
     assert "ECB 404 responses are final no-data answers" not in text
+
+
+@pytest.mark.parametrize("body, no_data", [
+    pytest.param(_ECB_404.encode(), True, id="live-problem-json"),
+    pytest.param(b'{"detail":"No Series was returned for the query"}', True, id="detail-is-the-prefix"),
+    pytest.param(b"", False, id="empty"),
+    pytest.param(b" \n", False, id="whitespace"),
+    pytest.param(b"\r\n", False, id="crlf"),
+    pytest.param(b"{}", False, id="empty-object"),
+    pytest.param(b'{"title":"No results"}', False, id="object-without-detail"),
+    pytest.param(b'{"title":"Not Found","status":404,"detail":"No results found."}', False,
+                 id="unknown-dataflow-detail"),
+    pytest.param(b'{"detail":"Error: No Series was returned for the query"}', False, id="prefix-not-at-start"),
+    pytest.param(b'{"detail":"no series was returned for the query"}', False, id="prefix-in-lower-case"),
+    pytest.param(b'{"detail":["No Series was returned for the query"]}', False, id="detail-not-a-string"),
+    pytest.param(b'["No Series was returned for the query"]', False, id="json-array"),
+    pytest.param(b'"No Series was returned for the query"', False, id="json-string"),
+    pytest.param(b"No Series was returned for the query", False, id="plain-text"),
+    pytest.param(b"[" * 100_000, False, id="nesting-past-recursion-limit"),
+])
+def test_ecb_404_is_no_data_only_for_the_portal_no_series_detail(body, no_data):
+    assert liquidity._ecb_404_is_no_data(body) is no_data
+
+
+def test_changelog_states_the_strict_ecb_404_rule():
+    text = " ".join((Path(__file__).parents[3] / "CHANGELOG.md").read_text().split())
+    assert (
+        "An ECB 404 is a final no-data answer, without outage retries, only when its body is the "
+        "portal's JSON problem answer whose detail starts \"No Series was returned for the query\"; "
+        "any other 404, an empty body or an HTML or plain-text error page included, is retried, "
+        "counted as a breaker failure and takes the outage path."
+    ) in text
+    assert "whose body is empty or a JSON object" not in text
+    assert liquidity._ECB_NO_SERIES_DETAIL == "No Series was returned for the query"
