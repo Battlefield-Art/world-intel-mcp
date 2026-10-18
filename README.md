@@ -10,6 +10,8 @@ Real-time global intelligence across **30+ domains** with **160 MCP tools**, a l
 
 Built for AI agents that need world awareness: market conditions, geopolitical risk, military posture, aircraft-cohort early warning, refugee and migration flows, supply chain disruptions, cyber threats, and more — all queryable via the Model Context Protocol. The vector store enables natural language queries like *"military activity near Taiwan"* or *"cyber threats targeting healthcare"* across all historical data.
 
+For research, the collector keeps a dated history of what it captures. Each observation carries the period it describes, the publisher's release date when known, and when it was saved, so earlier copies, revised values, lagged correlations between series and any past day can be queried, and collection health is measured from the collector's run log rather than inferred from cache freshness. The server also exposes **29 MCP prompts** (worked research questions, each naming the tools it needs and the limit to respect) and **3 MCP resources**: a research guide generated from the live tool registry (`intel://guide`), a measures glossary (`intel://guide/measures`) and live source health (`intel://guide/source-health`).
+
 ---
 
 ## What You Get
@@ -828,6 +830,16 @@ The vector store uses FastEmbed (ONNX-based, BAAI/bge-small-en-v1.5) for embeddi
 | `OLLAMA_API_URL` | No | Ollama server for AI-generated briefs (default: `http://localhost:11434`) |
 | `OLLAMA_MODEL` | No | Ollama model for AI-generated briefs (default: `llama3.2`) |
 | `WORLD_INTEL_LOG_LEVEL` | No | Logging level (default: INFO) |
+| `WORLD_INTEL_CACHE_DB` | No | Cache and history database path (default: `$XDG_CACHE_HOME/world-intel-mcp/cache.db`, else `~/.cache/world-intel-mcp/cache.db`) |
+| `WORLD_INTEL_DASHBOARD_HOST` | No | Dashboard bind interface (default: `127.0.0.1`) |
+| `WORLD_INTEL_HEATMAP_CACHE_MB` | No | On-disk cap for adsb.lol heatmaps used by the aircraft-cohort tools (default: 1024) |
+| `WORLD_INTEL_HISTORY_CADENCE_S` | No | Expected seconds between collector attempts, for collection health (default: 300) |
+| `WORLD_INTEL_HISTORY_CADENCES` | No | Per-source cadence overrides, e.g. `aoi_digest=900,news_feed=600` |
+| `WORLD_INTEL_HISTORY_PAYLOAD_DAYS` | No | Days stored payload bodies are kept (default: 7; 0 keeps them forever) |
+| `WORLD_INTEL_HISTORY_CAPTURE_DAYS` | No | Days run-log captures are kept (default: 30; 0 keeps them forever) |
+| `WORLD_INTEL_HISTORY_DAYS` | No | Days observations are kept (default: 365; 0 keeps them forever) |
+| `WORLD_INTEL_HISTORY_MAX_BODY_BYTES` | No | Largest payload body stored, in bytes of JSON (default: 4194304; 0 = no cap) |
+| `WORLD_INTEL_HISTORY_REPLAY_MAX_BYTES` | No | Largest payload returned by a capture replay (default: 262144; 0 = no cap) |
 | `WORLD_INTEL_AOI_WEBHOOK` | No | URL POSTed when an AOI sweep finds changes (collector daemon); quiet sweeps don't fire |
 | `WORLD_INTEL_AOI_WEBHOOK_FORMAT` | No | `json` (default: title/totals/markdown payload) or `text` (raw markdown body + `Title` header, ntfy-style) |
 

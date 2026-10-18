@@ -62,6 +62,10 @@ Phase 26: the 2,900-line registry/dispatch monolith split into domain modules
           TOOLS/HANDLERS parity guarantee) and shared infrastructure in
           runtime.py. Pure move: 128 tools, byte-identical definitions,
           identical dispatch semantics.
+Phases 27-29: aircraft-cohort early warning, cross-border migration, and
+          research-grade history and evidence, with MCP prompts and resources
+          (guide.py). 160 tools in 20 modules as of 2026-10-18; ROADMAP.md has
+          the per-phase detail.
 """
 
 import asyncio

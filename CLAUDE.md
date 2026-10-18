@@ -43,7 +43,7 @@ collector.py (daemon)  ──┘
 ```
 
 **Infrastructure layer** (`fetcher.py`, `cache.py`, `circuit_breaker.py`):
-- `Fetcher`: Centralized async HTTP client (httpx). All external calls go through `get_json()`, `get_text()`, or `get_xml()`. Handles retries (2 max), per-source rate limiting, and stale-data fallback (never returns blank if old data exists).
+- `Fetcher`: Centralized async HTTP client (httpx). All external calls go through `get_json()`, `get_text()`, `get_xml()` or `get_bytes()` (binary bodies, streamed under a size cap, never cached). Handles retries (2 max), per-source rate limiting, and stale-data fallback (never returns blank if old data exists). Failure logs and returned error strings pass through `redact()`, which masks credential query parameters and the values of `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` environment variables.
 - `CircuitBreaker`: Per-source tracking. 3 consecutive failures trips the breaker for 5 minutes. Each RSS feed gets its own breaker (`rss:bbc_world`).
 - `Cache`: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 
@@ -58,6 +58,10 @@ collector.py (daemon)  ──┘
 **Vector store** (`vector_store.py`): Optional Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX). Async background worker queue (`asyncio.Queue` + `asyncio.to_thread()`) for non-blocking storage. Fetcher auto-stores on fresh HTTP fetches. 65+ source name → category mappings for filtered search.
 
 **Collector** (`collector.py`): Standalone daemon for 24/7 vector store population. 61 sources organized by domain, with `--daemon`, `--interval`, `--sources` CLI args. Dynamic import via `_import_fetch_fn()`. Per-source timeout overrides in `SOURCE_TIMEOUTS` (the `aoi_digest` sweep gets 240 s; everything else the flat 45 s). Entry point: `intel-collector`.
+
+**Observation history** (`history.py`, `history_extractors.py`, `history_backfill.py`, `history_timeline.py`): every collector capture is written to the same SQLite database as the cache: a run log per source (status, reason, stale replays), deduplicated payload bodies, and observations with three dates (`observed_at` the period described, `published_at` the release when known, `collected_at` when saved). Feeds `intel_collection_health`, `intel_series_history`, `intel_capture_history`, `intel_revisions`, `intel_lagged_connections`, `intel_day_timeline` and `intel_history_backfill` (FRED and ECB). Retention and caps are set by the `WORLD_INTEL_HISTORY_*` variables (README). Nothing exists before the collector's first recorded cycle except backfilled series.
+
+**Research guide** (`guide.py`, `guide_prompts.py`): the MCP prompts (29 worked research questions) and resources (`intel://guide`, generated from the live registry; `intel://guide/measures`; `intel://guide/source-health`).
 
 **Reports** (`reports.py`): PDF/HTML intelligence report generator. Collects 18 domains in parallel, renders styled HTML, converts to PDF via WeasyPrint. Optional dependency: `pip install -e ".[pdf]"`.
 
@@ -85,7 +89,11 @@ collector.py (daemon)  ──┘
 ## Environment Variables
 
 Only these unlock additional data sources (everything else works unauthenticated):
-- `ACLED_ACCESS_TOKEN` — conflict events
+- `ACLED_EMAIL` / `ACLED_PASSWORD`: conflict events, unrest and risk scores
+- `UCDP_ACCESS_TOKEN`: UCDP organized violence events (the API refuses requests without it)
+- `TOMTOM_API_KEY`: traffic flow and incidents
+- `WINDY_API_KEY`: webcams
+- `OPENSKY_USERNAME` / `OPENSKY_PASSWORD`: OpenSky account for the aviation tools
 - `NASA_FIRMS_API_KEY` — satellite wildfire data
 - `EIA_API_KEY` — energy prices
 - `CLOUDFLARE_API_TOKEN` — internet outage data
