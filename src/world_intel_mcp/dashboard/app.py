@@ -745,9 +745,11 @@ async def api_migration(request):
 # ``error`` is a 503 with the payload intact, a timeout a 504, an exception a
 # 503 with the reason. None of them answers with an empty list that could
 # read as "nothing happened".
+#
+# No Access-Control-Allow-Origin header: the panel fetches from its own
+# origin, so a page from another site cannot read these answers (the
+# collector run log, the cache database path).
 # ---------------------------------------------------------------------------
-
-_CORS = {"Access-Control-Allow-Origin": "*"}
 
 # The budget /api/stream gives its slow sources. The RSS panels read every
 # feed: 5 to 15 s per call measured 2026-10-17, warm cache included, as a
@@ -802,7 +804,7 @@ async def _research_payload(name: str, coro) -> tuple[dict, int]:
 
 
 def _bad_request(exc: ValueError) -> JSONResponse:
-    return JSONResponse({"error": str(exc)}, status_code=400, headers=_CORS)
+    return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def api_liquidity_board(request):
@@ -823,7 +825,7 @@ async def api_liquidity_board(request):
         "liquidity board", liquidity.fetch_liquidity_board(_ensure_fetcher(), sort=sort)
     )
     payload.setdefault("net_liquidity_method", copy.deepcopy(liquidity.NET_LIQUIDITY_METHOD))
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 async def api_situations(request):
@@ -844,7 +846,7 @@ async def api_situations(request):
     payload, status = await _research_payload(
         "situations", news_signals.fetch_situations(_ensure_fetcher(), **kwargs)
     )
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 async def api_top_stories(request):
@@ -863,7 +865,7 @@ async def api_top_stories(request):
     payload, status = await _research_payload(
         "top stories", news_signals.fetch_top_stories(_ensure_fetcher(), **kwargs)
     )
-    return JSONResponse(payload, status_code=status, headers=_CORS)
+    return JSONResponse(payload, status_code=status)
 
 
 def _history_db_path() -> Path:
@@ -880,16 +882,26 @@ def _collector_roster() -> list[str]:
     (level INFO); in this process, where nothing configures the root
     logger, that would attach a stderr handler and start printing a line
     per upstream request. The root logger's handlers and level are put
-    back as they were. Called on the event loop thread, so no other
-    request reconfigures logging in between."""
+    back as they were, on every path: basicConfig can add its handler and
+    then raise (an unknown WORLD_INTEL_LOG_LEVEL). Called on the event loop
+    thread, so no other request reconfigures logging in between. Raises
+    _RosterUnavailable when the collector module cannot be imported."""
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
-    from world_intel_mcp.collector import SOURCES
-
-    for handler in [h for h in root.handlers if h not in handlers]:
-        root.removeHandler(handler)
-    root.setLevel(level)
+    try:
+        from world_intel_mcp.collector import SOURCES
+    except Exception as exc:
+        raise _RosterUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        for handler in [h for h in root.handlers if h not in handlers]:
+            root.removeHandler(handler)
+        root.setLevel(level)
     return [name for name, _, _, _ in SOURCES]
+
+
+class _RosterUnavailable(Exception):
+    """The collector roster could not be read; the history store was not
+    involved."""
 
 
 def _read_collection_health(db_path: Path, roster: list[str], source: str | None) -> dict:
@@ -909,12 +921,17 @@ async def api_collection_health(request):
     (``?source=`` for one source). A store that cannot be opened or read is
     a 503 with the reason and the database path, never a list of zeros; a
     database the collector never wrote reports every source ``never_run``;
-    an unknown source is a 404 naming the known ones."""
+    an unknown source is a 404 naming the known ones; a collector module
+    that cannot be imported is a 503 saying so, not blaming the store."""
     source = request.query_params.get("source") or None
+    try:
+        roster = _collector_roster()
+    except _RosterUnavailable as exc:
+        logger.warning("Collector roster unavailable: %s", exc)
+        return JSONResponse({"error": f"collector roster unavailable: {exc}"}, status_code=503)
     db_path = None
     try:
         db_path = _history_db_path()
-        roster = _collector_roster()
         data = await asyncio.to_thread(_read_collection_health, db_path, roster, source)
     except Exception as exc:
         logger.warning("Collection health unavailable: %s", exc)
@@ -924,9 +941,8 @@ async def api_collection_health(request):
                 "db_path": None if db_path is None else str(db_path),
             },
             status_code=503,
-            headers=_CORS,
         )
-    return JSONResponse(data, status_code=404 if "error" in data else 200, headers=_CORS)
+    return JSONResponse(data, status_code=404 if "error" in data else 200)
 
 
 async def api_health(request):

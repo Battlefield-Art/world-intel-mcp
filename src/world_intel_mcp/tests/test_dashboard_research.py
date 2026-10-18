@@ -16,13 +16,19 @@ http and https, a never-loaded or failed panel showing no figures, the
 liquidity board keeping units and keeping amounts apart from flows, and the
 collection health panel listing problems and its cannot_prove text.
 
+The controller block (``research-panel``) runs the same way against a
+stand-in page: fake elements, a fetch the test answers by hand, a clock it
+sets and the 5 s interval it steps. Those tests pin one state per query, a
+kept copy after a failed refresh, refresh only while open and visible, the
+60 s cadence, no duplicate request, Esc and the age measured to now.
+
 Uses Starlette's TestClient without the context manager so lifespan
 (default-path Cache, vector store) never runs.
 
-Gaps / not covered: the controller half of the page (fetch, tabs, refresh
-timer, Esc) runs only in a browser and is checked by driving the dashboard
-live, not here; the JS tests skip when no JavaScript runtime is on PATH; no
-route is load tested.
+Gaps / not covered: the controller runs under a stand-in page, not a
+browser, so layout, real events and the sanitizer behind safe() are checked
+only by driving the dashboard live; the JS tests skip when no JavaScript
+runtime is on PATH (and fail under CI); no route is load tested.
 """
 
 from __future__ import annotations
@@ -31,15 +37,19 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import types
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -205,7 +215,7 @@ def test_liquidity_board_passes_payload_through_with_the_method_block(client, fe
     calls = _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD)
     r = client.get("/api/liquidity-board")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     # Partial outage (unavailable), stale-cache row and blocked list all stay in the payload.
     assert r.json() == {**_BOARD, "net_liquidity_method": _METHOD}
     assert calls == [(fetcher, {"sort": "biggest_move"})]
@@ -269,7 +279,7 @@ def test_situations_pass_through_with_default_arguments(client, fetcher, monkeyp
     calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
     r = client.get("/api/situations")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     assert r.json() == _SITUATIONS
     assert calls == [(fetcher, {"hours": 24.0, "sort": "covered", "kind": "all", "limit": 20, "min_articles": 2})]
 
@@ -356,6 +366,82 @@ def test_top_stories_arguments_are_parsed_and_validated(client, fetcher, monkeyp
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("route", "func", "query", "kwargs"),
+    [
+        # The page's own 7 d requests, exactly as the controller builds them.
+        ("situations", "fetch_situations", "hours=168&sort=covered&kind=all",
+         {"hours": 168.0, "sort": "covered", "kind": "all", "limit": 20, "min_articles": 2}),
+        ("top-stories", "fetch_top_stories", "hours=168&min_outlets=3",
+         {"hours": 168.0, "min_outlets": 3, "limit": 10, "attention_limit": 10}),
+        ("situations", "fetch_situations", "hours=1&limit=1&min_articles=1",
+         {"hours": 1.0, "sort": "covered", "kind": "all", "limit": 1, "min_articles": 1}),
+        ("situations", "fetch_situations", "hours=168&limit=100&min_articles=1000",
+         {"hours": 168.0, "sort": "covered", "kind": "all", "limit": 100, "min_articles": 1000}),
+        ("top-stories", "fetch_top_stories", "hours=1&min_outlets=1&limit=1&attention_limit=1",
+         {"hours": 1.0, "min_outlets": 1, "limit": 1, "attention_limit": 1}),
+        ("top-stories", "fetch_top_stories", "hours=168&min_outlets=50&limit=50&attention_limit=50",
+         {"hours": 168.0, "min_outlets": 50, "limit": 50, "attention_limit": 50}),
+    ],
+)
+def test_inclusive_edges_are_accepted(client, fetcher, monkeypatch, route, func, query, kwargs) -> None:
+    calls = _stub(monkeypatch, news_signals, func, _SITUATIONS if route == "situations" else _TOP)
+    r = client.get(f"/api/{route}?{query}")
+    assert r.status_code == 200, r.text
+    assert calls == [(fetcher, kwargs)]
+
+
+@pytest.mark.parametrize(
+    ("route", "query", "error"),
+    [
+        ("situations", "limit=101", "limit must be between 1 and 100, got '101'"),
+        ("situations", "min_articles=1001", "min_articles must be between 1 and 1000, got '1001'"),
+        ("situations", "hours=0.99", "hours must be between 1 and 168, got '0.99'"),
+        ("top-stories", "hours=168.01", "hours must be between 1 and 168, got '168.01'"),
+        ("top-stories", "min_outlets=51", "min_outlets must be between 1 and 50, got '51'"),
+        ("top-stories", "limit=0", "limit must be between 1 and 50, got '0'"),
+        ("top-stories", "limit=51", "limit must be between 1 and 50, got '51'"),
+        ("top-stories", "attention_limit=0", "attention_limit must be between 1 and 50, got '0'"),
+    ],
+)
+def test_just_outside_the_edges_is_400(client, fetcher, monkeypatch, route, query, error) -> None:
+    calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    calls += _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    r = client.get(f"/api/{route}?{query}")
+    assert (r.status_code, r.json()) == (400, {"error": error})
+    assert calls == []
+
+
+def _schema(tools, name: str) -> dict:
+    (tool,) = [t for t in tools if t.name == name]
+    return tool.inputSchema["properties"]
+
+
+def test_route_choices_and_defaults_are_the_tool_schemas(client, fetcher, monkeypatch) -> None:
+    """The accepted sorts and kinds, and every default, are those the MCP
+    tool schemas declare. The schemas state no numeric ranges except hours
+    (1 to 168, in its description); the ranges for limit, min_articles,
+    min_outlets and attention_limit are the route's own."""
+    from world_intel_mcp.tools import liquidity as liquidity_tools
+    from world_intel_mcp.tools import news_signals as news_tools
+
+    sit = _schema(news_tools.TOOLS, "intel_situations")
+    top = _schema(news_tools.TOOLS, "intel_top_stories")
+    board = _schema(liquidity_tools.TOOLS, "intel_liquidity_board")
+    assert dashboard_app._SITUATION_SORTS == tuple(sit["sort"]["enum"])
+    assert dashboard_app._SITUATION_KINDS == tuple(sit["kind"]["enum"])
+    assert dashboard_app._LIQUIDITY_SORTS == tuple(board["sort"]["enum"])
+    assert "1 to 168" in sit["hours"]["description"] and "1 to 168" in top["hours"]["description"]
+    sit_calls = _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    top_calls = _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    board_calls = _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD)
+    for path in ("/api/situations", "/api/top-stories", "/api/liquidity-board"):
+        assert client.get(path).status_code == 200, path
+    assert sit_calls[0][1] == {k: v["default"] for k, v in sit.items()}
+    assert top_calls[0][1] == {k: v["default"] for k, v in top.items()}
+    assert board_calls[0][1] == {k: v["default"] for k, v in board.items()}
+
+
 def test_top_stories_outage_exception_and_timeout(client, fetcher, monkeypatch) -> None:
     degraded = {"stories": [], "count": 0, "attention": [], "min_outlets": 3,
                 "error": "RSS feed read failed", "degraded": True, "reason": "rss_unavailable",
@@ -379,6 +465,59 @@ def test_top_stories_empty_result_is_200(client, fetcher, monkeypatch) -> None:
     _stub(monkeypatch, news_signals, "fetch_top_stories", empty)
     r = client.get("/api/top-stories")
     assert (r.status_code, r.json()) == (200, empty)
+
+
+async def _probe_loop(path: str, gaps: list, done: dict) -> httpx.Response:
+    """GET ``path`` on the app in this event loop (no portal thread), while
+    a ticker records the longest stretch the loop could not run it."""
+
+    async def ticker() -> None:
+        last = time.monotonic()
+        while not done:
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    transport = httpx.ASGITransport(app=dashboard_app.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+        tick = asyncio.create_task(ticker())
+        try:
+            return await c.get(path)
+        finally:
+            done["at"] = time.monotonic()
+            await tick
+
+
+async def test_top_stories_clustering_runs_off_the_event_loop_and_under_the_budget(monkeypatch) -> None:
+    """The real fetch_top_stories over a feed read that answered. Clustering
+    is seconds of CPU over a 7 d window; it runs in a worker thread, so the
+    dashboard keeps serving meanwhile, and the route's budget answers 504
+    with its reason instead of waiting for it."""
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    def slow_cluster(rows, similarity_threshold):
+        threads.append(threading.get_ident())
+        time.sleep(0.8)
+        return []
+
+    async def feed(fetcher, **kwargs):
+        return {"items": [], "feeds_ok": 119, "feeds_failed": []}
+
+    monkeypatch.setattr(news, "fetch_news_feed", feed)
+    monkeypatch.setattr(news_signals, "cluster_articles", slow_cluster)
+    monkeypatch.setattr(dashboard_app, "_ensure_fetcher", lambda: object())
+
+    gaps: list[float] = []
+    r = await _probe_loop("/api/top-stories?hours=168", gaps, {})
+    assert r.status_code == 200 and r.json()["stories"] == []
+    assert threads and threads[0] != loop_thread
+    assert max(gaps) < 0.4, max(gaps)  # the 0.8 s of clustering never held the loop
+
+    monkeypatch.setattr(dashboard_app, "_RESEARCH_TIMEOUT_S", 0.2)
+    r = await _probe_loop("/api/top-stories?hours=168", [], {})
+    assert (r.status_code, r.json()) == (504, {"error": "top stories timed out after 0.2 s", "timeout": True})
 
 
 # ---------------------------------------------------------------------------
@@ -420,14 +559,26 @@ def _expected(db_path: Path, source: str | None = None) -> dict:
         store.close()
 
 
+_HISTORY_ENV = (
+    "WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES",
+    "WORLD_INTEL_HISTORY_PAYLOAD_DAYS", "WORLD_INTEL_HISTORY_CAPTURE_DAYS",
+    "WORLD_INTEL_HISTORY_DAYS",
+)
+
+
 @pytest.fixture
-def pinned_history(monkeypatch: pytest.MonkeyPatch) -> None:
+def history_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default cadence and retention, whatever the environment running the
+    tests sets: a short capture retention would otherwise prune the rows
+    _populate writes before the report reads them."""
+    for var in _HISTORY_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture
+def pinned_history(monkeypatch: pytest.MonkeyPatch, history_defaults) -> None:
     """Default cadence and retention, and the clock collection_health reads
     (time.time() when the route calls it) pinned to _CHECK."""
-    for var in ("WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES",
-                "WORLD_INTEL_HISTORY_PAYLOAD_DAYS", "WORLD_INTEL_HISTORY_CAPTURE_DAYS",
-                "WORLD_INTEL_HISTORY_DAYS"):
-        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(history, "time", types.SimpleNamespace(time=lambda: _CHECK))
     monkeypatch.setattr(dashboard_app, "_collector_roster", lambda: list(_ROSTER))
 
@@ -443,7 +594,7 @@ def test_collection_health_reads_the_store_and_returns_the_report_unchanged(clie
     _populate(health_db)
     r = client.get("/api/collection-health")
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     body = r.json()
     assert body == _expected(health_db)
     states = {s["source"]: s["state"] for s in body["sources"]}
@@ -458,6 +609,38 @@ def test_collection_health_reads_the_store_and_returns_the_report_unchanged(clie
     assert by["legacy_feed"]["in_collector_roster"] is False
     assert by["tides"]["attempts"] == 0
     assert body["cannot_prove"] and body["storage"]["db_path"] == str(health_db)
+
+
+async def test_collection_health_opens_reads_and_closes_its_store_in_a_worker_thread(health_db, monkeypatch) -> None:
+    """Each request opens its own store, reads and closes it, all on one
+    thread that is not the event loop's (the test runs on the loop thread)."""
+    _populate(health_db)
+    loop_thread = threading.get_ident()
+    events: list[tuple[str, int]] = []
+
+    class Recording(HistoryStore):
+        def __init__(self, *args, **kwargs) -> None:
+            events.append(("open", threading.get_ident()))
+            super().__init__(*args, **kwargs)
+
+        def collection_health(self, *args, **kwargs):
+            events.append(("read", threading.get_ident()))
+            return super().collection_health(*args, **kwargs)
+
+        def close(self) -> None:
+            events.append(("close", threading.get_ident()))
+            super().close()
+
+    monkeypatch.setattr(dashboard_app, "HistoryStore", Recording)
+    transport = httpx.ASGITransport(app=dashboard_app.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+        for _ in range(2):
+            r = await c.get("/api/collection-health")
+            assert r.status_code == 200
+    assert [e for e, _ in events] == ["open", "read", "close"] * 2
+    assert loop_thread not in {t for _, t in events}
+    for i in (0, 3):  # within one request, one thread
+        assert len({t for _, t in events[i:i + 3]}) == 1
 
 
 def test_collection_health_one_source_and_unknown_source(client, health_db) -> None:
@@ -523,6 +706,32 @@ def test_collection_health_opens_the_dashboard_cache_database(client, tmp_path, 
     assert {s["source"]: s["state"] for s in r.json()["sources"]}["fires"] == "failing"
 
 
+def test_no_research_answer_is_readable_by_another_origin(client, fetcher, monkeypatch, tmp_path, pinned_history) -> None:
+    """The panel fetches from its own origin. No answer of the four routes,
+    success or failure, carries Access-Control-Allow-Origin, so a page from
+    another site cannot read the run log or the cache database path."""
+    _stub(monkeypatch, liquidity, "fetch_liquidity_board", _BOARD_OUTAGE)
+    _stub(monkeypatch, news_signals, "fetch_situations", _SITUATIONS)
+    _stub(monkeypatch, news_signals, "fetch_top_stories", _TOP)
+    db_path = tmp_path / "cache.db"
+    _populate(db_path)
+    monkeypatch.setattr(dashboard_app, "_history_db_path", lambda: db_path)
+    origin = {"Origin": "https://other.example"}
+    answers = {
+        path: client.get(path, headers=origin)
+        for path in (
+            "/api/liquidity-board", "/api/liquidity-board?sort=x", "/api/situations",
+            "/api/top-stories", "/api/collection-health", "/api/collection-health?source=nope",
+        )
+    }
+    assert {p: r.status_code for p, r in answers.items()} == {
+        "/api/liquidity-board": 503, "/api/liquidity-board?sort=x": 400, "/api/situations": 200,
+        "/api/top-stories": 200, "/api/collection-health": 200, "/api/collection-health?source=nope": 404,
+    }
+    leaking = [p for p, r in answers.items() if any(h.startswith("access-control-") for h in r.headers)]
+    assert leaking == []
+
+
 def test_roster_is_the_collector_sources() -> None:
     from world_intel_mcp.collector import SOURCES
 
@@ -547,6 +756,30 @@ def test_reading_the_roster_leaves_root_logging_as_it_was(monkeypatch) -> None:
     assert root.handlers == []
     assert root.level == logging.WARNING
     assert roster == [name for name, _, _, _ in collector.SOURCES]
+
+
+def test_roster_import_failure_restores_logging_and_names_the_roster(client, tmp_path, monkeypatch) -> None:
+    """basicConfig adds its handler, then rejects a lowercase level and the
+    collector import raises. The handler and level are still put back (the
+    next import would otherwise find a handler and succeed with it left
+    attached), and the 503 names the roster, not the history store."""
+    import world_intel_mcp
+    from world_intel_mcp import collector
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    monkeypatch.delitem(sys.modules, "world_intel_mcp.collector")
+    monkeypatch.setattr(world_intel_mcp, "collector", collector)
+    monkeypatch.setenv("WORLD_INTEL_LOG_LEVEL", "debug")
+    monkeypatch.setattr(dashboard_app, "_history_db_path", lambda: tmp_path / "cache.db")
+    for _ in range(2):  # the same answer every time, not a 503 then a 200
+        r = client.get("/api/collection-health")
+        assert (r.status_code, r.json()) == (
+            503, {"error": "collector roster unavailable: ValueError: Unknown level: 'debug'"}
+        )
+        assert root.handlers == []
+        assert root.level == logging.WARNING
 
 
 # ---------------------------------------------------------------------------
@@ -593,11 +826,17 @@ _SCRIPT = "<script>alert(2)</script>"
 
 
 def _js_command() -> list[str]:
+    """node, deno or bun. Without one the page tests skip locally, but fail
+    under CI (the CI variable set), where a skip would pass the run with
+    the renderers and the controller untested."""
     for name, args in (("node", []), ("deno", ["run", "--quiet", "--no-prompt"]), ("bun", ["run"])):
         path = shutil.which(name)
         if path:
             return [path, *args]
-    pytest.skip("no JavaScript runtime (node, deno or bun) on PATH")
+    reason = "no JavaScript runtime (node, deno or bun) on PATH"
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason}; CI must run the page tests")
+    pytest.skip(reason)
 
 
 def _js(tmp_path: Path, calls: list) -> list:
@@ -615,6 +854,96 @@ def _js(tmp_path: Path, calls: list) -> list:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+
+# The controller block (research-panel) runs against this stand-in for the
+# page: elements with the ids and classes it reads, a fetch whose answers the
+# scenario releases by hand, a clock it sets (Date.now) and the 5 s interval
+# it captures and steps. safe() is the identity here; its use is pinned by
+# test_research_markup_is_assigned_through_the_sanitizer.
+_FAKE_PAGE = r"""
+var CLOCK = { t: 1760727848000 };
+Date.now = function() { return CLOCK.t; };
+var RENDERS = [], REQUESTS = [], TICKS = [];
+function el(id, attrs, parent) {
+    var e = { id: id, hidden: false, value: '', attrs: attrs || {}, handlers: {}, cls: {}, parent: parent || null, _html: '' };
+    e.classList = { toggle: function(c, on) { e.cls[c] = on === undefined ? !e.cls[c] : !!on; } };
+    e.addEventListener = function(type, fn) { (e.handlers[type] = e.handlers[type] || []).push(fn); };
+    e.getAttribute = function(n) { return n in e.attrs ? e.attrs[n] : null; };
+    e.closest = function() { return e.parent; };
+    e.tagName = attrs && attrs.tag || 'DIV';
+    e.fire = function(type, ev) { (e.handlers[type] || []).forEach(function(fn) { fn(ev || { target: e, key: '' }); }); };
+    Object.defineProperty(e, 'innerHTML', { get: function() { return e._html; }, set: function(v) { e._html = v; RENDERS.push(v); } });
+    return e;
+}
+var CTL = {
+    liquidity: el('ctl-liq', { 'data-rs-for': 'liquidity' }),
+    situations: el('ctl-sit', { 'data-rs-for': 'situations' }),
+    stories: el('ctl-top', { 'data-rs-for': 'stories' })
+};
+var E = {
+    researchPanel: el('researchPanel'), researchToggle: el('researchToggle'), rsClose: el('rsClose'),
+    rsRefresh: el('rsRefresh'), rsBody: el('rsBody'),
+    rsLiqSort: el('rsLiqSort', { tag: 'SELECT' }, CTL.liquidity), rsSitHours: el('rsSitHours', { tag: 'SELECT' }, CTL.situations),
+    rsSitSort: el('rsSitSort', { tag: 'SELECT' }, CTL.situations), rsSitKind: el('rsSitKind', { tag: 'SELECT' }, CTL.situations),
+    rsTopHours: el('rsTopHours', { tag: 'SELECT' }, CTL.stories), rsTopOutlets: el('rsTopOutlets', { tag: 'SELECT' }, CTL.stories)
+};
+E.researchPanel.hidden = true;
+E.rsLiqSort.value = 'biggest_move'; E.rsSitHours.value = '24'; E.rsSitSort.value = 'covered'; E.rsSitKind.value = 'all';
+E.rsTopHours.value = '24'; E.rsTopOutlets.value = '3';
+var TABS = ['liquidity', 'situations', 'stories', 'health'].map(function(n) { return el('tab-' + n, { 'data-rs-tab': n }); });
+var SELECTS = ['rsLiqSort', 'rsSitHours', 'rsSitSort', 'rsSitKind', 'rsTopHours', 'rsTopOutlets'].map(function(k) { return E[k]; });
+globalThis.$ = function(sel) { return E[sel.replace('#', '')]; };
+globalThis.$$ = function(sel) {
+    if (sel === '.rs-tab') return TABS;
+    if (sel === '.rs-ctl') return [CTL.liquidity, CTL.situations, CTL.stories];
+    if (sel === '.rs-ctl select') return SELECTS;
+    throw new Error('unexpected selector ' + sel);
+};
+var DOC = el('document');
+DOC.hidden = false;
+globalThis.document = DOC;
+globalThis.safe = function(h) { return h; };
+globalThis._helpOverlay = null;
+globalThis.setInterval = function(fn, ms) { TICKS.push({ fn: fn, ms: ms }); return TICKS.length; };
+globalThis.fetch = function(url) {
+    return new Promise(function(resolve, reject) { REQUESTS.push({ url: url, at: CLOCK.t, resolve: resolve, reject: reject }); });
+};
+async function settle() { for (var i = 0; i < 5; i++) await new Promise(function(r) { setTimeout(r, 0); }); }
+async function answer(i, status, body) {
+    REQUESTS[i].resolve({ status: status, text: function() { return Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)); } });
+    await settle();
+}
+async function fail(i, message) { REQUESTS[i].reject(new Error(message)); await settle(); }
+async function advance(ms) {  // the clock moves in 5 s steps; each step runs the captured interval
+    for (var t = 0; t < ms; t += 5000) { CLOCK.t += 5000; TICKS.forEach(function(k) { k.fn(); }); await settle(); }
+}
+function body() { return E.rsBody.innerHTML; }
+function urls() { return REQUESTS.map(function(r) { return r.url; }); }
+var OUT = {};
+"""
+
+
+def _controller(tmp_path: Path, scenario: str, payloads: dict) -> dict:
+    """Run the render and controller blocks of index.html against the fake
+    page, then ``scenario`` (top-level await allowed); returns OUT."""
+    src = _INDEX.read_text()
+    script = tmp_path / "research_controller.mjs"
+    script.write_text(
+        _FAKE_PAGE
+        + "var P = " + json.dumps(payloads) + ";\n"
+        + _section(src, "research-render") + "\n"
+        + _section(src, "research-panel") + "\n"
+        + "try {\n" + scenario + "\n} catch (e) { OUT.scenario_error = String(e && e.stack || e); }\n"
+        + "console.log(JSON.stringify(OUT));\n"
+    )
+    proc = subprocess.run(
+        [*_js_command(), str(script)], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert "scenario_error" not in out, out["scenario_error"]
+    return out
 
 
 def _norm(text: str) -> str:
@@ -674,6 +1003,14 @@ def _poison(value, mark: str):
     return value
 
 
+@pytest.mark.parametrize(("ci", "outcome"), [("true", pytest.fail.Exception), ("", pytest.skip.Exception)])
+def test_missing_runtime_fails_under_ci_and_skips_locally(monkeypatch, ci, outcome) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setenv("CI", ci)
+    with pytest.raises(outcome, match="no JavaScript runtime"):
+        _js_command()
+
+
 def test_escape_helper_and_link_filter(tmp_path) -> None:
     out = _js(tmp_path, [
         ["rEsc", "<a href=\"x\">'&"],
@@ -719,7 +1056,7 @@ def test_headline_markup_renders_as_text_not_markup(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("panel", ["liquidity", "situations", "stories", "health"])
-def test_every_payload_string_is_escaped(tmp_path, panel) -> None:
+def test_every_payload_string_is_escaped(tmp_path, panel, history_defaults) -> None:
     payload = {
         "liquidity": {**_BOARD, "net_liquidity_method": _METHOD},
         "situations": _SITUATIONS,
@@ -738,6 +1075,42 @@ def test_every_payload_string_is_escaped(tmp_path, panel) -> None:
     for html in (html_ok, html_failed):
         m = _assert_inert(html)
         assert mark in m.text  # shown, as text
+
+
+def test_branch_picking_fields_left_clean_still_escape_their_text(tmp_path, history_defaults) -> None:
+    """The poisoned payloads above spoil the fields that pick a branch (a
+    link, a state, a key), so three paths need their own case: text inside
+    a kept https link, a never_run source's tag, and a method component key."""
+    link = "https://news.example/1"
+    top = copy.deepcopy(_TOP)
+    top["stories"][0]["items"][0].update(title=_HOSTILE, link=link)
+    sit = copy.deepcopy(_SITUATIONS)
+    sit["situations"][0]["sample_headlines"][0].update(title=_HOSTILE, link=link)
+    db = tmp_path / "fresh.db"
+    health = _expected(db)
+    for s in health["sources"]:
+        s["source"] = _SCRIPT + s["source"]
+    method = copy.deepcopy(_METHOD)
+    method["components"] = {_HOSTILE: next(iter(_METHOD["components"].values()))}
+    html_top, html_sit, html_health, html_liq = _js(tmp_path, [
+        ["renderResearch", "stories", _loaded(top)],
+        ["renderResearch", "situations", _loaded(sit)],
+        ["renderResearch", "health", _loaded(health)],
+        ["renderResearch", "liquidity", _loaded({**_BOARD, "net_liquidity_method": method})],
+    ])
+    for html in (html_top, html_sit):
+        m = _assert_inert(html)
+        assert m.hrefs == [link]  # the link was kept
+        assert f'data-external="1">&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</a>' in html
+    m = _assert_inert(html_health)
+    assert {s["state"] for s in health["sources"]} == {"never_run"}
+    assert "&lt;script&gt;alert(2)&lt;/script&gt;tides" in html_health and _SCRIPT + "tides" in m.text
+    m = _assert_inert(html_liq)
+    assert "<td>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</td>" in html_liq and _HOSTILE in m.text
+
+
+def test_route_budget_is_90_s() -> None:
+    assert dashboard_app._RESEARCH_TIMEOUT_S == 90.0
 
 
 def test_panel_that_never_loaded_says_so(tmp_path) -> None:
@@ -781,6 +1154,175 @@ def test_failed_refresh_keeps_the_earlier_copy_and_says_how_old(tmp_path) -> Non
     assert "REFRESH FAILED HTTP 504: situations timed out after 90 s" in m.text
     assert f"Showing the copy loaded {_CLOCK}, 60 s before that attempt." in m.text
     assert "Israel and Iran trade warnings" in m.text
+
+
+def test_kept_copy_age_is_measured_to_now(tmp_path) -> None:
+    """Reopened an hour after a failed refresh: the banner states how old
+    the copy is now, not only how old it was at the failed attempt; an
+    old loaded copy says how long ago it loaded."""
+    st = {
+        "lastAttempt": {"at": _T_MS + 61_000, "http": 503, "data": {"error": "boom"}, "error": "boom"},
+        "lastGood": {"at": _T_MS, "http": 200, "data": _SITUATIONS, "error": None},
+    }
+    hour_later = _T_MS + 3_720_000
+    failed_now, old_loaded, fresh_loaded = _js(tmp_path, [
+        ["renderResearch", "situations", st, hour_later],
+        ["renderResearch", "situations", _loaded(_SITUATIONS), hour_later],
+        ["renderResearch", "situations", _loaded(_SITUATIONS), _T_MS + 30_000],
+    ])
+    text = _Markup(failed_now).text
+    assert f"Showing the copy loaded {_CLOCK}, 61 s before that attempt. That copy is 62 min old now." in text
+    assert f"Loaded {_CLOCK}, 62 min ago; refreshes every 60 s" in _Markup(old_loaded).text
+    assert f"Loaded {_CLOCK}; refreshes every 60 s" in _Markup(fresh_loaded).text
+
+
+_LIQ = "/api/liquidity-board?sort="
+
+
+def _liquidity_payloads() -> dict:
+    old = copy.deepcopy(_BOARD)
+    old["indicators"][0]["label"] = "Answer to the old query"
+    return {"board": _BOARD, "old": old}
+
+
+def test_controller_one_state_per_query_drops_the_late_answer(tmp_path) -> None:
+    """A control changed while a request is out sends the new query at once;
+    the old query's answer, arriving late, is never shown for the new one."""
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        E.rsLiqSort.value = 'newest';
+        E.rsLiqSort.fire('change');
+        OUT.urls = urls();
+        await answer(0, 200, P.old);
+        OUT.after_old = body();
+        await answer(1, 200, P.board);
+        OUT.after_new = body();
+    """, _liquidity_payloads())
+    assert out["urls"] == [_LIQ + "biggest_move", _LIQ + "newest"]
+    assert "Answer to the old query" not in out["after_old"]
+    assert "Loading: first request sent" in out["after_old"]
+    assert "Fed total assets" in out["after_new"]
+    assert "Answer to the old query" not in out["after_new"]
+
+
+def test_controller_refreshes_every_60_s_only_while_open_and_visible(tmp_path) -> None:
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await answer(0, 200, P.board);
+        OUT.interval_ms = TICKS.map(function(k) { return k.ms; });
+        await advance(55000);
+        OUT.at_55 = REQUESTS.length;
+        await advance(5000);
+        OUT.at_60 = REQUESTS.length;
+        OUT.second_after_ms = REQUESTS[1].at - REQUESTS[0].at;
+        E.rsRefresh.fire('click');
+        OUT.refresh_while_in_flight = REQUESTS.length;
+        await answer(1, 200, P.board);
+        document.hidden = true;
+        await advance(180000);
+        OUT.while_hidden = REQUESTS.length;
+        document.hidden = false;
+        await advance(5000);
+        OUT.visible_again = REQUESTS.length;
+        await answer(2, 200, P.board);
+        E.rsClose.fire('click');
+        OUT.closed = E.researchPanel.hidden;
+        await advance(180000);
+        OUT.while_closed = REQUESTS.length;
+    """, _liquidity_payloads())
+    assert out["interval_ms"] == [5000]
+    assert out["at_55"] == 1
+    assert out["at_60"] == 2
+    assert out["second_after_ms"] == 60_000
+    assert out["refresh_while_in_flight"] == 2  # no duplicate request
+    assert out["while_hidden"] == 2
+    assert out["visible_again"] == 3
+    assert out["closed"] is True
+    assert out["while_closed"] == 3
+
+
+def test_controller_failed_refresh_keeps_the_copy_and_first_failure_is_unavailable(tmp_path) -> None:
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await fail(0, 'offline');
+        OUT.first_failed = body();
+        E.rsRefresh.fire('click');
+        await answer(1, 200, P.board);
+        OUT.loaded = body();
+        await advance(60000);
+        await answer(2, 503, { error: 'FRED down' });
+        OUT.refresh_failed = body();
+    """, _liquidity_payloads())
+    first = _Markup(out["first_failed"]).text
+    assert "UNAVAILABLE request failed: Error: offline" in first
+    assert "Fed total assets" not in first
+    assert "Fed total assets" in out["loaded"]
+    kept = _Markup(out["refresh_failed"]).text
+    assert "REFRESH FAILED HTTP 503: FRED down" in kept
+    assert "Fed total assets" in kept  # the earlier good copy, still shown
+    assert "That copy is 60 s old now." in kept
+
+
+def test_controller_passes_now_and_esc_closes_the_panel(tmp_path) -> None:
+    """Reopened five minutes after the last load, the panel says how long
+    ago that copy loaded before the refresh answers; Esc closes it."""
+    out = _controller(tmp_path, """
+        E.researchToggle.fire('click');
+        await answer(0, 200, P.board);
+        document.fire('keydown', { key: 'Escape', target: document });
+        OUT.closed_by_esc = E.researchPanel.hidden;
+        CLOCK.t += 300000;
+        E.researchToggle.fire('click');
+        OUT.reopened = RENDERS[RENDERS.length - 2];
+        OUT.requests = REQUESTS.length;
+    """, _liquidity_payloads())
+    assert out["closed_by_esc"] is True
+    assert "Loaded " in out["reopened"] and ", 5 min ago; refreshes every 60 s" in out["reopened"]
+    assert out["requests"] == 2
+
+
+def test_attempt_error_table(tmp_path) -> None:
+    cases = [
+        (200, {"count": 0}, None),
+        (503, {"error": "x"}, "x"),
+        (200, {"error": {"a": 1}}, '{"a":1}'),
+        (500, {"detail": "x"}, "no error message in the response"),
+        (502, None, "response was not JSON"),
+        (200, [], "response was not JSON"),
+        (None, None, "no response"),
+    ]
+    out = _js(tmp_path, [["researchAttemptError", http, data] for http, data, _ in cases])
+    assert out == [expected for _, _, expected in cases]
+
+
+def test_no_comparable_feed_reads_as_not_measurable_never_as_no_growth(tmp_path) -> None:
+    """7 d window: the prior window starts 14 d back and no feed keeps that
+    much history, so feeds_comparable is 0 and the function reports change 0
+    and no attention. The panels say change cannot be measured."""
+    coverage = {**_COVERAGE, "feeds_comparable": 0, "items_current_window_comparable": 0}
+    window = {"hours": 168.0, "current": {"start": "2026-10-10T19:04:08Z", "end": "2026-10-17T19:04:08Z"},
+              "prior": {"start": "2026-10-03T19:04:08Z", "end": "2026-10-10T19:04:08Z"}}
+    sit = copy.deepcopy(_SITUATIONS)
+    sit.update(coverage=coverage, window=window, sort="change")
+    sit["situations"][0].update(current_comparable=0, prior=0, change=0, change_ratio=1.0)
+    top = {**_TOP, "attention": [], "coverage": coverage, "window": window}
+    html_sit, html_top, html_sit_ok = _js(tmp_path, [
+        ["renderResearch", "situations", _loaded(sit)],
+        ["renderResearch", "stories", _loaded(top)],
+        ["renderResearch", "situations", _loaded(_SITUATIONS)],
+    ])
+    s = _assert_inert(html_sit).text
+    assert ("Change against the prior window cannot be measured over this window: no feed keeps history back to "
+            "2026-10-03T19:04:08Z, so no feed is comparable. This is not a finding that nothing changed.") in s
+    assert "Sorted by change, but no change is measurable, so the order is by article count." in s
+    assert "change not measurable (no comparable feed)" in s
+    assert "(change 0" not in s and "ratio 1" not in s
+    t = _assert_inert(html_top).text
+    assert "Growth in mentions cannot be measured over this window" in t
+    assert "grew against the prior window;" not in t and "No named country" not in t
+    ok = _Markup(html_sit_ok).text  # comparable feeds: change shown as measured
+    assert "comparable feeds 9 now vs 4 prior (change +5, ratio 2)" in ok
+    assert "cannot be measured" not in ok
 
 
 def test_empty_result_states_its_threshold_and_coverage(tmp_path) -> None:
@@ -837,9 +1379,7 @@ def test_liquidity_total_outage_shows_reasons_and_no_board(tmp_path) -> None:
     assert "Amounts outstanding" not in m.text and "no indicator rows" not in m.text
 
 
-def test_collection_health_lists_problems_and_cannot_prove(tmp_path, monkeypatch) -> None:
-    for var in ("WORLD_INTEL_HISTORY_CADENCE_S", "WORLD_INTEL_HISTORY_CADENCES"):
-        monkeypatch.delenv(var, raising=False)
+def test_collection_health_lists_problems_and_cannot_prove(tmp_path, history_defaults) -> None:
     db = tmp_path / "h.db"
     _populate(db)
     report = _expected(db)
@@ -861,6 +1401,7 @@ def test_collection_health_lists_problems_and_cannot_prove(tmp_path, monkeypatch
     assert text.index("failing (1)") < text.index("HTTP 503 from FIRMS") < text.index("ok (2)")
     assert "OVERDUE" in text and "not attempted recently (1)" in text
     assert "never run (1)" in text and "tides" in text
+    assert text.index("never run (1)") < text.index("ok (2)")  # never_run is a problem, listed before ok
     assert "not in roster" in text  # legacy_feed: logged, but no longer collected
     assert "No collector capture is recorded" not in text
     never_text = _Markup(html_never).text

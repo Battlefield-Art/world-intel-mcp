@@ -3819,6 +3819,19 @@ function rCoverage(d) {
 function rFailedNews(d) {
     return (d.reason ? '<div class="rs-note">Reason: ' + rEsc(d.reason) + '</div>' : '') + rCoverage(d) + rGaps(d);
 }
+// Change is counted only over feeds whose history reaches back to the
+// prior window's start. With none (common for 7 d: the prior window starts
+// 14 d back), change cannot be measured, which is not a change of zero.
+function rNoComparable(d) {
+    var c = d.coverage && typeof d.coverage === 'object' ? d.coverage : null;
+    return !!c && c.feeds_comparable === 0;
+}
+function rNoComparableBanner(d, what) {
+    var win = d.window && typeof d.window === 'object' ? d.window : {};
+    var prior = win.prior && typeof win.prior === 'object' ? win.prior : {};
+    return '<div class="rs-banner warn">' + what + ' cannot be measured over this window: no feed keeps history back to ' +
+        rEsc(prior.start || 'the start of the prior window') + ', so no feed is comparable. This is not a finding that nothing changed.</div>';
+}
 function rHeadline(item) {
     item = item || {};
     var meta = [item.outlet, item.published].concat(rArr(item.hostility).length ? ['hostility: ' + rArr(item.hostility).join(', ')] : []);
@@ -3827,7 +3840,12 @@ function rHeadline(item) {
 function renderSituations(d, failed) {
     if (failed) return rFailedNews(d);
     var list = rArr(d.situations);
+    var noComp = rNoComparable(d);
     var h = rCoverage(d);
+    if (noComp) {
+        h += rNoComparableBanner(d, 'Change against the prior window') +
+            (d.sort === 'change' ? '<div class="rs-note">Sorted by change, but no change is measurable, so the order is by article count.</div>' : '');
+    }
     if (!list.length) {
         h += '<div class="rs-banner info">No situation' + (d.kind && d.kind !== 'all' ? ' (' + rEsc(d.kind) + ')' : '') + ' reached ' +
             rNum(d.min_articles, 0) + ' articles in this window, over the coverage stated above.</div>';
@@ -3841,8 +3859,9 @@ function renderSituations(d, failed) {
             '<span class="rs-badge">' + rEsc(s.kind) + '</span></div>' +
             '<div class="dim">' + rPlural(s.articles, 'article') + ' from ' + rPlural(s.outlet_count, 'outlet') + '; hostile ' + rNum(s.hostile_articles, 0) +
             (typeof s.hostile_share === 'number' ? ' (' + rNum(s.hostile_share * 100, 0) + '%)' : '') + (catText ? ': ' + rEsc(catText) : '') +
-            '; comparable feeds ' + rNum(s.current_comparable, 0) + ' now vs ' + rNum(s.prior, 0) + ' prior (change ' + rSigned(s.change, 0) +
-            ', ratio ' + rNum(s.change_ratio, 3) + ')</div>' +
+            (noComp ? '; change not measurable (no comparable feed)' :
+                '; comparable feeds ' + rNum(s.current_comparable, 0) + ' now vs ' + rNum(s.prior, 0) + ' prior (change ' + rSigned(s.change, 0) +
+                ', ratio ' + rNum(s.change_ratio, 3) + ')') + '</div>' +
             '<div class="rs-list">' + rArr(s.sample_headlines).map(rHeadline).join('') + '</div></div>';
     });
     return h + rNotes(d);
@@ -3863,7 +3882,9 @@ function renderTopStories(d, failed) {
             '<div class="rs-list">' + rArr(s.items).map(rHeadline).join('') + '</div></div>';
     });
     h += '<div class="sub">Attention: named entities that grew against the prior window</div>';
-    if (!att.length) {
+    if (rNoComparable(d)) {
+        h += rNoComparableBanner(d, 'Growth in mentions');
+    } else if (!att.length) {
         h += '<div class="rs-banner info">No named country or organization grew against the prior window; only growth is listed.</div>';
     } else {
         h += '<table class="dtable"><thead><tr><th>Entity</th><th>Type</th><th>Now</th><th>Prior</th><th>Change</th><th>Ratio</th></tr></thead><tbody>' +
@@ -3951,8 +3972,9 @@ function rMarked(d) {
 // A panel never shows figures it has not received: before the first answer
 // it says so, a failure with no earlier copy shows the reason and the
 // payload's diagnostics only, and a failed refresh keeps the earlier copy
-// under a banner naming the failure and when that copy was loaded.
-function renderResearch(name, st) {
+// under a banner naming the failure and when that copy was loaded. now
+// (ms) is the render time: a kept copy's age is stated against it.
+function renderResearch(name, st, now) {
     var render = RESEARCH_RENDERERS[name];
     if (!render) return '<div class="rs-banner err">Unknown panel: ' + rEsc(name) + '</div>';
     if (!st || (!st.lastAttempt && !st.inFlight)) {
@@ -3969,10 +3991,14 @@ function renderResearch(name, st) {
             '<br><span class="dim">Attempted ' + rClock(a.at) + '. Nothing has loaded for this query, so no figures are shown.</span></div>' +
             (st.inFlight ? '<div class="rs-note">Retrying: request sent ' + rClock(st.requestedAt) + '.</div>' : '') + render(diag, true);
     }
+    var hasNow = typeof now === 'number' && isFinite(now);
     var head = a.error
         ? '<div class="rs-banner warn"><span class="rs-badge warn">REFRESH FAILED</span> ' + rEsc(status + a.error) + ' (' + rClock(a.at) + ').<br>' +
-            'Showing the copy loaded ' + rClock(g.at) + ', ' + rAge((a.at - g.at) / 1000) + ' before that attempt.</div>'
-        : '<div class="rs-note">Loaded ' + rClock(g.at) + '; refreshes every ' + RESEARCH_REFRESH_MS / 1000 + ' s while this panel is open.</div>';
+            'Showing the copy loaded ' + rClock(g.at) + ', ' + rAge((a.at - g.at) / 1000) + ' before that attempt.' +
+            (hasNow ? ' That copy is ' + rAge((now - g.at) / 1000) + ' old now.' : '') + '</div>'
+        : '<div class="rs-note">Loaded ' + rClock(g.at) +
+            (hasNow && now - g.at > 2 * RESEARCH_REFRESH_MS ? ', ' + rAge((now - g.at) / 1000) + ' ago' : '') +
+            '; refreshes every ' + RESEARCH_REFRESH_MS / 1000 + ' s while this panel is open.</div>';
     if (st.inFlight) head += '<div class="rs-note">Refreshing: request sent ' + rClock(st.requestedAt) + '.</div>';
     return head + rMarked(g.data) + render(g.data, false);
 }
@@ -4000,7 +4026,7 @@ function researchRender() {
     var name = researchActive, html;
     $$('.rs-tab').forEach(function(b) { b.classList.toggle('active', b.getAttribute('data-rs-tab') === name); });
     $$('.rs-ctl').forEach(function(c) { c.classList.toggle('on', c.getAttribute('data-rs-for') === name); });
-    try { html = renderResearch(name, researchState[name]); }
+    try { html = renderResearch(name, researchState[name], Date.now()); }
     catch (e) {
         console.error('research panel render failed:', e);
         html = '<div class="rs-banner err">This panel failed to render: ' + rEsc(String(e)) + '</div>';

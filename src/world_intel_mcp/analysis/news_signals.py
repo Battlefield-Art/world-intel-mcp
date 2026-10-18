@@ -1027,8 +1027,9 @@ async def fetch_top_stories(
 
     win = _Windows(feed, hours, now)
     rows = win.current
-    # Pairwise Jaccard is quadratic in titles: off the event loop the
-    # collector and the MCP server share.
+    # Clustering compares headline pairs: seconds of CPU over a 7 d window.
+    # In a worker thread it leaves the caller's event loop serving other
+    # requests, and a caller's timeout can fire while it runs.
     raw = await asyncio.to_thread(cluster_articles, rows, similarity_threshold=threshold)
 
     stories = []

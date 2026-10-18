@@ -19,8 +19,15 @@
   failed first load shows UNAVAILABLE with the reason and the payload's
   diagnostics (unavailable indicators, blocked sources, data gaps), and a
   failed refresh keeps the earlier copy under a REFRESH FAILED banner with
-  the time it loaded. An answer to a query the controls have since changed
-  is dropped.
+  the time it loaded and its age now. An answer to a query the controls
+  have since changed is dropped.
+- Top stories cluster headlines in a worker thread, so a 7 d window does
+  not stall the dashboard and the 90 s budget can answer 504 with its
+  reason. When no feed keeps history back to the prior window, the
+  situations and top stories panels say change cannot be measured, not
+  that nothing changed.
+- The four routes send no `Access-Control-Allow-Origin` header, so another
+  site cannot read their answers.
 - Liquidity rows keep the units each row states and are grouped by
   measure, amounts outstanding apart from flows. Collection health lists
   failing, degraded, not-attempted-recently and never-run sources and shows
@@ -30,8 +37,10 @@
   assignment; only http and https links are kept.
 - Reading the collector roster imports the collector module, whose
   `logging.basicConfig` would attach a root handler in the dashboard
-  process; the root logger is put back as it was, so the first
-  collection-health request does not start printing every upstream request.
+  process; the root logger is put back as it was on every path, so the
+  first collection-health request does not start printing every upstream
+  request. A collector module that cannot be imported is a 503 reading
+  "collector roster unavailable: <reason>".
 
 ### Fixed: development runs no longer touch user databases
 - Temporal and keyword spike databases now follow `XDG_CACHE_HOME` like
