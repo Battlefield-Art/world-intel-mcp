@@ -32,6 +32,7 @@ import math
 import random
 import struct
 import threading
+import tracemalloc
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1615,6 +1616,61 @@ def test_cone_kmz_member_larger_than_it_declares_is_refused() -> None:
     struct.pack_into("<I", raw, central + 24, 1000)  # central directory entry
     with pytest.raises(zipfile.BadZipFile, match="CRC"):
         cf.parse_nhc_cone_kmz(bytes(raw))
+
+
+def _understated_kmz(real_bytes: int, declared_bytes: int) -> bytes:
+    """One deflated member of ``real_bytes`` spaces whose local and central
+    headers declare ``declared_bytes`` (the CRC stays the real one)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("ep212026_017adv_CONE.kml")
+        info.compress_type = zipfile.ZIP_DEFLATED
+        chunk = b" " * (1024 * 1024)
+        with zf.open(info, "w") as member:
+            for _ in range(real_bytes // len(chunk)):
+                member.write(chunk)
+    raw = bytearray(buf.getvalue())
+    struct.pack_into("<I", raw, 22, declared_bytes)  # local file header: uncompressed size
+    central = raw.rfind(b"PK\x01\x02")
+    struct.pack_into("<I", raw, central + 24, declared_bytes)  # central directory entry
+    return bytes(raw)
+
+
+def test_cone_kml_read_stays_bounded_when_the_member_understates_its_size() -> None:
+    """32 MiB of KML declared as 1 MiB passes the size and ratio checks, so
+    only the bounded read keeps the member from being decompressed whole.
+    Peak traced allocation, measured with tracemalloc on Python 3.11.11,
+    3.12.7 and 3.13.11 (2026-10-17): 16.1 MiB as written, 77.4 MiB when
+    the member is read unbounded (``handle.read()``)."""
+    kmz = _understated_kmz(32 * 1024 * 1024, 1024 * 1024)
+    started = not tracemalloc.is_tracing()
+    if started:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        with pytest.raises(zipfile.BadZipFile, match="CRC"):
+            cf.parse_nhc_cone_kmz(kmz)
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        if started:
+            tracemalloc.stop()
+    assert peak < 3 * cf._KML_MAX_BYTES
+
+
+def test_cone_kml_past_the_cap_is_refused_even_if_the_zip_layer_returns_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The length check after the read is the second line behind the
+    declared-size check: CPython's zipfile never returns more than a member
+    declares (see the CRC test above), so this stands in a zip layer that
+    does, handing back the live cone's KML followed by 8 MiB of trailing
+    whitespace. Without the check that document parses as an ok cone."""
+    kmz = _cone_kmz()
+    kml = _fixture("nhc_ep212026_017adv_CONE.kml").encode() + b" " * cf._KML_MAX_BYTES
+    monkeypatch.setattr(zipfile.ZipFile, "open", lambda self, *args, **kwargs: io.BytesIO(kml))
+    with pytest.raises(ValueError, match="KML exceeds cap"):
+        cf.parse_nhc_cone_kmz(kmz)
 
 
 @pytest.mark.parametrize(
