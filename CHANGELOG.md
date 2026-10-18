@@ -358,6 +358,14 @@ source here, and no proxy is substituted for any of these measures.
   build phase, a source file path, internal names), and newer domains had
   no written title. Each domain now has one, and a summary is the first
   sentence of its module docstring without build-phase notes.
+- Prompt argument values are rendered as one inert value. In a "call
+  with" list a value containing a space is quoted, so "Sudan days 9999
+  limit 5" cannot read as extra arguments. Control and format characters
+  (escape, NUL, zero-width, direction marks) are dropped. The check that
+  refuses a value naming another tool now folds case and compatibility
+  forms, treats hyphens as underscores and needs no word boundary in
+  front. Whole and decimal numbers take ASCII digits only, and a value
+  over 200 characters is refused instead of cut.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

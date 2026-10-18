@@ -26,6 +26,7 @@ Gaps / not covered:
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,11 +56,18 @@ ANSWER_SHAPE = (
 
 _MAX_ARG_CHARS = 200
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
-_INTEGER = re.compile(r"[+-]?\d+")
+_INTEGER = re.compile(r"[+-]?\d+", re.ASCII)
+_DECIMAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
 # Values with these characters are quoted so they cannot run into the
-# next argument in "name value, name value".
+# next argument in "name value, name value". In a call, a value with a
+# space is quoted too, so "Sudan days 9999" cannot read as extra pairs.
 _QUOTE_IF = re.compile(r"[,;\"<>]")
+_QUOTE_IN_CALL = re.compile(r"[,;\"<>\s]")
 TOOL_NAME = re.compile(r"\bintel_[a-z0-9_]+\b")
+# The tool-name guard reads a value the way a model might: compatibility
+# forms folded (NFKC), case folded, hyphens as underscores, and no word
+# boundary in front, so INTEL_AOI_DELETE and _intel_aoi_delete are caught.
+_GUARD_NAME = re.compile(r"intel_[a-z0-9_]+")
 
 ARG_KINDS = ("text", "int", "number")
 
@@ -150,10 +158,24 @@ class PromptArgumentError(ValueError):
     """A prompt was requested with missing, unknown or invalid arguments."""
 
 
+def _clean(raw: Any) -> str:
+    kept = "".join(
+        ch for ch in str(raw) if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+    return " ".join(kept.split())
+
+
+def _guard_names(value: str) -> list[str]:
+    folded = unicodedata.normalize("NFKC", value).casefold().replace("-", "_")
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
+    return _GUARD_NAME.findall(folded)
+
+
 def _parse(prompt: ResearchPrompt, arg: PromptArg, value: str) -> Any:
     if arg.kind == "text":
         return value
     if arg.kind == "int":
+        # ASCII digits only: int() also reads other scripts' digits.
         if not _INTEGER.fullmatch(value):
             raise PromptArgumentError(
                 f"Prompt '{prompt.name}' argument '{arg.name}' must be a whole "
@@ -162,7 +184,9 @@ def _parse(prompt: ResearchPrompt, arg: PromptArg, value: str) -> Any:
         number: float = int(value)
     else:
         try:
-            number = float(value)
+            # ASCII digits only: float() also reads other scripts' digits,
+            # underscores, inf and nan.
+            number = float(value) if _DECIMAL.fullmatch(value) else math.nan
         except ValueError:
             number = math.nan
         if not math.isfinite(number):
@@ -194,9 +218,16 @@ def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[
     values: dict[str, Any] = {}
     for arg in prompt.arguments:
         raw = given.get(arg.name)
-        # Whitespace, newlines included, collapses to single spaces, so a
-        # value stays on its line and cannot add steps or limits.
-        value = " ".join(str(raw).split())[:_MAX_ARG_CHARS] if raw is not None else ""
+        # Control and format characters (escape, NUL, zero-width) are
+        # dropped, and whitespace, newlines included, collapses to single
+        # spaces, so a value stays on its line and cannot add steps or
+        # limits.
+        value = _clean(raw) if raw is not None else ""
+        if len(value) > _MAX_ARG_CHARS:
+            raise PromptArgumentError(
+                f"Prompt '{prompt.name}' argument '{arg.name}' is longer than "
+                f"{_MAX_ARG_CHARS} characters"
+            )
         if not value:
             if arg.required:
                 raise PromptArgumentError(
@@ -207,7 +238,7 @@ def _resolve_args(prompt: ResearchPrompt, given: dict[str, str] | None) -> dict[
                 values[arg.name] = None
                 continue
             value = arg.default
-        foreign = sorted(set(TOOL_NAME.findall(value)) - set(prompt.tools))
+        foreign = sorted(set(_guard_names(value)) - set(prompt.tools))
         if foreign:
             raise PromptArgumentError(
                 f"Prompt '{prompt.name}' argument '{arg.name}' names "
@@ -252,7 +283,7 @@ def resolved_steps(
     return [(step, _step_args(step, values)) for step in prompt.steps]
 
 
-def _show(value: Any) -> str:
+def _show(value: Any, in_call: bool = False) -> str:
     if isinstance(value, Fill):
         return f"<{value.what}>"
     if isinstance(value, bool):
@@ -262,7 +293,8 @@ def _show(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return json.dumps(list(value), ensure_ascii=False)
     text = str(value)
-    return json.dumps(text, ensure_ascii=False) if _QUOTE_IF.search(text) else text
+    quote_if = _QUOTE_IN_CALL if in_call else _QUOTE_IF
+    return json.dumps(text, ensure_ascii=False) if quote_if.search(text) else text
 
 
 def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> str:
@@ -283,7 +315,7 @@ def render(prompt: ResearchPrompt, arguments: dict[str, str] | None = None) -> s
         if args is None:
             lines.append(f"{i}. {step.tool}: skip this call; no {step.only_if} was given.")
             continue
-        pairs = ", ".join(f"{name} {_show(value)}" for name, value in args.items())
+        pairs = ", ".join(f"{name} {_show(value, in_call=True)}" for name, value in args.items())
         call = f"call with {pairs}; " if pairs else ""
         lines.append(f"{i}. {step.tool}: {call}{fill(step.purpose)}")
     lines += ["", "Limits to respect:"]
