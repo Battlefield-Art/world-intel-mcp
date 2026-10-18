@@ -1105,7 +1105,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_country_dossier",
                 "economy, sanctions, news and conflict context. It knows only "
-                "the 50 countries in its own table and returns an error for others",
+                "the 50 countries in its own table and returns an error for others. "
+                "Its sanctions section lists sanctions-list entries whose remarks name the "
+                "country, which is not an exposure screen; match_count null means "
+                "the sanctions list could not be read, not zero matches",
                 args=(("country", "{country}"),),
                 only_if="country",
             ),
@@ -1233,7 +1236,10 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             Step(
                 "intel_country_dossier",
                 "economy, elections, sanctions, news and conflict. It knows only "
-                "the 50 countries in its own table and returns an error for others",
+                "the 50 countries in its own table and returns an error for others. "
+                "Its sanctions section lists sanctions-list entries whose remarks name the "
+                "country, which is not an exposure screen; match_count null means "
+                "the sanctions list could not be read, not zero matches",
                 args=(("country", "{country}"),),
             ),
             Step(

@@ -82,6 +82,30 @@ _ISO2_TO_ISO3: dict[str, str] = {
 }
 _ISO3_TO_ISO2: dict[str, str] = {v: k for k, v in _ISO2_TO_ISO3.items()}
 
+# English names for the codes above that are not tier-1 countries (those
+# carry their own name in TIER1_COUNTRIES). Used to screen the SDN list.
+_EXTRA_COUNTRY_NAMES: dict[str, str] = {
+    "ARG": "Argentina", "AUS": "Australia", "BEL": "Belgium", "BRA": "Brazil",
+    "CAN": "Canada", "CHE": "Switzerland", "CHL": "Chile", "COL": "Colombia",
+    "DEU": "Germany", "EGY": "Egypt", "ESP": "Spain", "FRA": "France",
+    "GBR": "United Kingdom", "IDN": "Indonesia", "ITA": "Italy", "JPN": "Japan",
+    "KOR": "Korea, South", "NLD": "Netherlands", "NOR": "Norway", "PER": "Peru",
+    "PHL": "Philippines", "POL": "Poland", "SAU": "Saudi Arabia", "SWE": "Sweden",
+    "THA": "Thailand", "TUR": "Turkey", "VNM": "Vietnam", "ZAF": "South Africa",
+}
+
+# Entries listed in the sanctions section.
+_SANCTIONS_LIMIT = 10
+
+_SANCTIONS_METHOD = (
+    "OFAC SDN entries whose remarks name the country (nationality, citizenship, "
+    "address, registration), substring match on the English country name. Not "
+    "an exposure screen: entries tied to the country in other ways are missed, "
+    "and a name inside another also matches (Niger in Nigeria, Sudan in South Sudan). "
+    "total_entities is the number of SDN rows read before the search stopped, "
+    "not the size of the list."
+)
+
 
 def _normalize_country(code: str) -> tuple[str, str]:
     """Return (iso2, iso3) from either format. Raises ValueError if unknown."""
@@ -99,6 +123,12 @@ def _normalize_country(code: str) -> tuple[str, str]:
             raise ValueError(f"Unknown ISO-3 code: {code}")
         return iso2, iso3
     raise ValueError(f"Country code must be 2 or 3 characters: {code}")
+
+
+def _sanctions_country_name(iso3: str) -> str:
+    from ..config.countries import TIER1_COUNTRIES
+
+    return (TIER1_COUNTRIES.get(iso3) or {}).get("name") or _EXTRA_COUNTRY_NAMES[iso3]
 
 
 async def _safe(coro, label: str) -> dict:
@@ -163,7 +193,12 @@ async def fetch_country_dossier(
         _safe(fetch_country_brief(fetcher, country_code=iso2), "country_brief"),
         _safe(fetch_country_stocks(fetcher, country=iso3), "country_stocks"),
         _safe(fetch_election_calendar(fetcher, country=iso3), "elections"),
-        _safe(fetch_sanctions_search(fetcher, query=iso3, limit=10), "sanctions"),
+        _safe(
+            fetch_sanctions_search(
+                fetcher, country=_sanctions_country_name(iso3), limit=_SANCTIONS_LIMIT + 1
+            ),
+            "sanctions",
+        ),
         _safe(fetch_news_feed(fetcher, category=None, limit=200), "news_feed"),
     )
 
@@ -217,14 +252,37 @@ async def fetch_country_dossier(
         elections = {"_error": election_data["_error"]}
 
     # --- Section 5: Sanctions ---
+    # Until 2026-10-17 this searched entity names for the ISO-3 code and read
+    # "results" (the producer emits "matches"), so the list was always empty,
+    # and a failed SDN download read as zero matches. One extra row is asked
+    # for so a cut-off list is known to be cut off.
     sanctions = {}
-    if "_error" not in sanctions_data:
+    if "_error" in sanctions_data:
         sanctions = {
-            "matches": sanctions_data.get("results", []),
-            "match_count": sanctions_data.get("count", 0),
+            "_error": sanctions_data["_error"],
+            "match_count": None,
+            "data_gaps": [f"sanctions search failed: {sanctions_data['_error']}; not screened"],
+        }
+    elif not sanctions_data.get("total_entities"):
+        sanctions = {
+            "matches": [],
+            "match_count": None,
+            "total_entities": 0,
+            "error": "The OFAC SDN list could not be read",
+            "degraded": True,
+            "reason": "sdn_unavailable",
+            "data_gaps": ["OFAC SDN list could not be read; sanctions not screened, not zero"],
         }
     else:
-        sanctions = {"_error": sanctions_data["_error"]}
+        found = sanctions_data.get("matches") or []
+        sanctions = {
+            "matches": found[:_SANCTIONS_LIMIT],
+            "match_count": min(len(found), _SANCTIONS_LIMIT),
+            "more_matches": len(found) > _SANCTIONS_LIMIT,
+            "total_entities": sanctions_data.get("total_entities"),
+            "country_searched": sanctions_data.get("query", {}).get("country"),
+            "match_method": _SANCTIONS_METHOD,
+        }
 
     # --- Section 6: News ---
     # Every RSS feed (category=None), headlines matched on the country's

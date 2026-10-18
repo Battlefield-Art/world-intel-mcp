@@ -1784,7 +1784,10 @@ def dossier(ctx: click.Context, country: str) -> None:
 
     # Sanctions
     sanc = data.get("sanctions", {})
-    if sanc.get("match_count", 0) > 0:
+    if "match_count" in sanc and sanc["match_count"] is None:
+        # A failed SDN download is not zero matches.
+        console.print("[red]Sanctions:[/red] not screened (SDN list unavailable)")
+    elif (sanc.get("match_count") or 0) > 0:
         console.print(f"[red]Sanctions:[/red] {sanc['match_count']} OFAC matches")
 
     # News

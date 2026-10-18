@@ -297,6 +297,14 @@ source here, and no proxy is substituted for any of these measures.
   request refused or unreachable, every ACLED tool said the credentials
   were not configured. That case now has its own reason,
   `acled_auth_failed`, and the error says the sign-in failed.
+- The sanctions section of `intel_country_dossier` was always empty: it
+  searched entity names for the ISO-3 code and read a key the search does
+  not return, and a failed SDN download read as zero matches. It now lists
+  SDN entries whose remarks name the country (by English name), carries
+  `total_entities`, `country_searched`, `match_method` and `more_matches`,
+  and a failed download sets `match_count` to null with `error`,
+  `degraded`, reason `sdn_unavailable` and a `data_gaps` entry. `intel
+  dossier` prints "not screened" in that case.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
