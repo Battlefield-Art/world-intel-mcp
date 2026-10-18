@@ -19,7 +19,9 @@ Publishers, as measured on 2026-10-17 (HTTP status, robots.txt, terms):
 * UK Home Office: "Small boat activity in the English Channel" on GOV.UK, read
   through the GOV.UK Content API (200, keyless, at most 10 requests per second
   per client). The time series is published only as an ODS spreadsheet, on
-  assets.publishing.service.gov.uk (robots.txt 404). ODS is a zip of XML, read
+  assets.publishing.service.gov.uk (robots.txt 404); an attachment on
+  www.gov.uk is accepted only under /government/uploads/, since its robots.txt
+  (200) disallows other paths such as /search/all*. ODS is a zip of XML, read
   here with zipfile and the standard library's expat parser, streamed with
   DTDs refused, so no new dependency. GOV.UK content is under the Open
   Government Licence v3.0.
@@ -107,6 +109,10 @@ _FLOW_NOT_STOCK = (
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 def _usage(source: str, error: str) -> dict[str, Any]:
@@ -236,7 +242,7 @@ _CBP_FILE_NAME = re.compile(
 _CBP_FILE_FOLDER = re.compile(r"^/sites/default/files/(\d{4}-\d{2})/[^/]+$")
 # Any encounters CSV link, to name the ones the file-name rule above cannot read; the by-state
 # files are a different table, read by nothing here, so they are not named.
-_CBP_ENCOUNTERS_CSV = re.compile(r"nationwide-encounters[^/]*\.csv$", re.IGNORECASE)
+_CBP_ENCOUNTERS_CSV = re.compile(r"nationwide[-_ ]?encounters[^/]*\.csv$", re.IGNORECASE)  # matched unquoted
 _CBP_STATE_CSV = re.compile(r"-state(?:_\d+)?\.csv$", re.IGNORECASE)
 _UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
 _ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
@@ -528,10 +534,18 @@ def _normalized_path(raw_path: str) -> str:
     return _remove_dot_segments(_ESCAPE.sub(unescape, raw_path))
 
 
+def _odd_path(raw_path: str) -> bool:
+    """A backslash (or %5C) or an empty segment: no publisher's file path has one, and a server
+    may read either as a way into another directory (a backslash as "/", "//" merged into "/"),
+    which the literal robots.txt prefix match would not see."""
+    return "\\" in raw_path or "%5c" in raw_path.lower() or "//" in raw_path
+
+
 def _cbp_link(href: str) -> tuple[str, str, bool] | None:
     """(URL to request, its path, robots.txt allows it) of a link on https://www.cbp.gov, else None.
 
-    Only https on the standard port with no credentials is accepted. The URL is rebuilt from
+    Only https on the standard port with no credentials, and a path with no backslash, %5C or
+    empty segment, is accepted. The URL is rebuilt from
     the normalized path and must come back from httpx with that exact path, so the robots.txt
     rule is checked on the path httpx sends, not on the link as written: a dot segment or a
     percent-escape cannot reach the disallowed directory. A path that reaches it only once
@@ -542,6 +556,8 @@ def _cbp_link(href: str) -> tuple[str, str, bool] | None:
         if first.scheme != "https" or first.host != _CBP_HOST or first.port is not None or first.userinfo:
             return None
         raw_path, _, query = first.raw_path.decode("ascii").partition("?")
+        if _odd_path(raw_path):
+            return None
         path = _normalized_path(raw_path)
         target = path + (f"?{query}" if query else "")
         url = f"https://{_CBP_HOST}{target}"
@@ -585,8 +601,9 @@ def _file_rank(path: str) -> tuple | None:
 
 def _skipped_links(page: _PageParser) -> list[str]:
     """Encounters CSV links (by-state files aside) that ``_latest_file`` cannot consider: off
-    https://www.cbp.gov (another host or scheme, a port, credentials), not a URL at all, or
-    named in a way the file-name rule cannot read (say "-sept-"). Any of them may be newer than
+    https://www.cbp.gov (another host or scheme, a port, credentials), an odd path (a backslash
+    or an empty segment), not a URL at all, or named in a way the file-name rule cannot read
+    (say "-sept-", or "_" or a space between "nationwide" and "encounters"). Any of them may be newer than
     the file read, so the response names them instead of falling back to an older file in
     silence."""
     skipped: list[str] = []
@@ -595,7 +612,8 @@ def _skipped_links(page: _PageParser) -> list[str]:
             path = urlsplit(urljoin(CBP_DATASET_PAGE, href.strip())).path
         except ValueError:
             path = href.strip()  # a link that does not parse is judged by its text
-        if not _CBP_ENCOUNTERS_CSV.search(path) or _CBP_STATE_CSV.search(path):
+        name = unquote(path)  # "nationwide%20encounters-..." is judged as it reads
+        if not _CBP_ENCOUNTERS_CSV.search(name) or _CBP_STATE_CSV.search(name):
             continue
         link = _cbp_link(href)
         if link is not None and _file_rank(link[1]) is not None:
@@ -933,11 +951,14 @@ UK_PUBLICATION_PATH = "/government/publications/migrants-detected-crossing-the-e
 UK_PUBLICATION_PAGE = "https://www.gov.uk" + UK_PUBLICATION_PATH
 UK_CONTENT_API = "https://www.gov.uk/api/content" + UK_PUBLICATION_PATH
 UK_CACHE_KEY = "border_crossings:uk_small_boats"
-_UK_SCHEMA = 1
+_UK_SCHEMA = 2  # 2: rows dated outside the series window are left out (an older copy may hold them)
 _UK_TTL = 10800  # 3 h; its change history shows 72 updates from 1 August to 16 October 2026
 _UK_API_MAX_BYTES = 8 * 1024 * 1024
 _UK_ODS_MAX_BYTES = 32 * 1024 * 1024  # the 16 October 2026 file is 76,787 bytes
 _UK_FILE_HOSTS = {"assets.publishing.service.gov.uk", "www.gov.uk"}
+_UK_GOV_UK_FILES = "/government/uploads/"  # the only www.gov.uk path read: robots.txt disallows others
+_UK_FIRST_DAY = date(2018, 1, 1)  # SB_01 starts on 1 January 2018
+_UK_DAYS_AHEAD = 7  # a week ending may be dated a few days past today; a later date is not a figure
 _UK_SHEETS = ("SB_01", "SB_02", "Notes")  # the sheets read; any other sheet is skipped unread
 _ODS_TYPE = "application/vnd.oasis.opendocument.spreadsheet"
 # Limits for one file, over every sheet read, each checked before anything is expanded; a file
@@ -1415,7 +1436,8 @@ def _uk_series(table: list[list[Any] | None], located: tuple[str, int, dict], ke
             gaps.append(f"{sheet} has no {_UK_COLUMN_LABELS[key]!r} column; those figures are null.")
     used = {columns[key] for key in ("when", *keys)} - {None}  # the date and the figures
     records: dict[str, list[Any]] = {}
-    undated = unreadable = duplicates = 0
+    undated = out_of_range = unreadable = duplicates = 0
+    last_day = _today() + timedelta(days=_UK_DAYS_AHEAD)
     lost_rows = sum(row is None for row in table)
     # Unreadable cells away from the date and figures (above the data, or in another column, Notes
     # included: only a text cell can say "Revised") are named, not fatal.
@@ -1432,6 +1454,9 @@ def _uk_series(table: list[list[Any] | None], located: tuple[str, int, dict], ke
         day = _uk_date(cell("when"))
         if day is None:
             undated += 1
+            continue
+        if not _UK_FIRST_DAY <= day <= last_day:
+            out_of_range += 1  # year 1 or 9999 would also break the date arithmetic of every response
             continue
         if day.isoformat() in records:
             duplicates += 1
@@ -1452,6 +1477,9 @@ def _uk_series(table: list[list[Any] | None], located: tuple[str, int, dict], ke
                     "any figures in them are not counted.")
     if undated:
         gaps.append(f"{undated} row(s) of {sheet} have no readable date and are not counted.")
+    if out_of_range:
+        gaps.append(f"{out_of_range} row(s) of {sheet} are dated outside {_UK_FIRST_DAY} to {last_day} and are "
+                    "not counted.")
     if unreadable:
         gaps.append(f"{unreadable} cell(s) of {sheet} are neither a count nor '-' and are read as null.")
     if duplicates:
@@ -1522,13 +1550,19 @@ def _uk_attachment(item: Any) -> dict[str, Any]:
     if not isinstance(href, str) or not href.strip():
         raise _SourceError("uk_unexpected_format", "the time-series attachment has no URL")
     # Checked as httpx parses it, since that is the URL requested: https on the standard port,
-    # no credentials, a GOV.UK file host and a path to a file.
+    # no credentials, a GOV.UK file host and a path to a file (on www.gov.uk, under
+    # /government/uploads/ as resolved and as fully decoded, so ".." or "%2F" cannot leave it).
     try:
         url = httpx.URL(urljoin("https://www.gov.uk/", href.strip()))
+        raw_path = url.raw_path.decode("ascii").partition("?")[0]
     except (httpx.InvalidURL, ValueError):
         url = None
+    if url is not None:
+        path = _normalized_path(raw_path)
+        outside = url.host == "www.gov.uk" and not all(
+            p.startswith(_UK_GOV_UK_FILES) for p in (path, _remove_dot_segments(unquote(path))))
     if (url is None or url.scheme != "https" or url.host not in _UK_FILE_HOSTS or url.port is not None
-            or url.userinfo or url.path in ("", "/")):
+            or url.userinfo or url.path in ("", "/") or _odd_path(raw_path) or outside):
         raise _SourceError("uk_unexpected_format",
                            f"the time-series attachment is not a file on GOV.UK over https ({_shown(href)})")
     size = chosen.get("file_size")

@@ -51,15 +51,21 @@
   and cells that cannot be read outside the columns the tool uses are
   named in `data_gaps` instead of failing the file; a CBP row with bytes
   that are not UTF-8 in a column the tool reads is counted as unreadable.
+  A UK row dated before 1 January 2018 (where SB_01 starts) or more than
+  seven days after today is left out and named. A cached copy written
+  under an older layout or rule is refetched, never served.
 - Requests use an identifying User-Agent, two per refresh (the listing,
   then the file), cached 12 h (CBP) and 3 h (UK). Only https links on the
-  publishers' own hosts (www.cbp.gov; assets.publishing.service.gov.uk or
-  www.gov.uk), on the standard port and without credentials, are
-  requested. CBP's robots.txt rule is checked on the path as normalized
-  for the request (dot segments removed, escapes of unreserved characters
-  decoded), so paths it disallows are never requested; a newer-looking CBP
-  file at such a path is named in `data_gaps` instead, as is any
-  encounters link the tool cannot read. Redirects are followed, and the
+  publishers' own hosts (www.cbp.gov; assets.publishing.service.gov.uk, or
+  www.gov.uk under /government/uploads/ since its robots.txt disallows
+  other paths), on the standard port, without credentials and with no
+  backslash, %5C or empty segment in the path, are requested. CBP's
+  robots.txt rule is checked on the path as normalized for the request
+  (dot segments removed, escapes of unreserved characters decoded), so
+  paths it disallows are never requested; a newer-looking CBP file at such
+  a path is named in `data_gaps` instead, as is any encounters link the
+  tool cannot read (including names with "_" or a space after
+  "nationwide"). Redirects are followed, and the
   download size caps apply after the body is read, both in the shared
   fetcher (see the module's gaps).
 - Frontex is not built: its only data file is an XLSX under `/assets/`,
