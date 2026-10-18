@@ -1450,12 +1450,12 @@ function showDrawerDetail(id) {
             ['End', d.until || d.end || '\u2014']
         ];
     } else if (type === 'navwarning') {
-        title = (d.navArea || d.area || 'Nav Warning');
+        title = d.navarea ? 'NAVAREA ' + d.navarea : 'Nav Warning';
         subtitle = d.status || '';
         fields = [
-            ['Area', d.navArea || d.area || '\u2014'],
+            ['Area', d.navarea || '?'],
             ['Number', d.number || d.id || '\u2014'],
-            ['Issued', d.dtg || d.date || '\u2014'],
+            ['Issued', d.issue_date || '?'],
             ['Text', d.text || d.description || '\u2014']
         ];
     } else if (type === 'conflict') {
@@ -2547,13 +2547,25 @@ function updateDrawer(data) {
             h += '</tbody></table>';
         }
     }
-    if (data.nav_warnings && !data.nav_warnings.error) {
-        var navs = data.nav_warnings.warnings || [];
+    // A stale or degraded NGA feed is marked: its list describes the feed's
+    // last update, not current conditions. An outage shows its gaps.
+    if (data.nav_warnings) {
+        var nw = data.nav_warnings;
+        var navs = nw.error ? [] : (nw.warnings || []);
+        var navMark = nw.feed_stale ? ' <span class="warn">STALE</span>' : nw.degraded ? ' <span class="warn">DEGRADED</span>' : '';
         if (navs.length) {
-            h += '<div class="sub">Nav Warnings (' + navs.length + ')</div><table class="dtable"><thead><tr><th>Area</th><th>Warning</th></tr></thead><tbody>';
+            h += '<div class="sub">Nav Warnings (' + navs.length + ')' + navMark + '</div><table class="dtable"><thead><tr><th>Area</th><th>Warning</th></tr></thead><tbody>';
             navs.slice(0, 8).forEach(function(w) {
                 var did = _storeItem('navwarning', w);
-                h += '<tr data-click="' + did + '"><td class="bright">' + esc(w.navArea || w.area || '?') + '</td><td class="dim">' + esc(trunc(w.text || w.description || '\u2014', 40)) + '</td></tr>';
+                h += '<tr data-click="' + did + '"><td class="bright">' + esc(w.navarea || '?') + '</td><td class="dim">' + esc(trunc(w.text || w.description || '\u2014', 40)) + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
+        var navGaps = (nw.error ? [nw.error] : []).concat(Array.isArray(nw.data_gaps) ? nw.data_gaps : []);
+        if (navGaps.length) {
+            h += '<div class="sub">Nav Warning Gaps' + (navs.length ? '' : navMark) + '</div><table class="dtable"><tbody>';
+            navGaps.forEach(function(g) {
+                h += '<tr><td class="warn">' + esc(String(g)) + '</td></tr>';
             });
             h += '</tbody></table>';
         }
@@ -2789,17 +2801,32 @@ function updateDrawer(data) {
     }
 
     // ── FLEET ──
-    if (data.fleet_report && !data.fleet_report.error) {
+    // A component the report could not use is left out of its count, so that
+    // count reads '?'; readiness_score is null when nothing was scored and a
+    // lower bound (shown with a leading >=, never in the calm green) when
+    // inputs are missing.
+    if (data.fleet_report) {
         var fr = data.fleet_report;
+        var frOut = fr.unavailable_components || [];
+        var frCount = function(n, component) { return (typeof n !== 'number' || frOut.indexOf(component) >= 0) ? '<span class="dim">?</span>' : String(n); };
         h += '<div class="sh">FLEET</div>';
-        var fScore = fr.readiness_score || 0;
-        var fColor = fScore >= 70 ? 'var(--red)' : fScore >= 40 ? 'var(--amber)' : 'var(--green)';
+        var fScore = fr.readiness_score;
+        var fKnown = typeof fScore === 'number';
+        var fColor = !fKnown ? 'var(--dim)' : fScore >= 70 ? 'var(--red)' : fScore >= 40 ? 'var(--amber)' : fr.readiness_lower_bound ? 'var(--bright)' : 'var(--green)';
         h += '<div class="mini-row">';
-        h += '<div class="mini-box"><div class="v" style="color:' + fColor + '">' + fScore + '</div><div class="l">Readiness</div></div>';
-        h += '<div class="mini-box"><div class="v">' + esc(fr.readiness_level || '\u2014') + '</div><div class="l">Level</div></div>';
-        h += '<div class="mini-box"><div class="v">' + (fr.total_tracked_aircraft || 0) + '</div><div class="l">Aircraft</div></div>';
-        h += '<div class="mini-box"><div class="v">' + (fr.surge_count || 0) + '</div><div class="l">Surges</div></div>';
+        h += '<div class="mini-box"><div class="v" style="color:' + fColor + '">' + (fKnown ? (fr.readiness_lower_bound ? '\u2265' : '') + fScore : '?') + '</div><div class="l">Readiness</div></div>';
+        h += '<div class="mini-box"><div class="v">' + esc(fr.readiness_level || '?') + '</div><div class="l">Level</div></div>';
+        h += '<div class="mini-box"><div class="v">' + ((fr.unavailable_theaters || []).length ? '\u2265' : '') + frCount(fr.total_tracked_aircraft, 'theater_posture') + '</div><div class="l">Aircraft</div></div>';
+        h += '<div class="mini-box"><div class="v">' + frCount(fr.surge_count, 'military_surge') + '</div><div class="l">Surges</div></div>';
         h += '</div>';
+        var frGaps = (fr.error ? [fr.error] : []).concat(Array.isArray(fr.data_gaps) ? fr.data_gaps : []);
+        if (frGaps.length || fr.degraded) {
+            h += '<div class="sub">Data Gaps' + (fr.degraded ? ' <span class="warn">DEGRADED</span>' : '') + (frOut.length ? ' <span class="warn">unavailable: ' + esc(frOut.join(', ')) + '</span>' : '') + '</div><table class="dtable"><tbody>';
+            frGaps.forEach(function(g) {
+                h += '<tr><td class="warn">' + esc(String(g)) + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
         var wws = fr.waterway_summary || [];
         if (wws.length) {
             h += '<div class="sub">Waterways</div><table class="dtable"><thead><tr><th>Waterway</th><th>Status</th><th>Warnings</th></tr></thead><tbody>';
