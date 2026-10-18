@@ -699,6 +699,140 @@ def test_week_grid_reports_unequal_change_intervals(store) -> None:
     assert all(s["change_interval_days"] is None for s in levels["series"])
 
 
+def test_month_grid_names_unequal_intervals_only_beyond_calendar_months(store) -> None:
+    """Calendar months alone run 28 to 31 days, so daily data covering whole
+    months (2023-01 to 2024-12) gets no unequal-interval line. Ending on
+    2024-12-15 makes the last change span 15 days, and the line appears."""
+    start = date(2023, 1, 1)
+
+    def rows(seed: int, end: date) -> list[tuple[str, float]]:
+        values = _walk(seed, (end - start).days + 1)
+        return [((start + timedelta(days=i)).isoformat(), v) for i, v in enumerate(values)]
+
+    _write(store, {"m1": rows(1001, date(2024, 12, 31)), "m2": rows(1002, date(2024, 12, 31)),
+                   "p1": rows(1001, date(2024, 12, 15)), "p2": rows(1002, date(2024, 12, 15))})
+    whole = _run(store, ["m1", "m2"], grid="month", min_overlap=20, max_lag=1)
+    assert [s["change_interval_days"] for s in whole["series"]] == [{"min": 28, "max": 31}] * 2
+    assert not any("unequal intervals" in g for g in whole["data_gaps"])
+    partial = _run(store, ["p1", "p2"], grid="month", min_overlap=20, max_lag=1)
+    assert [s["change_interval_days"] for s in partial["series"]] == [{"min": 15, "max": 31}] * 2
+    assert [g for g in partial["data_gaps"] if "unequal intervals" in g] == [
+        f"lagtest:{k}: on the month grid its changes span 15 to 31 days (each period takes "
+        "its last observation), so changes cover unequal intervals" for k in ("p1", "p2")
+    ]
+
+
+def test_q_ar1_counts_the_tests_that_could_not_be_assessed(store) -> None:
+    """x and y are daily (y_t = x_(t-3) + noise, 300 days); z is seen only on
+    Mondays and Tuesdays, so its changes have no adjacent pairs and its 22
+    tests are not assessed (p_ar1 = 1). They stay in the call's adjustment:
+    the planted test's q_ar1 is 33 p_ar1 (measured 32.97), not 11 p_ar1."""
+    x = _walk(701, 300)
+    noise = _normals(702, 300)
+    z = [((D0 + timedelta(days=i)).isoformat(), v)
+         for i, v in enumerate(_walk(703, 300)) if i % 7 in (0, 1)]
+    _write(store, {"x": _days(x), "y": _days([x[i - 3] + 0.3 * noise[i] for i in range(3, 300)],
+                                             offset=3), "z": z})
+    result = _run(store, ["x", "y", "z"])
+    assert result["tests_run"] == 33
+    assert [s["lag1_pairs"] for s in result["series"]] == [298, 295, 0]
+    by_pair = {(p["a"], p["b"]): p for p in result["pairs"]}
+    best = by_pair[("lagtest:x", "lagtest:y")]["strongest"][0]
+    assert best["lag"] == 3 and "note" not in best and 0 < best["p_ar1"] < 1e-100
+    assert best["q_ar1"] / best["p_ar1"] == pytest.approx(33, rel=0.02)
+    for key in ("lagtest:x", "lagtest:y"):
+        (zbest,) = by_pair[(key, "lagtest:z")]["strongest"]
+        assert zbest["note"] == lc.NO_PHI_NOTE and zbest["p_ar1"] == 1.0
+
+
+def test_an_effective_size_just_under_three_is_no_evidence_and_reads_2_9(store) -> None:
+    """Random walks (seeds 3240/3241, 40 days) in levels, lag 0: measured
+    phi values leave an effective size of 2.97. That is below 3, so p_ar1 is 1
+    with the no-evidence note, and it is shown rounded down as 2.9, never as
+    3.0."""
+    _write(store, {"ra": _days(_walk(3240, 40)), "rb": _days(_walk(3241, 40))})
+    result = _run(store, ["ra", "rb"], transform="levels", max_lag=0)
+    best = result["pairs"][0]["strongest"][0]
+    assert best["n"] == 40 and best["n_effective_ar1"] == 2.9
+    assert best["p_ar1"] == 1.0 and best["note"] == lc.NO_EVIDENCE_NOTE
+    assert best["significant"] is False
+    (gap,) = [g for g in result["data_gaps"] if "serial correlation dominates" in g]
+    assert "effective sample size of 2.9 of 40 periods" in gap
+    assert gap.endswith("Below 3 the sample carries no evidence either way (p_ar1 set to 1)")
+
+
+def test_one_unmeasurable_autocorrelation_leaves_the_test_unassessed(store) -> None:
+    """A daily walk (210 days, phi measured) against a weekly copy of it plus
+    noise (30 Mondays, no adjacent days, phi unknown), in levels on the day
+    grid. Six lags reach 30 points; every one is not assessed, none is
+    significant, and only the weekly series gets the unmeasurable line."""
+    d = _walk(801, 210)
+    weekly = [((D0 + timedelta(days=7 * i)).isoformat(), d[7 * i] + 0.2 * e)
+              for i, e in enumerate(_normals(802, 30))]
+    _write(store, {"daily": _days(d), "weekly": weekly})
+    result = _run(store, ["daily", "weekly"], transform="levels")
+    phi_daily, phi_weekly = (s["lag1_autocorrelation"] for s in result["series"])
+    assert phi_daily > 0.9 and phi_weekly is None
+    assert result["tests_run"] == 6
+    assert result["significant_tests"] == 0 and result["significant_tests_if_independent"] == 6
+    best = result["pairs"][0]["strongest"][0]
+    assert (best["lag"], best["n"]) == (0, 30) and best["r"] > 0.99
+    assert best["n_effective_ar1"] is None and best["p_ar1"] == 1.0
+    assert best["note"] == lc.NO_PHI_NOTE
+    unmeasurable = [g for g in result["data_gaps"] if "not measurable" in g]
+    assert len(unmeasurable) == 1 and unmeasurable[0].startswith("lagtest:weekly:")
+
+
+def test_negative_autocorrelation_gets_its_data_gaps_line(store) -> None:
+    """AR(1) changes at phi -0.5 (measured -0.51) beside white-noise changes
+    (measured +0.10): the line covers |phi| above 0.3 whatever its sign, and
+    the white-noise series gets none."""
+    _write(store, {"neg": _days(_levels(_ar1(901, 300, -0.5))),
+                   "oth": _days(_levels(_normals(902, 300)))})
+    result = _run(store, ["neg", "oth"])
+    phis = [s["lag1_autocorrelation"] for s in result["series"]]
+    assert phis[0] == pytest.approx(-0.5052, abs=1e-4) and abs(phis[1]) < 0.3
+    assert [g for g in result["data_gaps"] if "lag-1 autocorrelation" in g] == [
+        "lagtest:neg: lag-1 autocorrelation -0.51 after the transform; p and q assume "
+        "independent periods, so significance uses the AR(1)-adjusted p_ar1 and q_ar1"
+    ]
+
+
+def test_serial_correlation_dominates_above_an_effective_size_of_three(store) -> None:
+    """Random walks (seeds 2000/2001, 300 days) in levels, lag 0: effective
+    size 5.9 of 300 (measured), above 3 so p_ar1 is computed (0.608), but
+    below 0.2 n, so serial correlation dominates."""
+    _write(store, {"ra": _days(_walk(2000, 300)), "rb": _days(_walk(2001, 300))})
+    result = _run(store, ["ra", "rb"], transform="levels", max_lag=0)
+    best = result["pairs"][0]["strongest"][0]
+    assert best["n"] == 300 and best["n_effective_ar1"] == 5.9
+    assert "note" not in best and best["p_ar1"] == pytest.approx(0.608, abs=0.001)
+    assert best["serial_correlation_dominates"] is True
+    (gap,) = [g for g in result["data_gaps"] if "serial correlation dominates" in g]
+    assert "effective sample size of 5.9 of 300 periods" in gap and "no evidence" not in gap
+
+
+def test_flat_adjacent_values_are_named_as_the_reason(store) -> None:
+    """A rate flat at 2.5 for 99 days that moves to 2.75 on day 100: in
+    changes it has 98 adjacent pairs, but the earlier side never varies, so
+    phi is undefined. The note and the data_gaps line give that reason, not a
+    shortage of adjacent periods."""
+    _write(store, {"rate": _days([2.5] * 99 + [2.75]), "walk": _days(_walk(951, 100))})
+    result = _run(store, ["rate", "walk"], max_lag=1)
+    rate = result["series"][0]
+    assert (rate["lag1_autocorrelation"], rate["lag1_pairs"]) == (None, 98)
+    best = result["pairs"][0]["strongest"][0]
+    assert best["note"] == lc.NO_PHI_FLAT_NOTE and best["p_ar1"] == 1.0
+    assert [g for g in result["data_gaps"] if g.startswith("lagtest:rate: lag-1")] == [
+        "lagtest:rate: lag-1 autocorrelation undefined (across its 98 adjacent-period pairs "
+        "after the transform, the earlier or the later values do not vary), so its tests "
+        "cannot be adjusted for serial correlation and are not counted as significant "
+        "(p_ar1 set to 1)"
+    ]
+    assert "adjacent values that do not vary" in result["method"]["serial_correlation"]
+    assert "not over each test's overlap" in result["method"]["serial_correlation"]
+
+
 def test_window_cut_reports_a_given_start_as_clamped(store, monkeypatch) -> None:
     """The most-recent cut also applies when start is given; the start
     actually used is then reported (200 days, cut to the last 120: day 80)."""
@@ -899,6 +1033,9 @@ def test_cli_connections_table_states_convention_and_limits(cli_db) -> None:
     assert "Transform: Period-over-period changes" in out
     assert "Cannot prove: Correlation is not causation" in out
     assert "1 of 1 pairs have a lag with q <= 0.05" in out
+    # The line above matches only the independent-periods sentence; pin both.
+    assert "1 of 1 pairs have a lag with q_ar1 <= 0.05" in out
+    assert "Assuming independent periods instead, 1 of 1 pairs have a lag with q <= 0.05." in out
 
 
 def test_cli_connections_lists_untested_lags_and_renders_keys_literally(cli_db) -> None:
@@ -954,3 +1091,32 @@ def test_cli_connections_table_shows_p_ar1_and_q_ar1(cli_db) -> None:
     assert row.split()[-3:] == [cli._p_text(best["p_ar1"]), cli._p_text(best["q_ar1"]),
                                 "yes" if best["significant"] else "no"]
     assert "p_ar1 and q_ar1 use n_eff, and Significant means q_ar1 <= 0.05" in out
+
+
+def test_cli_connections_prints_notes_and_both_summary_counts(cli_db) -> None:
+    """Seeds 1000/1001 in levels have an effective size of 0.9 (no evidence),
+    so the CLI prints the entry's note and a q_ar1 count of 0 beside the
+    independent-periods count of 1."""
+    s = HistoryStore(cli_db)
+    _write(s, {"rwa": _days(_walk(1000, 200)), "rwb": _days(_walk(1001, 200))}, at=T0 + 1)
+    s.close()
+    out = _invoke("history", "connections", "lagtest:rwa", "lagtest:rwb",
+                  "--transform", "levels").output
+    notes = [line for line in out.splitlines() if line.startswith("Note:")]
+    assert len(notes) == 1
+    assert notes[0].startswith("Note: lagtest:rwa / lagtest:rwb lag -5: no evidence: the AR(1) "
+                               "effective sample size is below 3")
+    flat = " ".join(out.split())
+    assert "0 of 1 pairs have a lag with q_ar1 <= 0.05" in flat
+    assert "Assuming independent periods instead, 1 of 1 pairs have a lag with q <= 0.05." in flat
+
+
+def test_cli_gap_lines_render_series_keys_literally(cli_db) -> None:
+    """Keys such as lagtest:x carry ':x:' once a colon follows them, which the
+    console would otherwise turn into an emoji."""
+    out = _invoke("history", "connections", "lagtest:x", "lagtest:y",
+                  "--transform", "levels").output
+    flat = " ".join(out.split())
+    assert "Gap: lagtest:x: lag-1 autocorrelation +" in flat
+    assert "Gap: lagtest:y: lag-1 autocorrelation +" in flat
+    assert chr(0x274C) not in out  # the cross-mark emoji ':x:' turns into

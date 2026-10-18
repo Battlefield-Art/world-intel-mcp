@@ -81,11 +81,17 @@ large-sample variance inflation of r for two AR(1) series, Bartlett) and
 capped at n, and ``p_ar1``, p recomputed with that sample size. Significance
 uses q_ar1. Below an effective size of 3 the sample carries no evidence
 either way, and without a measurable phi (fewer than ``_AUTOCORR_MIN_PAIRS``
-adjacent periods) the adjustment cannot be made; both set p_ar1 to 1 and the
-entry says why. ``serial_correlation_dominates`` marks n_effective_ar1 below
+adjacent periods, or adjacent values that do not vary) the adjustment cannot
+be made; both set p_ar1 to 1 and the entry says why. phi is measured once per
+series over all its periods in the window (``lag1_pairs`` adjacent pairs),
+not over each test's overlap, so the adjustment assumes the series has the
+same autocorrelation inside every overlap; a series whose autocorrelation
+changes between periods (a long white-noise stretch before a short
+autocorrelated one that holds the overlap) can still have its evidence
+overstated. ``serial_correlation_dominates`` marks n_effective_ar1 below
 ``DOMINATES_BELOW`` x n (variance of r inflated more than fivefold), and
-data_gaps names those pairs and every series with |phi| above
-``AUTOCORR_NOTE_ABOVE``. The strongest lag is chosen by p among a pair's
+data_gaps names those pairs and every series that took part in a test with
+|phi| above ``AUTOCORR_NOTE_ABOVE``. The strongest lag is chosen by p among a pair's
 lags, so its p and p_ar1 are post-selection values; q and q_ar1 carry the
 adjustment for every test in the call. Measured 2026-10-17 in a scratch
 simulation through the store (not part of the test suite): for two
@@ -207,8 +213,11 @@ AR1_RULE = (
     "adjustment of p_ar1 across the call, and significant uses q_ar1; p_ar1 does "
     "not enter q. Below an effective sample size of 3 the sample carries no "
     "evidence either way, and without a measurable phi (fewer than "
-    f"{_AUTOCORR_MIN_PAIRS} adjacent periods) no adjustment can be made; both set "
-    "p_ar1 to 1 and say why in the entry's note. n_effective_ar1 is shown rounded "
+    f"{_AUTOCORR_MIN_PAIRS} adjacent periods, or adjacent values that do not vary) "
+    "no adjustment can be made; both set p_ar1 to 1 and say why in the entry's "
+    "note. phi is measured once per series over all its periods in the window "
+    "(lag1_pairs), not over each test's overlap, so the adjustment assumes the "
+    "same autocorrelation inside every overlap. n_effective_ar1 is shown rounded "
     "down to one decimal. serial_correlation_dominates "
     f"marks n_effective_ar1 below {DOMINATES_BELOW:g} n. The strongest lag is the "
     "smallest p among the pair's lags, so its p and p_ar1 are post-selection "
@@ -231,6 +240,12 @@ NO_PHI_NOTE = (
     "autocorrelation cannot be measured and p cannot be adjusted for it; p_ar1 is "
     "set to 1, so the test cannot be significant"
 )
+NO_PHI_FLAT_NOTE = (
+    "not assessed: across a series' adjacent-period pairs after the transform, the "
+    "earlier or the later values do not vary, so its lag-1 autocorrelation is "
+    "undefined and p cannot be adjusted "
+    "for it; p_ar1 is set to 1, so the test cannot be significant"
+)
 NOT_TESTED_REASONS = {
     "below_min_overlap": "fewer overlapping periods than min_overlap",
     "no_variation": "one side is constant over the overlap, so r is undefined",
@@ -247,7 +262,9 @@ CANNOT_PROVE = [
     "significant uses q_ar1, the false-discovery adjustment of p_ar1. What was "
     "not: prewhitening, autocorrelation beyond lag 1, volatility clustering, so "
     "series with longer memory than AR(1) can still have their evidence "
-    "overstated.",
+    "overstated. Each series' phi comes from its whole window, not from each "
+    "test's overlap, so a series whose autocorrelation differs inside the "
+    "overlap can too.",
     "A shared common driver produces correlation: two series that both respond to "
     "a third (the business cycle, a policy date, a holiday calendar) correlate "
     "with no link between them.",
@@ -782,6 +799,10 @@ def lagged_connections(
                 continue
             t_abs = math.inf if abs(r) >= 1.0 else abs(r) * math.sqrt((n - 2) / (1 - r * r))
             n_eff, p_ar1, note = ar1_adjusted(r, n, a["_phi"], b["_phi"])
+            if note == NO_PHI_NOTE and all(
+                s["_phi_pairs"] >= _AUTOCORR_MIN_PAIRS for s in (a, b) if s["_phi"] is None
+            ):
+                note = NO_PHI_FLAT_NOTE
             test = {"lag": k, "r": r, "n": n, "p": correlation_p_value(r, n), "_t": t_abs,
                     "n_eff": n_eff, "p_ar1": p_ar1, "note": note}
             tests.append(test)
@@ -902,6 +923,14 @@ def lagged_connections(
                 f"{key}: lag-1 autocorrelation {phi:+.2f} after the transform; p and q "
                 "assume independent periods, so significance uses the AR(1)-adjusted "
                 "p_ar1 and q_ar1"
+            )
+        elif tested and phi is None and info["_phi_pairs"] >= _AUTOCORR_MIN_PAIRS:
+            gaps.append(
+                f"{key}: lag-1 autocorrelation undefined (across its {info['_phi_pairs']} "
+                "adjacent-period pairs after the transform, the earlier or the later "
+                "values do not vary), so its tests "
+                "cannot be adjusted for serial correlation and are not counted as "
+                "significant (p_ar1 set to 1)"
             )
         elif tested and phi is None:
             gap = (

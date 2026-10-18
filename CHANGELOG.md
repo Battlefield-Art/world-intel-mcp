@@ -572,10 +572,16 @@ source here, and no proxy is substituted for any of these measures.
   transform, and on every test an AR(1) effective sample size n (1 - phi_a
   phi_b) / (1 + phi_a phi_b), capped at n, with `p_ar1` recomputed from it;
   significance follows `q_ar1`. Below an effective size of 3, or without a
-  measurable phi, `p_ar1` is 1 and the entry says "no evidence" or "not
-  assessed". `serial_correlation_dominates` marks an effective size under a
-  fifth of n, and `data_gaps` names those pairs and every series with
-  |phi| above 0.3. The strongest lag's p and `p_ar1` are post-selection;
+  measurable phi (too few adjacent periods, or adjacent values that do not
+  vary, each named as such), `p_ar1` is 1 and the entry says "no evidence"
+  or "not assessed"; those tests still count in `q` and `q_ar1`. phi comes
+  from each series' whole window, not from each test's overlap, so a series
+  whose autocorrelation differs inside the overlap can still have its
+  evidence overstated. `serial_correlation_dominates` marks an effective
+  size under a fifth of n, and `data_gaps` names those pairs and every
+  series that took part in a test with |phi| above 0.3, either sign. The
+  CLI prints series keys literally in its gap, note and pair lines (a key
+  segment such as `:x:` was turned into an emoji). The strongest lag's p and `p_ar1` are post-selection;
   `q` and `q_ar1` adjust for every test. Nothing is prewhitened. Measured in
   a scratch simulation through the store: two independent random walks of
   300 daily points in levels (seeds 0-99, defaults) have a lag with q <=

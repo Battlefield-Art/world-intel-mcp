@@ -3135,8 +3135,9 @@ def _parse_latlon_pairs(
 
 
 def _print_data_gaps(data: dict) -> None:
+    # emoji=False: series keys such as "src:x:..." would otherwise render ":x:" as an emoji.
     for gap in data.get("data_gaps", []):
-        console.print(f"[yellow]Gap:[/yellow] {escape(str(gap))}")
+        console.print(f"[yellow]Gap:[/yellow] {escape(str(gap))}", emoji=False)
 
 
 @main.group(name="aoi")
@@ -3791,7 +3792,8 @@ def history_connections(
             if entry.get("note"):
                 console.print(
                     f"[yellow]Note:[/yellow] {escape(pair['a'])} / {escape(pair['b'])} lag "
-                    f"{entry['lag']:+d}: {escape(entry['note'])}"
+                    f"{entry['lag']:+d}: {escape(entry['note'])}",
+                    emoji=False,
                 )
     for clamp in data["inputs_clamped"]:
         why = clamp.get("reason") or "allowed {} to {}".format(*clamp["allowed"])
@@ -3810,7 +3812,8 @@ def history_connections(
             listed = ", ".join(
                 f"lag {e['lag']:+d} (r {e['r']:+.3f}, q_ar1 {_p_text(e['q_ar1'])})" for e in others
             )
-            console.print(f"Also significant: {escape(pair['a'])} / {escape(pair['b'])}: {listed}")
+            console.print(f"Also significant: {escape(pair['a'])} / {escape(pair['b'])}: {listed}",
+                          emoji=False)
         if pair["not_tested"]:
             listed = ", ".join(
                 f"lag {nt['lag']:+d} (n {nt['n']}"
@@ -3819,11 +3822,13 @@ def history_connections(
             )
             console.print(
                 f"[yellow]Not tested[/yellow] (minimum {method['min_overlap']} overlapping "
-                f"periods): {escape(pair['a'])} / {escape(pair['b'])}: {listed}"
+                f"periods): {escape(pair['a'])} / {escape(pair['b'])}: {listed}",
+                emoji=False,
             )
     for item in data["excluded_series"]:
         console.print(
-            f"[yellow]Excluded:[/yellow] {escape(item['series_key'])}: {escape(item['reason'])}"
+            f"[yellow]Excluded:[/yellow] {escape(item['series_key'])}: {escape(item['reason'])}",
+            emoji=False,
         )
     _print_data_gaps(data)
     for line in data["cannot_prove"]:
