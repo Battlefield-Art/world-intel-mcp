@@ -172,7 +172,9 @@ async def fetch_acled_events(
     data = await acled_query(
         fetcher,
         params,
-        cache_key=f"conflict:acled:{cache_country}:{days}",
+        # limit is part of the key: a cached short list must not answer a
+        # call that asked for more rows.
+        cache_key=f"conflict:acled:{cache_country}:{days}:{limit}",
         cache_ttl=900,
     )
     if data is None:

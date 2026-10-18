@@ -1242,7 +1242,7 @@ async def fetch_unrest_events(
     data = await acled_query(
         fetcher,
         params=params,
-        cache_key=f"intel:unrest:{cache_label}:{days}",
+        cache_key=f"intel:unrest:{cache_label}:{days}:{limit}",
         cache_ttl=900,
     )
 

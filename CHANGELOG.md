@@ -283,6 +283,10 @@ source here, and no proxy is substituted for any of these measures.
   reading. The brief now says "Kp unavailable (no reading)" and
   `metrics_snapshot.kp_index` is null, and the digest lists "Space weather:
   no Kp reading" in `data_gaps`.
+- `intel_acled_events` and `intel_unrest_events` keyed their cache on
+  country and days only, so a short list cached for a small `limit` came
+  back, for 15 minutes, to a call that asked for more rows, and a count
+  below the limit then read as complete. `limit` is now part of both keys.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

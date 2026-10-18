@@ -818,6 +818,84 @@ async def test_fetch_acled_events_genuine_zero_has_no_error(
     assert result["count"] == 0
 
 
+def _acled_pool_route(pool_size: int):
+    """A respx side effect for the ACLED read endpoint that, like the real
+    API, returns at most `limit` rows from a pool, and records each limit."""
+    sent: list[int] = []
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        sent.append(limit)
+        rows = [
+            {
+                "event_id_cnty": f"SDN{i}",
+                "event_date": "2026-10-01",
+                "event_type": "Battles",
+                "country": "Sudan",
+                "latitude": str(10.0 + i),
+                "longitude": str(30.0 + i),
+                "fatalities": "1",
+            }
+            for i in range(min(limit, pool_size))
+        ]
+        return httpx.Response(200, json={"data": rows})
+
+    return _answer, sent
+
+
+@pytest.mark.asyncio
+async def test_acled_events_cache_does_not_answer_a_larger_limit(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short list cached for a small limit must not come back, inside the
+    cache TTL, for a call that asked for more rows: a count below the limit
+    would then read as a complete list."""
+    from world_intel_mcp.sources import conflict
+
+    async def _fake_token() -> str:
+        return "fake-token"
+
+    monkeypatch.setattr(conflict, "_acled_get_token", _fake_token)
+    answer, sent = _acled_pool_route(5)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(conflict._ACLED_API_URL).mock(side_effect=answer)
+        small = await conflict.fetch_acled_events(
+            fetcher, country="Sudan", days=60, limit=2
+        )
+        large = await conflict.fetch_acled_events(
+            fetcher, country="Sudan", days=60, limit=1000
+        )
+
+    assert small["count"] == 2
+    assert large["count"] == 5
+    assert sent == [2, 1000]
+
+
+@pytest.mark.asyncio
+async def test_unrest_events_cache_does_not_answer_a_larger_limit(
+    fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from world_intel_mcp.sources import conflict, intelligence
+
+    async def _fake_token() -> str:
+        return "fake-token"
+
+    monkeypatch.setattr(conflict, "_acled_get_token", _fake_token)
+    answer, sent = _acled_pool_route(5)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(conflict._ACLED_API_URL).mock(side_effect=answer)
+        small = await intelligence.fetch_unrest_events(
+            fetcher, country="Sudan", days=60, limit=2
+        )
+        large = await intelligence.fetch_unrest_events(
+            fetcher, country="Sudan", days=60, limit=1000
+        )
+
+    assert small["count"] + small["deduplicated"] == 2
+    assert large["count"] + large["deduplicated"] == 5
+    assert sent == [2, 1000]
+
+
 # ---------------------------------------------------------------------------
 # News (GDELT search)
 # ---------------------------------------------------------------------------
