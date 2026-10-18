@@ -441,10 +441,28 @@ source here, and no proxy is substituted for any of these measures.
   payload bodies are still kept. Each source gets a `day_state`:
   `changed`, `unchanged`, `answered`, `degraded`, `failed`,
   `not_attempted` (the collector ran that day, not this source),
-  `collector_did_not_run` (no capture of any source that day), `never_run`
-  (no capture of it in the retained run log) or `unknown_past_retention`.
-  A collector block gives the day's capture count, first and last capture
-  and the longest stretch without any capture.
+  `collector_did_not_run` (no capture of any source that day),
+  `before_run_log` (the day is before the first capture in this
+  database's run log, so whether the source ran cannot be read),
+  `never_run` (no capture of it before or after the day in the retained
+  run log) or `unknown_past_retention`. A source with an error beside ok or
+  degraded captures is flagged `partial_failure`. A collector block gives
+  the day's capture count, first and last capture, `covered_from` and the
+  longest stretch without any capture; its state is `ran`, `did_not_run`,
+  `unknown_past_retention` or `not_recorded` (the run log starts after the
+  day or is empty).
+- Extractor failures are read from the run log: captures whose history
+  extractor raised (nothing stored) and captures whose points the store
+  refused are counted per source, their errors appear among the reasons
+  (kind `extraction`), and the day gets a gap saying what the observed view
+  misses. by=observed checks captures collected from the day to the next
+  day for the same failures.
+- Coverage: a day partly or wholly past the run-log cutoff is read as
+  covered when the run log still holds an older capture (pruning cuts every
+  source at one cutoff and captures are stamped on insert), so a day the
+  last cycle has not pruned yet keeps its states; otherwise counts, states
+  and the longest gap are stated to cover only the first retained capture
+  onward.
 - `by=observed`: values whose `observed_at` is the day (a date) or a UTC
   instant on it, one item per series and `observed_at` with the latest
   value, how many values were stored for it and the first one when it was
@@ -458,14 +476,22 @@ source here, and no proxy is substituted for any of these measures.
   `unknown_past_retention`, never as a day on which nothing ran, and pruned
   payload bodies and observations that outlived their capture are counted.
   Output is capped (default 10 per source and 100 in all, at most 1,000
-  and 5,000) with matched and returned counts per source.
+  and 5,000) with matched and returned counts per source; in by=observed
+  the day values and period values share one budget. A limit that is not
+  an integer (a bool, 2.9, infinity) gets the default.
+- One call reads one SQLite snapshot (a single read transaction), so a
+  collector cycle committing mid-call cannot mix two states. A store
+  missing some history tables is an error naming them, not an empty day.
+  Values whose `observed_at` starts with the day but sorts above
+  `T23:59:59Z` (fractional seconds, offsets) are counted on the day.
 - Read-only: the store is opened with SQLite `mode=ro`, so the tool cannot
   write it, and it never fetches. Queries range-scan
   `idx_history_captures_time` and `idx_history_obs_time` and walk
   `idx_history_obs_series` one key at a time; a test checks every
   statement's query plan for a full scan of a history table. On a
   synthetic store of 475,200 captures and 1.75 million observations
-  (10,982 series), one call took 24 to 46 ms.
+  (10,982 series), one call took 24 to 46 ms (measured before the review
+  fixes, not re-measured).
 - Tools 152 -> 153.
 
 ### Added: observation history and collection health

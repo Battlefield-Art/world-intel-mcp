@@ -2,31 +2,49 @@
 (ROADMAP Phase 29).
 
 Two views over the store that ``history.py`` keeps in the cache database,
-both read through a read-only SQLite connection (``mode=ro``), so this
-module cannot write the store; it never fetches upstream either.
+both read through a read-only SQLite connection (``mode=ro``) inside one
+read transaction: this module cannot write the store, every statement of
+a call reads the same snapshot, and nothing here fetches upstream.
 
 - ``by="collected"``: the run log for the day. Per source: attempts,
-  ok / degraded / error counts with their reasons, captures whose payload
-  changed or matched the capture before it, first and last capture time,
-  observations stored, and how many of the day's payload bodies are still
-  kept. A source without a capture that day says why: the collector
-  recorded no capture of any source that day, it ran but not this source,
-  the source has no capture in the retained run log (``never_run``), or
-  the day is past run-log retention. The observations saved that day are
-  listed too.
+  ok / degraded / error counts with their reasons, captures whose
+  extractor raised or whose points the store refused, captures whose
+  payload changed or matched the capture before it, first and last
+  capture time, observations stored, and how many of the day's payload
+  bodies are still kept. A source that failed some attempts and answered
+  others is flagged ``partial_failure``. A source without a capture that
+  day says why: the collector recorded no capture of any source that day,
+  it ran but not this source, the source has no capture in the retained
+  run log (``never_run``), the day is before this database's run log
+  starts (``before_run_log``), or the day is past run-log retention. The
+  observations saved that day are listed too.
 - ``by="observed"``: observations whose ``observed_at`` falls on the day,
   as a date (``YYYY-MM-DD``) or a UTC instant, one item per series and
   observed_at with its latest stored value and how many values were
   stored for it. Month (``YYYY-MM``) and year (``YYYY``) values that
-  contain the day are listed separately, as period values. Observations
-  without ``observed_at`` cannot be placed on any day: they are excluded,
-  and the ones collected that day are counted.
+  contain the day are listed separately, as period values; the two lists
+  share one ``limit`` and ``per_source_limit``. Observations without
+  ``observed_at`` cannot be placed on any day: they are excluded, and the
+  ones collected that day are counted. Captures of the day and the day
+  after whose extractor failed are counted, since their values for the
+  day are missing.
 
 The day is ``YYYY-MM-DD`` in UTC, the half-open window
 ``[day 00:00:00Z, next day 00:00:00Z)``. Collection times are compared as
 epoch seconds, ``observed_at`` as stored text (the store keeps instants in
 UTC as ``YYYY-MM-DDTHH:MM:SSZ``). A future day is an error; today is
 allowed and reported as in progress.
+
+Coverage. Pruning deletes run-log captures older than one cutoff, for
+every source at once, and the history store stamps each capture with the
+time it inserts it. So a stored capture older than the day proves that
+nothing of the day was pruned, and the run log covers the whole day.
+When the run log's oldest capture falls on or after the day's start, the
+time before it is not covered: the database was not recording yet, or
+older captures were pruned, and the store cannot say which. Counts,
+states and the longest gap then cover only the part from that capture
+on, and a day before the run log starts reads ``not_recorded``, never as
+a day on which the collector did not run.
 
 Retention (``history.retention_days()``) is stated per record kind for the
 requested day, so a day whose records were pruned reads as pruned, never
@@ -43,12 +61,19 @@ Gaps / not covered:
 - Retention windows come from this process's environment. The collector
   prunes with its own, so a collector run with different
   ``WORLD_INTEL_HISTORY_*`` values makes the windows stated here wrong.
+- Coverage assumes captures are stamped when they are inserted and
+  removed only by the store's pruning. A capture written with an older
+  timestamp (a restored backup, a hand edit) would make a pruned day read
+  as covered.
 - A date-only ``observed_at`` is the publisher's calendar date; it is
   matched to the requested day by its label, not converted from the
   publisher's time zone, which the payloads do not state.
 - Collector cycles are not stored as such: "the collector did not run"
-  means no capture of any source is recorded in the day's window of this
-  database.
+  means no capture of any source is recorded in the covered part of the
+  day's window of this database.
+- The observed-date view checks for extractor failures only in captures
+  collected on the day and the day after; a failed capture outside that
+  span that held values for the day is not counted.
 - The observed-date view costs one index seek per distinct series key.
   USGS quakes get a series per event, so the cost grows with the event
   count: about 12 ms for 11,000 series in 1.75 million rows, measured on
@@ -74,7 +99,7 @@ DEFAULT_LIMIT = 100
 DEFAULT_PER_SOURCE_LIMIT = 10
 MAX_LIMIT = 5000
 MAX_PER_SOURCE_LIMIT = 1000
-# Distinct (status, reason) pairs shown per source; the rest are counted.
+# Distinct (kind, status, reason) entries shown per source; the rest are counted.
 MAX_REASONS = 5
 
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -102,13 +127,34 @@ WHERE c.collected_at >= :start AND c.collected_at < :end
 GROUP BY c.source
 """
 
+# Capture reasons, then extraction notes the capture reason does not
+# already quote (an extractor whose points were all refused makes the
+# capture degraded with the note in its reason).
 _CAPTURE_REASONS_SQL = """
-SELECT source, status, error, COUNT(*), MIN(collected_at), MAX(collected_at)
+SELECT source, 'capture', status, error, COUNT(*), MIN(collected_at), MAX(collected_at)
 FROM history_captures
 WHERE collected_at >= :start AND collected_at < :end AND error IS NOT NULL
   AND (:source IS NULL OR source = :source)
 GROUP BY source, status, error
-ORDER BY source, COUNT(*) DESC, MAX(collected_at) DESC
+UNION ALL
+SELECT source, 'extraction', status, extract_error, COUNT(*), MIN(collected_at),
+       MAX(collected_at)
+FROM history_captures
+WHERE collected_at >= :start AND collected_at < :end AND extract_error IS NOT NULL
+  AND (error IS NULL OR instr(error, extract_error) = 0)
+  AND (:source IS NULL OR source = :source)
+GROUP BY source, status, extract_error
+ORDER BY 1, 5 DESC, 7 DESC, 2, 4
+"""
+
+# history._extract leaves observations_extracted NULL when the extractor
+# raised, and sets it (with a note) when it refused some returned points.
+_EXTRACTION_SQL = """
+SELECT source, SUM(observations_extracted IS NULL), SUM(observations_extracted IS NOT NULL)
+FROM history_captures
+WHERE collected_at >= :start AND collected_at < :end AND extract_error IS NOT NULL
+  AND (:source IS NULL OR source = :source)
+GROUP BY source
 """
 
 _COLLECTOR_DAY_SQL = """
@@ -191,18 +237,20 @@ WITH RECURSIVE keys(k) AS (
 )
 """
 
-# Every stored string with the day as prefix sorts between :day and
-# :day_last ('<day>T23:59:59Z'); the CASE keeps the two recognized forms
-# and leaves anything else (only a writer bypassing record_cycle can
-# store it) NULL, to be counted rather than shown.
+# Every stored string with the day as prefix sorts in [:day, :day_upper),
+# :day_upper being the day with its last character incremented
+# ('2026-10-19' -> '2026-10-1:'). The CASE keeps the two recognized forms
+# (hours 00 to 23) and leaves anything else (only a writer bypassing
+# record_cycle can store it) NULL, to be counted rather than shown.
 _DAY_MATCHED_CTE = """
 , matched AS (
     SELECT o.id, o.source, o.series_key, o.observed_at, o.published_at, o.collected_at,
            o.value, o.unit, o.label, o.capture_id,
            CASE WHEN o.observed_at = :day THEN 'date'
-                WHEN o.observed_at GLOB :instant_glob THEN 'instant' END AS precision
+                WHEN o.observed_at GLOB :instant_glob
+                     AND substr(o.observed_at, 12, 2) <= '23' THEN 'instant' END AS precision
     FROM keys JOIN history_observations o
-      ON o.series_key = keys.k AND o.observed_at >= :day AND o.observed_at <= :day_last
+      ON o.series_key = keys.k AND o.observed_at >= :day AND o.observed_at < :day_upper
     WHERE :source IS NULL OR o.source = :source
 )
 """
@@ -274,10 +322,14 @@ STATES_EXPLAINED = {
     "degraded": "no ok capture that day; every delivered payload was marked stale or "
     "degraded, was empty, or lacked the measures its extractor expects",
     "failed": "every attempt that day was an error (reasons lists why)",
-    "not_attempted": "the collector captured other sources that day but not this one; "
-    "this source has captures on other days",
-    "collector_did_not_run": "no capture of any source is recorded that day",
+    "not_attempted": "the collector captured other sources that day (in the part of it the "
+    "run log covers) but not this one; this source has captures on other days",
+    "collector_did_not_run": "no capture of any source is recorded that day, and the run "
+    "log covers the whole day (it still holds an older capture)",
     "never_run": "no capture of this source anywhere in the retained run log",
+    "before_run_log": "the day is before the first capture in this database's run log (it "
+    "was not recording yet, or older captures were pruned): whether this source ran cannot "
+    "be read",
     "unknown_past_retention": "part or all of the day is past run-log retention and no "
     "capture of this source from it remains: whether it ran cannot be read",
 }
@@ -317,11 +369,20 @@ def _iso(ts: float | None) -> str | None:
 
 
 def _bounded(value: Any, default: int, maximum: int) -> int:
+    """A count clamped to 1..maximum. An integral float (MCP clients send
+    JSON 7 as 7.0) is that integer; a bool, a fraction, inf or nan gets
+    the default rather than a truncated or coerced value."""
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return default
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(1, min(maximum, number))
+
+
+def _per_source(counts: dict[str, int]) -> str:
+    return ", ".join(f"{name} {count:,}" for name, count in sorted(counts.items()))
 
 
 def parse_day(value: Any, now: float) -> tuple[date | None, str | None]:
@@ -373,6 +434,10 @@ class _Reader:
     def __init__(self, conn: sqlite3.Connection | None):
         self.conn = conn
 
+    @property
+    def available(self) -> bool:
+        return self.conn is not None
+
     def all(self, sql: str, params: dict | None = None) -> list[tuple]:
         if self.conn is None:
             return []
@@ -384,23 +449,32 @@ class _Reader:
 
 
 def _connect(db_path: Path) -> sqlite3.Connection | None:
-    """A read-only connection, or None when the database does not exist
-    (opening it read-only never creates it)."""
+    """A read-only connection inside one read transaction, or None when the
+    database does not exist (opening it read-only never creates it).
+
+    The transaction gives every statement of a call the snapshot its first
+    read saw, so a collector cycle committed mid-call cannot make the
+    answer disagree with itself; closing the connection ends it."""
     path = Path(db_path).resolve()
     if not path.exists():
         return None
-    return sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=10)
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=10)
+    try:
+        conn.execute("BEGIN")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
 
 
-def _has_history_tables(conn: sqlite3.Connection) -> bool:
-    found = {
+def _history_tables(conn: sqlite3.Connection) -> set[str]:
+    return {
         row[0]
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
             _TABLES,
         )
     }
-    return found == set(_TABLES)
 
 
 def _retention(window: _Window) -> dict:
@@ -434,6 +508,12 @@ def _public_retention(retention: dict) -> dict:
     }
 
 
+def _covers_whole_day(log_first: float | None, w: _Window) -> bool:
+    """True when the run log still holds a capture older than the day:
+    pruning cuts every source at one cutoff, so none of the day was pruned."""
+    return log_first is not None and log_first < w.start
+
+
 def _item(row: tuple) -> dict:
     (source, series_key, observed_at, published_at, collected_at, value, unit, label,
      capture_id, capture_retained) = row[:10]
@@ -460,6 +540,20 @@ def _point(row: tuple) -> dict:
         item["first_value"] = first_value
         item["first_collected_at"] = _iso(first_collected_at)
     return item
+
+
+def _within_budget(items: list[dict], room: int, per_source: int, used: Counter) -> list[dict]:
+    """The leading items that fit in ``room`` more in all and in what
+    ``used`` left of ``per_source`` for each source."""
+    kept: list[dict] = []
+    taken = Counter(used)
+    for item in items:
+        if len(kept) >= room:
+            break
+        if taken[item["source"]] < per_source:
+            taken[item["source"]] += 1
+            kept.append(item)
+    return kept
 
 
 def _truncation(matched_by_source: dict[str, int], items: list[dict], limit: int,
@@ -495,10 +589,11 @@ def _truncation_gap(what: str, block: dict, order: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _collector_block(r: _Reader, w: _Window, run_log: dict) -> dict:
+def _collector_block(r: _Reader, w: _Window, run_log: dict, log_first: float | None,
+                     log_last: float | None) -> dict:
     params = {"start": w.start, "end": w.end}
     captures, sources, first, last = r.one(_COLLECTOR_DAY_SQL, params, (0, 0, None, None))
-    log_first, log_last = r.one(_RUN_LOG_BOUNDS_SQL, None, (None, None))
+    whole_day = _covers_whole_day(log_first, w)
     block: dict[str, Any] = {
         "captures": captures,
         "sources_captured": sources,
@@ -506,18 +601,17 @@ def _collector_block(r: _Reader, w: _Window, run_log: dict) -> dict:
         "run_log_last_capture_at": _iso(log_last),
     }
     if captures:
-        # The retained part of the day starts at the run-log cutoff when
-        # the day straddles it; time before that is unknown, not silent.
-        lower = w.start
-        if run_log["day"] == "partly_past_window":
-            lower = min(max(w.start, run_log["cutoff_ts"]), first)
-        spans = [(lower, first), (last, min(w.end, w.now))]
+        # The run log covers the day from its oldest capture on; time
+        # before that capture is unrecorded, not a stretch without one.
+        covered_from = w.start if whole_day else log_first
+        spans = [(covered_from, first), (last, min(w.end, w.now))]
         internal = r.one(_LONGEST_INTERNAL_GAP_SQL, params, (None, None))
         if internal[0] is not None:
             spans.append(internal)
         gap_from, gap_to = max(spans, key=lambda span: span[1] - span[0])
         block.update(
             state="ran",
+            covered_from=_iso(covered_from),
             first_capture_at=_iso(first),
             last_capture_at=_iso(last),
             longest_gap_s=round(max(0.0, gap_to - gap_from), 1),
@@ -526,7 +620,7 @@ def _collector_block(r: _Reader, w: _Window, run_log: dict) -> dict:
             explanation=f"{captures:,} captures of {sources} source(s) are recorded that day.",
         )
         return block
-    if run_log["day"] in ("past_window", "partly_past_window"):
+    if run_log["day"] in ("past_window", "partly_past_window") and not whole_day:
         block.update(
             state="unknown_past_retention",
             explanation=(
@@ -537,10 +631,23 @@ def _collector_block(r: _Reader, w: _Window, run_log: dict) -> dict:
         )
         return block
     if log_first is None:
-        context, why = "empty_run_log", "the run log has no capture at all in this database"
-    elif log_first >= w.end:
-        context, why = "before_first_capture", f"the run log starts later, at {_iso(log_first)}"
-    elif log_last < w.start:
+        block.update(
+            state="not_recorded",
+            context="empty_run_log",
+            explanation="The run log in this database has no capture at all: nothing is "
+            "recorded here, so whether the collector ran that day cannot be read.",
+        )
+        return block
+    if log_first >= w.end:
+        block.update(
+            state="not_recorded",
+            context="before_first_capture",
+            explanation=f"The run log in this database starts later, at {_iso(log_first)}: "
+            "no capture before then is recorded here, so whether the collector ran that day "
+            "cannot be read.",
+        )
+        return block
+    if log_last < w.start:
         context, why = "after_last_capture", f"no capture is recorded since {_iso(log_last)}"
     else:
         context, why = "between_captures", "captures exist before and after this day"
@@ -564,6 +671,74 @@ def _captured_state(ok: int, degraded: int, changed: int, unchanged: int, first:
     return "answered"
 
 
+def _run_log_gaps(r: _Reader, w: _Window, run_log: dict, collector: dict, whole_day: bool,
+                  retained_captures: int, retained_obs: int) -> list[str]:
+    """Retention and coverage of the day's run log, most important first."""
+    gaps = []
+    oldest = collector["run_log_first_capture_at"]
+    if run_log["day"] == "past_window":
+        if retained_captures:
+            gaps.append(
+                f"This day is past the {run_log['days']:g}-day run-log retention (cutoff "
+                f"{run_log['cutoff']}); its {retained_captures:,} captures are still here only "
+                "because pruning runs at the end of a collector cycle, and the next cycle "
+                "removes them."
+            )
+        elif whole_day:
+            gaps.append(
+                f"This day is past the {run_log['days']:g}-day run-log retention (cutoff "
+                f"{run_log['cutoff']}), but the run log still holds an older capture "
+                f"({oldest}), so nothing from this day was pruned: the collector recorded no "
+                "capture of any source that day."
+            )
+        else:
+            # Observations collected that day prove it had captures; without
+            # them the day may equally predate this database.
+            what = "its captures are gone" if retained_obs else "any captures from it are gone"
+            gaps.append(
+                f"The run log keeps captures {run_log['days']:g} days (cutoff "
+                f"{run_log['cutoff']}); this day is past it, so {what}. Whether the collector "
+                "or any source ran that day cannot be read here: absence is not evidence "
+                "that nothing happened."
+            )
+    elif run_log["day"] == "partly_past_window":
+        if whole_day:
+            gaps.append(
+                f"Part of this day is past the {run_log['days']:g}-day run-log retention "
+                f"(cutoff {run_log['cutoff']}), but the run log still holds an older capture "
+                f"({oldest}), so no capture from this day has been pruned yet. Pruning runs "
+                "at the end of each collector cycle, so the next one removes this day's "
+                "captures from before the cutoff."
+            )
+        else:
+            gaps.append(
+                f"Captures before {run_log['cutoff']} (the {run_log['days']:g}-day run-log "
+                "cutoff) are pruned: this day's earlier hours may be missing from the counts "
+                "above, and a source shown as unknown_past_retention may have run then."
+            )
+    if retained_captures and not whole_day:
+        gaps.append(
+            f"The run log holds no capture before {oldest}, its oldest: this day before then "
+            "is not covered (this database was not recording yet, or older captures were "
+            f"pruned), so counts, states and the longest gap cover only {oldest} onward."
+        )
+    if collector["state"] == "not_recorded" and r.available:
+        day = w.day.isoformat()
+        if collector["context"] == "before_first_capture":
+            gaps.append(
+                f"This database's run log starts at {oldest}: no capture before then is "
+                "recorded here (the database was not recording yet, or older captures were "
+                f"pruned), so whether the collector or any source ran on {day} cannot be read. "
+                "Absence is not evidence that nothing ran."
+            )
+        else:
+            gaps.append(
+                "The run log in this database has no capture: no collector cycle is recorded "
+                f"here yet, so whether the collector or any source ran on {day} cannot be read."
+            )
+    return gaps
+
+
 def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
                     source: str | None, limit: int, per_source: int,
                     retention: dict) -> dict:
@@ -573,8 +748,11 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
     reasons: dict[str, list[tuple]] = {}
     for row in r.all(_CAPTURE_REASONS_SQL, params):
         reasons.setdefault(row[0], []).append(row[1:])
+    extraction = {row[0]: row[1:] for row in r.all(_EXTRACTION_SQL, params)}
     obs_counts = dict(r.all(_COLLECTED_OBS_COUNTS_SQL, params))
-    collector = _collector_block(r, w, run_log)
+    log_first, log_last = r.one(_RUN_LOG_BOUNDS_SQL, None, (None, None))
+    whole_day = _covers_whole_day(log_first, w)
+    collector = _collector_block(r, w, run_log, log_first, log_last)
 
     if source is None:
         names = names + sorted((set(summary) | set(obs_counts)) - set(names))
@@ -584,7 +762,7 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
         entry: dict[str, Any] = {"source": name, "in_collector_roster": name in roster}
         cap = summary.get(name)
         if cap is None:
-            if run_log["day"] in ("past_window", "partly_past_window"):
+            if run_log["day"] in ("past_window", "partly_past_window") and not whole_day:
                 state = "unknown_past_retention"
             else:
                 before, after = r.one(
@@ -593,6 +771,8 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
                 )
                 if before is None and after is None:
                     state = "never_run"
+                elif log_first >= w.end:
+                    state = "before_run_log"
                 elif collector["captures"] == 0:
                     state = "collector_did_not_run"
                 else:
@@ -604,11 +784,13 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
             continue
         (_, attempts, ok, degraded, error, changed, unchanged, first, not_stored,
          first_at, last_at, obs_stored, with_extractor, bodies_kept, bodies_pruned) = cap
+        raised, skipped = extraction.get(name, (0, 0))
         source_reasons = reasons.get(name, [])
         entry.update(
             day_state=_captured_state(ok, degraded, changed, unchanged, first),
             attempts=attempts,
             status_counts={"ok": ok, "degraded": degraded, "error": error},
+            partial_failure=bool(error and (ok or degraded)),
             payload_changes={
                 "changed": changed, "unchanged": unchanged, "first": first,
                 "not_stored": not_stored,
@@ -617,14 +799,22 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
             last_capture_at=_iso(last_at),
             observations_stored=obs_stored if with_extractor else None,
             observations_retained=retained_obs,
+            captures_extractor_raised=raised,
+            captures_points_skipped=skipped,
             captures_with_body_retained=bodies_kept,
             captures_with_body_pruned=bodies_pruned,
             reasons=[
-                {"status": status, "reason": reason, "count": count,
+                {"kind": kind, "status": status, "reason": reason, "count": count,
                  "first_at": _iso(r_first), "last_at": _iso(r_last)}
-                for status, reason, count, r_first, r_last in source_reasons[:MAX_REASONS]
+                for kind, status, reason, count, r_first, r_last in source_reasons[:MAX_REASONS]
             ],
         )
+        if raised:
+            entry["observations_stored_note"] = (
+                f"the extractor raised on {raised:,} capture(s), which stored nothing; "
+                + (f"this counts the {with_extractor:,} it ran on" if with_extractor
+                   else "it ran on no capture that day, so the count is unknown")
+            )
         if len(source_reasons) > MAX_REASONS:
             entry["more_reasons"] = len(source_reasons) - MAX_REASONS
         rows.append(entry)
@@ -637,36 +827,36 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
     ]
     truncation = _truncation(obs_counts, items, limit, per_source)
 
-    gaps = []
     retained_captures = sum(row[1] for row in summary.values())
-    if run_log["day"] == "past_window":
-        if retained_captures:
-            gaps.append(
-                f"This day is past the {run_log['days']:g}-day run-log retention (cutoff "
-                f"{run_log['cutoff']}); its {retained_captures:,} captures are still here only "
-                "because pruning runs at the end of a collector cycle, and the next cycle "
-                "removes them."
-            )
-        else:
-            gaps.append(
-                f"The run log keeps captures {run_log['days']:g} days (cutoff "
-                f"{run_log['cutoff']}); this day is past it, so its captures are gone. Whether "
-                "the collector or any source ran that day cannot be read here: absence is "
-                "not evidence that nothing happened."
-            )
-    elif run_log["day"] == "partly_past_window":
+    gaps = _run_log_gaps(r, w, run_log, collector, whole_day, retained_captures,
+                         sum(obs_counts.values()))
+    raised_by = {name: c[0] for name, c in extraction.items() if c[0]}
+    skipped_by = {name: c[1] for name, c in extraction.items() if c[1]}
+    if raised_by:
         gaps.append(
-            f"Captures before {run_log['cutoff']} (the {run_log['days']:g}-day run-log cutoff) "
-            "are pruned: this day's earlier hours may be missing from the counts above, and "
-            "a source shown as unknown_past_retention may have run then."
+            f"History extractors raised on {sum(raised_by.values()):,} capture(s) that day "
+            f"({_per_source(raised_by)}): those captures stored no observations, so "
+            "observations_stored and the observed-date view miss whatever they held; each "
+            "source's reasons give the error."
+        )
+    if skipped_by:
+        gaps.append(
+            f"{sum(skipped_by.values()):,} capture(s) that day had points their extractor "
+            f"returned but the store refused as invalid ({_per_source(skipped_by)}): those "
+            "points were not stored."
         )
     pruned_bodies = sum(row[14] for row in summary.values())
     kept_bodies = sum(row[13] for row in summary.values())
     if pruned_bodies:
+        body_days = retention["payload_bodies"]["days"]
+        kept = (
+            f"bodies are kept {body_days:g} days after the payload was last seen"
+            if body_days > 0 else "this server's settings keep bodies forever, so the "
+            "collector pruned them with its own WORLD_INTEL_HISTORY_PAYLOAD_DAYS"
+        )
         gaps.append(
-            f"Payload bodies of {pruned_bodies:,} of this day's captures were pruned (bodies "
-            f"are kept {retention['payload_bodies']['days']:g} days after the payload was last "
-            "seen); intel_capture_history can replay only captures whose body is retained "
+            f"Payload bodies of {pruned_bodies:,} of this day's captures were pruned ({kept}); "
+            "intel_capture_history can replay only captures whose body is retained "
             f"({kept_bodies:,} of {kept_bodies + pruned_bodies:,})."
         )
     observations = retention["observations"]
@@ -687,6 +877,7 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
         "collector": collector,
         "sources": rows,
         "state_counts": states,
+        "partial_failure_sources": [row["source"] for row in rows if row.get("partial_failure")],
         "observations": items,
         "truncation": truncation,
         "data_gaps": gaps,
@@ -699,6 +890,8 @@ def _collected_view(r: _Reader, w: _Window, names: list[str], roster: set[str],
             "upstream published new data.",
             "A degraded capture with no records cannot tell a quiet period from a silent "
             "upstream failure.",
+            "Coverage is inferred: a stored capture older than the day means none of the "
+            "day was pruned, because the store stamps captures when it inserts them.",
             HISTORY_ACCRUAL_NOTE,
         ],
     }
@@ -714,18 +907,30 @@ def _observed_view(r: _Reader, w: _Window, obs_sources: list[str], roster: set[s
                    retention: dict) -> dict:
     day = w.day.isoformat()
     base = {"source": source, "per_source": per_source, "limit": limit}
-    day_params = {**base, "day": day, "day_last": f"{day}T23:59:59Z",
+    day_params = {**base, "day": day, "day_upper": day[:-1] + chr(ord(day[-1]) + 1),
                   "instant_glob": f"{day}T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z"}
     period_params = {**base, "month": day[:7], "year": day[:4]}
+    # Captures of the day and the next can hold values observed on the day
+    # (the K-index payload spans 24 hours); failed extractions there lose them.
+    checked_to = w.end + 86400.0
+    extraction = {
+        row[0]: row[1:]
+        for row in r.all(_EXTRACTION_SQL, {"start": w.start, "end": checked_to, "source": source})
+    }
 
     day_counts = {row[0]: row[1:] for row in r.all(_DAY_COUNTS_SQL, day_params)}
     period_counts = {row[0]: row[1:] for row in r.all(_PERIOD_COUNTS_SQL, period_params)}
     no_date = dict(r.all(_NO_OBSERVED_AT_SQL, {"start": w.start, "end": w.end, "source": source}))
     day_items = [_point(row) for row in r.all(_DAY_ITEMS_SQL, day_params)]
-    period_items = [_point(row) for row in r.all(_PERIOD_ITEMS_SQL, period_params)]
+    # One budget for both lists: period values get what the day values left,
+    # in all and per source. The query's own caps return enough rows for that.
+    period_items = _within_budget(
+        [_point(row) for row in r.all(_PERIOD_ITEMS_SQL, period_params)],
+        limit - len(day_items), per_source, Counter(item["source"] for item in day_items),
+    )
 
     names = [source] if source is not None else sorted(
-        set(obs_sources) | set(day_counts) | set(period_counts) | set(no_date)
+        set(obs_sources) | set(day_counts) | set(period_counts) | set(no_date) | set(extraction)
     )
     rows = []
     for name in names:
@@ -751,10 +956,10 @@ def _observed_view(r: _Reader, w: _Window, obs_sources: list[str], roster: set[s
     gaps = []
     excluded = sum(no_date.values())
     if excluded:
-        by_source = ", ".join(f"{name} {count:,}" for name, count in sorted(no_date.items()))
         gaps.append(
             f"{excluded:,} observation(s) collected this day have no observed_at "
-            f"({by_source}) and are excluded: {_NO_OBSERVED_AT_REASON}. by=collected lists them."
+            f"({_per_source(no_date)}) and are excluded: {_NO_OBSERVED_AT_REASON}. by=collected "
+            "lists them."
         )
     unrecognized_total = sum(c[2] for c in day_counts.values())
     if unrecognized_total:
@@ -762,6 +967,22 @@ def _observed_view(r: _Reader, w: _Window, obs_sources: list[str], roster: set[s
             f"{unrecognized_total:,} stored observed_at value(s) on this day are in neither "
             f"recognized form ({day} or {day}THH:MM:SSZ) and are excluded; only a writer "
             "that bypasses the history store's validation can store them."
+        )
+    raised_by = {name: c[0] for name, c in extraction.items() if c[0]}
+    skipped_by = {name: c[1] for name, c in extraction.items() if c[1]}
+    span = f"from {_iso(w.start)} to {_iso(checked_to)}"
+    if raised_by:
+        gaps.append(
+            f"History extractors raised on {sum(raised_by.values()):,} capture(s) collected "
+            f"{span} ({_per_source(raised_by)}): values for {day} that those captures held "
+            "were not stored, so day_values may miss them. Captures collected outside that "
+            "span are not checked."
+        )
+    if skipped_by:
+        gaps.append(
+            f"{sum(skipped_by.values()):,} capture(s) collected {span} had points the store "
+            f"refused as invalid ({_per_source(skipped_by)}); values for {day} among them "
+            "are missing."
         )
     observations = retention["observations"]
     if observations["day"] in ("past_window", "partly_past_window"):
@@ -774,13 +995,22 @@ def _observed_view(r: _Reader, w: _Window, obs_sources: list[str], roster: set[s
         1 for item in day_items + period_items if not item["capture_retained"]
     )
     if pruned_captures:
+        log_days = retention["run_log"]["days"]
+        kept = (
+            f"the run log keeps {log_days:g} days" if log_days > 0
+            else "this server's settings keep the run log forever, so the collector pruned "
+            "it with its own WORLD_INTEL_HISTORY_CAPTURE_DAYS"
+        )
         gaps.append(
             f"{pruned_captures:,} listed value(s) outlived the capture that produced them "
-            f"(the run log keeps {retention['run_log']['days']:g} days); capture_retained "
-            "marks them."
+            f"({kept}); capture_retained marks them."
         )
-    for what, block in (("Day values", day_truncation), ("Period values", period_truncation)):
-        truncated = _truncation_gap(what, block, "by observed_at, then series")
+    for what, block, order in (
+        ("Day values", day_truncation, "by observed_at, then series"),
+        ("Period values", period_truncation,
+         "by observed_at, then series, after the day values, which share these caps"),
+    ):
+        truncated = _truncation_gap(what, block, order)
         if truncated:
             gaps.append(truncated)
     if w.in_progress:
@@ -797,6 +1027,15 @@ def _observed_view(r: _Reader, w: _Window, obs_sources: list[str], roster: set[s
             "collected_that_day": excluded,
             "by_source": dict(sorted(no_date.items())),
             "reason": _NO_OBSERVED_AT_REASON,
+        },
+        "extraction_problems": {
+            "captures_from": _iso(w.start),
+            "captures_to": _iso(checked_to),
+            "end_exclusive": True,
+            "by_source": {
+                name: {"extractor_raised": c[0], "points_skipped": c[1]}
+                for name, c in sorted(extraction.items())
+            },
         },
         "truncation": {"day_values": day_truncation, "period_values": period_truncation},
         "precision_explained": PRECISION_EXPLAINED,
@@ -854,7 +1093,16 @@ def day_timeline(
     except sqlite3.Error as exc:
         return {"error": f"history store could not be opened read-only: {exc}"}
     try:
-        ready = conn is not None and _has_history_tables(conn)
+        found = _history_tables(conn) if conn is not None else set()
+        if found and found != set(_TABLES):
+            missing = sorted(set(_TABLES) - found)
+            return {
+                "error": f"history store in {Path(db_path)} is incomplete: table(s) "
+                f"{', '.join(missing)} missing, so no day can be read from it",
+                "missing_tables": missing,
+                "db_path": str(db_path),
+            }
+        ready = bool(found)
         r = _Reader(conn if ready else None)
         logged = [row[0] for row in r.all(_CAPTURE_SOURCES_SQL)]
         obs_sources = [row[0] for row in r.all(_OBSERVATION_SOURCES_SQL)]

@@ -27,16 +27,18 @@ TOOLS: list[Tool] = [
             "What the history store recorded for one UTC calendar day (YYYY-MM-DD; today "
             "allowed, a future day refused). by=collected (default): per source, that day's "
             "collector captures from the run log (attempts; ok / degraded / error counts with "
-            "reasons; changed vs unchanged payloads; first and last capture; observations "
-            "stored), sources with no capture that day and why, whether the collector ran at "
-            "all, and the observations saved that day. by=observed: values whose observed_at "
-            "falls on the day (dates and UTC instants); month and year values containing the "
-            "day are listed apart as period values; values without observed_at are excluded "
-            "and counted. Items carry observed_at, published_at and collected_at where known. "
-            "Says which records are past retention (payload bodies 7 days, run log 30, "
-            "observations 365 by default) instead of reading them as a quiet day. Output is "
-            "capped and truncation is stated. Read-only: never fetches. History accrues only "
-            "while the collector (intel-collector, or intel_collect) runs."
+            "reasons; extractor failures; partial failures; changed vs unchanged payloads; "
+            "first and last capture; observations stored), sources with no capture that day "
+            "and why, whether the collector ran or the day is before this database's run log "
+            "starts (not_recorded), and the observations saved that day. by=observed: values "
+            "whose observed_at falls on the day (dates and UTC instants); month and year values "
+            "containing the day are listed apart as period values; values without observed_at "
+            "are excluded and counted. Items carry observed_at, published_at and collected_at "
+            "where known. Says which records are past retention (payload bodies 7 days, run "
+            "log 30, observations 365 by default) or before the run log starts, instead of "
+            "reading them as a quiet day. Output is capped (in by=observed both lists share "
+            "the caps) and truncation is stated. Read-only: never fetches. History accrues "
+            "only while the collector (intel-collector, or intel_collect) runs."
         ),
         inputSchema={
             "type": "object",
@@ -59,14 +61,15 @@ TOOLS: list[Tool] = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": f"Most items listed in all (default {DEFAULT_LIMIT}, "
-                    f"max {MAX_LIMIT})",
+                    "description": "Most items listed in all, across both lists of "
+                    f"by=observed (default {DEFAULT_LIMIT}, max {MAX_LIMIT})",
                     "default": DEFAULT_LIMIT,
                 },
                 "per_source_limit": {
                     "type": "integer",
-                    "description": f"Most items listed per source (default "
-                    f"{DEFAULT_PER_SOURCE_LIMIT}, max {MAX_PER_SOURCE_LIMIT})",
+                    "description": "Most items listed per source, across both lists of "
+                    f"by=observed (default {DEFAULT_PER_SOURCE_LIMIT}, max "
+                    f"{MAX_PER_SOURCE_LIMIT})",
                     "default": DEFAULT_PER_SOURCE_LIMIT,
                 },
             },

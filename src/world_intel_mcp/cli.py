@@ -3840,8 +3840,10 @@ def history_connections(
     help="collected: what was captured that day; observed: values whose observed_at is that day",
 )
 @click.option("--source", default=None, help="One collector source name")
-@click.option("--limit", default=None, type=int, help="Most items listed in all")
-@click.option("--per-source", "per_source", default=None, type=int, help="Most items listed per source")
+@click.option("--limit", default=None, type=int,
+              help="Most items listed in all (with --by observed, both lists together)")
+@click.option("--per-source", "per_source", default=None, type=int,
+              help="Most items listed per source (with --by observed, both lists together)")
 @click.pass_context
 def history_day(
     ctx: click.Context,
@@ -3914,13 +3916,23 @@ def _print_day_collected(data: dict) -> None:
     for row in data["sources"]:
         counts = row.get("status_counts") or {}
         changes = row.get("payload_changes") or {}
+        state = Text(row["day_state"], style=styles.get(row["day_state"], "yellow"))
         if row["attempts"]:
             top = (row.get("reasons") or [None])[0]
-            context = f"{top['reason']} (x{top['count']})" if top else ""
+            context = ""
+            if top:
+                kind = "extraction: " if top.get("kind") == "extraction" else ""
+                context = f"{kind}{top['reason']} (x{top['count']})"
             if row.get("more_reasons"):
                 context += f" +{row['more_reasons']} more"
             stored = row.get("observations_stored")
-            obs = "-" if stored is None else str(stored)
+            if stored is not None:
+                obs = str(stored)
+            else:
+                # An extractor that raised stored nothing: unknown, not "none".
+                obs = "?" if row.get("captures_extractor_raised") else "-"
+            if row.get("partial_failure"):
+                state = Text(f"{row['day_state']}, {counts['error']} failed", style="yellow")
         else:
             parts = []
             if row.get("last_capture_before"):
@@ -3931,7 +3943,7 @@ def _print_day_collected(data: dict) -> None:
             obs = str(row["observations_retained"]) if row["observations_retained"] else "-"
         table.add_row(
             _cell(row["source"]),
-            Text(row["day_state"], style=styles.get(row["day_state"], "yellow")),
+            state,
             str(row["attempts"]),
             str(counts.get("ok", "-")),
             str(counts.get("degraded", "-")),
