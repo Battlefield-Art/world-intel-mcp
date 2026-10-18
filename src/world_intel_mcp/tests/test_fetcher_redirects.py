@@ -10,6 +10,8 @@ Gaps / not covered: get_text, get_json and get_xml have no such option
 and keep following redirects.
 """
 
+import inspect
+
 import httpx
 import pytest
 import respx
@@ -73,9 +75,16 @@ async def test_get_bytes_without_following_still_returns_a_direct_body(
 @pytest.mark.asyncio
 async def test_follow_redirects_is_keyword_only(fetcher: Fetcher) -> None:
     """Keyword-only, so other keyword parameters of get_bytes can be added
-    without moving it."""
+    without moving it. The call fills every other positional parameter and
+    passes one more, so the check holds whatever positional parameters
+    get_bytes gains, and fails if follow_redirects is one of them."""
+    positional = [
+        p for p in inspect.signature(fetcher.get_bytes).parameters.values()
+        if p.kind is p.POSITIONAL_OR_KEYWORD and p.name != "follow_redirects"
+    ]
+    assert positional[:2] == list(inspect.signature(fetcher.get_bytes).parameters.values())[:2]
     with pytest.raises(TypeError):
-        await fetcher.get_bytes("https://a.test/x", "t", None, None, 10, False)
+        await fetcher.get_bytes("https://a.test/x", "t", *[None] * (len(positional) - 2), False)
 
 
 @respx.mock
