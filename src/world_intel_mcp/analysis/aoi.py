@@ -1434,7 +1434,7 @@ async def _gather_scoped_domains(fetcher, aoi_row: dict) -> dict[str, dict]:
             conflict_result, "events", aoi_row, "latitude", "longitude"
         ),
         "wildfires": _scope_to_aoi(wildfire_result, "clusters", aoi_row, "lat", "lon"),
-        "aviation": _scope_to_aoi(aviation_result, "sampled", aoi_row, "lat", "lon"),
+        "aviation": _scope_to_aoi(aviation_result, "positions", aoi_row, "lat", "lon"),
     }
 
     if isinstance(news_result, dict) and news_result.get("error"):
