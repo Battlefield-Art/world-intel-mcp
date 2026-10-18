@@ -1458,7 +1458,8 @@ async def fetch_aoi_brief(fetcher, store: AOIStore, name: Any) -> dict:
     """Compose a cited brief for a user-defined AOI: earthquakes, military
     flights (bbox-derived), wildfires (region-mapped), ACLED conflict
     events, sampled aviation traffic, nearby static infrastructure, and
-    news headline mentions of the AOI name. Every listed item carries a
+    news about the place the AOI sits in (see ``_aoi_news_query``). Every
+    listed item carries a
     ``[n]`` citation; ``data_gaps`` names every domain that could not be
     scoped to the AOI rather than silently omitting it.
     """
@@ -1684,7 +1685,7 @@ async def fetch_aoi_brief(fetcher, store: AOIStore, name: Any) -> dict:
         ("conflict_events", "Conflict Events (ACLED)"),
         ("wildfires", "Wildfires"),
         ("aviation", "Aviation (sampled)"),
-        ("news", "News Headline Mentions"),
+        ("news", "News Near the AOI"),
         *[(k, v) for k, v in _INFRA_LABELS.items()],
     ]
     for domain, label in section_order:

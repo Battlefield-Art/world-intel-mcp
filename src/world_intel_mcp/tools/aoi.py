@@ -66,7 +66,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="intel_aoi_brief",
-        description="Cited brief for a user-defined AOI: earthquakes, military flights (bbox-derived), wildfires (region-mapped), ACLED conflict events, sampled aviation traffic, nearby static infrastructure (bases, ports, pipelines, nuclear, cables, datacenters, spaceports) with distances in km, and news headline mentions of the AOI name. Every item carries a [n] citation into a numbered sources list; data_gaps names every domain that could not be scoped to the AOI rather than omitting it silently. Required: name (must already be defined via intel_aoi_define).",
+        description="Cited brief for a user-defined AOI: earthquakes, military flights (bbox-derived), wildfires (region-mapped), ACLED conflict events, sampled aviation traffic, nearby static infrastructure (bases, ports, pipelines, nuclear, cables, datacenters, spaceports) with distances in km, and news about the place the AOI sits in (the settlement and county reverse-geocoded at its centre; the AOI's own name only when geocoding is unavailable, which data_gaps says). Every item carries a [n] citation into a numbered sources list; data_gaps names every domain that could not be scoped to the AOI rather than omitting it silently. Required: name (must already be defined via intel_aoi_define).",
         inputSchema={
             "type": "object",
             "properties": {

@@ -700,7 +700,8 @@ radius), wildfires (region-mapped, since NASA FIRMS has no point+radius
 query), ACLED conflict events, a sample of nearby aviation traffic,
 nearby static infrastructure (military bases, ports, pipelines, nuclear
 facilities, undersea cables, datacenters, spaceports) with distances in
-km, and news headline mentions of "Pittsburgh". Every item in the
+km, and news about the place at the AOI's centre (the reverse-geocoded
+settlement and county, here Pittsburgh). Every item in the
 response carries a `[n]` citation into a numbered `sources` list, and
 `data_gaps` names any domain that couldn't be scoped to the AOI (for
 example, wildfires when the AOI falls outside NASA FIRMS's coverage
