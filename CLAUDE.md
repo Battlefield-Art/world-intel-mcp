@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-World Intelligence MCP Server: 139 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
+World Intelligence MCP Server: 160 tools across 30+ domains providing real-time global intelligence from free public APIs. Serves four interfaces: MCP stdio (for Claude Code/Cursor), a live Starlette dashboard with SSE, a Click CLI with Rich output, and a collector daemon for 24/7 vector store population. Python 3.11+, built with hatchling.
 
 ## Commands
 
@@ -47,7 +47,7 @@ collector.py (daemon)  ──┘
 - `CircuitBreaker`: Per-source tracking. 3 consecutive failures trips the breaker for 5 minutes. Each RSS feed gets its own breaker (`rss:bbc_world`).
 - `Cache`: SQLite WAL-mode TTL cache. `get()` returns live data, `get_stale()` returns expired data for fallback.
 
-**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 139 tools live in 12 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) lives in `runtime.py` and is built lazily: importing any module opens no database, and the first access to any of those names builds the whole set once, under a module lock, and publishes it in one step (a failed build binds nothing and closes what it opened). Handlers reach it as `runtime.fetcher` etc. at call time; binding one at module level would open the databases at import. The cache's and AOI store's SQLite connections belong to the thread that made the first access, so make it on the thread that will use them (the MCP server does, in `_run()` before serving), not from `asyncio.to_thread` or an executor. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time — a drifted registry refuses to start.
+**Tool registry** (`tools/*.py` + `runtime.py`, Phase 26): server.py is a thin shell; the 160 tools live in 20 domain modules under `tools/`, each exporting `TOOLS` (list of Tool definitions) and `HANDLERS` (tool name -> `async def h(arguments)`). Shared infrastructure (cache, circuit breaker, AOI store, vector store, fetcher) lives in `runtime.py` and is built lazily: importing any module opens no database, and the first access to any of those names builds the whole set once, under a module lock, and publishes it in one step (a failed build binds nothing and closes what it opened). Handlers reach it as `runtime.fetcher` etc. at call time; binding one at module level would open the databases at import. The cache's and AOI store's SQLite connections belong to the thread that made the first access, so make it on the thread that will use them (the MCP server does, in `_run()` before serving), not from `asyncio.to_thread` or an executor. `tools/aggregate()` enforces TOOLS/HANDLERS parity and cross-module name uniqueness at import time; a drifted registry refuses to start.
 
 **Source modules** (`sources/*.py`): Each module exports `async def fetch_*(fetcher: Fetcher, **kwargs) -> dict`. Pure data fetching — no MCP awareness. 30+ modules covering markets, seismology, military, cyber, health, tech, environmental, etc.
 
@@ -57,7 +57,7 @@ collector.py (daemon)  ──┘
 
 **Vector store** (`vector_store.py`): Optional Qdrant + FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX). Async background worker queue (`asyncio.Queue` + `asyncio.to_thread()`) for non-blocking storage. Fetcher auto-stores on fresh HTTP fetches. 65+ source name → category mappings for filtered search.
 
-**Collector** (`collector.py`): Standalone daemon for 24/7 vector store population. 55 sources organized by domain, with `--daemon`, `--interval`, `--sources` CLI args. Dynamic import via `_import_fetch_fn()`. Per-source timeout overrides in `SOURCE_TIMEOUTS` (the `aoi_digest` sweep gets 240 s; everything else the flat 45 s). Entry point: `intel-collector`.
+**Collector** (`collector.py`): Standalone daemon for 24/7 vector store population. 61 sources organized by domain, with `--daemon`, `--interval`, `--sources` CLI args. Dynamic import via `_import_fetch_fn()`. Per-source timeout overrides in `SOURCE_TIMEOUTS` (the `aoi_digest` sweep gets 240 s; everything else the flat 45 s). Entry point: `intel-collector`.
 
 **Reports** (`reports.py`): PDF/HTML intelligence report generator. Collects 18 domains in parallel, renders styled HTML, converts to PDF via WeasyPrint. Optional dependency: `pip install -e ".[pdf]"`.
 
