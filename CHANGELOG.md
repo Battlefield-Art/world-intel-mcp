@@ -100,6 +100,16 @@
   default 1,024 open-file limit. Test runs also no longer leave
   `wim-server-test-*` directories in the system temp directory.
 
+### Fixed: simultaneous first opens of a cache database
+- Processes opening a new cache database at the same moment (the MCP
+  server, the collector and a CLI run, or parallel tests) could crash with
+  "database is locked": the switch to WAL needs an exclusive lock, and
+  SQLite refuses all but one of the simultaneous requests without waiting.
+  A cache at the default path then gave up on that path and fell back to
+  the temp directory. Opening now retries the switch for up to 10 seconds.
+  Measured with 8 processes on one fresh file: 29 to 67 failed opens in 80
+  to 160 before, none in 160 after.
+
 ### Fixed: the collector cycle summary separates data from errors
 - A source that answers with an upstream error (`{"error": ...}`) still
   counts as a completed fetch, but the cycle summary now lists it under

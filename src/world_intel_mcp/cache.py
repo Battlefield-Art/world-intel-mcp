@@ -16,6 +16,10 @@ from typing import Any
 
 logger = logging.getLogger("world-intel-mcp.cache")
 
+# How long opening a connection keeps retrying the switch to WAL while
+# another connection holds the database. Matches the connect timeout.
+_WAL_RETRY_SECONDS = 10.0
+
 
 def _default_db_path() -> Path:
     # Resolved per Cache, not at import, so HOME and XDG_CACHE_HOME are read
@@ -75,6 +79,29 @@ def _fallback_db_path() -> Path:
         f"Refusing to use {directory} for the cache fallback: {problem}. "
         "Point WORLD_INTEL_CACHE_DB at a path only you can write."
     )
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch the connection's database to WAL, waiting out other openers.
+
+    Leaving rollback-journal mode needs an exclusive lock. When several
+    processes open a new database at once, each holds a shared lock while
+    asking for that exclusive one, and SQLite answers all but one with
+    "database is locked" at once, without its busy handler, to avoid a
+    deadlock. Retrying after a short pause lets the winner finish; any
+    other error, or a lock still held after _WAL_RETRY_SECONDS, is raised.
+    """
+    deadline = time.monotonic() + _WAL_RETRY_SECONDS
+    delay = 0.01
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay)
+        delay = min(delay * 2, 0.25)
 
 
 class Cache:
@@ -138,7 +165,7 @@ class Cache:
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.db_path), timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            _enable_wal(self._conn)
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
