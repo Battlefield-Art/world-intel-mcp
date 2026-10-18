@@ -871,6 +871,15 @@ class HistoryStore:
         # The connect timeout is SQLite's busy timeout: how long a write
         # waits on another writer's lock before "database is locked".
         self._conn = sqlite3.connect(str(self.db_path), timeout=BUSY_TIMEOUT_S)
+        try:
+            self._create_schema()
+        except BaseException:
+            # A file that is not a database (or a failed migration) raises
+            # here; the caller never gets a store to close, so close it now.
+            self._conn.close()
+            raise
+
+    def _create_schema(self) -> None:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(

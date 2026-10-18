@@ -11,6 +11,7 @@ the collector attaches, at fixed times.
 """
 
 import asyncio
+import gc
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 import types
+import warnings
 from urllib.parse import unquote
 
 import httpx
@@ -996,3 +998,26 @@ def test_migration_tolerates_a_column_another_process_just_added(tmp_path) -> No
     finally:
         conn.close()
     assert _capture_columns(db).count("stale_age_s") == 1
+
+
+def test_a_file_that_is_not_a_database_raises_and_leaks_no_connection(tmp_path, monkeypatch):
+    db = tmp_path / "corrupt.db"
+    db.write_bytes(b"this is not an SQLite database\n" * 64)
+    opened = []
+    real_connect = sqlite3.connect
+
+    def _spy(*args, **kwargs):
+        opened.append(real_connect(*args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(history.sqlite3, "connect", _spy)
+    gc.collect()  # connections other tests leaked warn now, not inside the block
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+            HistoryStore(db)
+        gc.collect()
+    (conn,) = opened
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        conn.execute("SELECT 1")
+    assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
