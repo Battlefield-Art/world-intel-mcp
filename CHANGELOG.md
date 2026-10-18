@@ -218,8 +218,10 @@ source here, and no proxy is substituted for any of these measures.
   its schema does not take (name, type, listed value or range), cites an
   output field the code does not produce, describes a step in words that
   share nothing with the called tool's description or names a provider
-  that tool does not, or states a count or a table size the code does not
-  match.
+  that tool does not, or states one of the pinned counts or table sizes
+  (cities, countries, waterways, corridors, central banks, hotspots,
+  airports, Yahoo maturities, election rows and default limits) that the
+  code does not match. Counts the tests do not pin are not checked.
 - `intel guide` prints the guide markdown; `intel guide --measures` prints
   the glossary.
 - Two tests drive initialize, resources/list, resources/read, prompts/list,
@@ -410,6 +412,14 @@ source here, and no proxy is substituted for any of these measures.
   no date and no marker. The limit now names the release and says a
   count of 0, or a newest event well before the window ends, is missing
   data, not zero events. The code is unchanged.
+- Claims in the guide text are pinned to the code they describe: the
+  failure warning in the server instructions, shared prompt limits, guide
+  intro and glossary; the no-observation-date sentence in all three; the
+  fx-move direction, checked by running the rate series; the exposure
+  step's magnitude, window, limit and radius, read from the code; the ten
+  years in history-recall; and the central bank, hotspot, airport and
+  Yahoo maturity counts. The test claim above is narrowed to the counts
+  the tests pin.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

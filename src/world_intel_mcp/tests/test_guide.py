@@ -9,8 +9,10 @@ cache and HOME.
 
 Beyond the guide's structure, these tests pin the claims its text makes:
 every argument a prompt passes against the tool's inputSchema, every
-field name it cites against the package source, every count it states
-against the code, and the failure behaviour its limits warn about.
+field name it cites against the package source, the counts and table
+sizes that test_prompt_counts_and_tables_match_the_code and the claim pins
+check against the code (not every number in the text), and the failure
+behaviour its limits warn about.
 """
 
 import asyncio
@@ -2008,3 +2010,98 @@ async def test_conflict_trend_says_a_ucdp_release_can_end_before_the_window(monk
     text = " ".join(_text("conflict-trend").split())
     assert "one pinned GED release (gedevents/25.1)" in text
     assert "when count is 0, or the newest event is well before the window ends, UCDP has no data" in text
+
+
+# ---------------------------------------------------------------------------
+# Claim pins (review R7): each sentence below is checked against the code
+# or the constant it describes, so changing either side fails a test.
+# ---------------------------------------------------------------------------
+
+_FAILURE_SHAPES = ("an empty list", "a LOW", "an all-clear", "a false flag")
+
+
+def test_failure_warning_is_in_every_surface_a_model_reads() -> None:
+    surfaces = {
+        "SERVER_INSTRUCTIONS": guide.SERVER_INSTRUCTIONS,
+        "COMMON_LIMITS": guide_prompts.COMMON_LIMITS[1],
+        "guide intro": guide.render_guide().split("## What an answer from this server contains", 1)[1][:1500],
+        "MEASURES": guide.MEASURES.split("## Missing data is not zero", 1)[1],
+    }
+    for name, text in surfaces.items():
+        flat = " ".join(text.split())
+        assert "Many tools do not mark a failure" in flat or "Many do not" in flat or "Many tools do not:" in flat, name
+        missing = [shape for shape in _FAILURE_SHAPES if shape not in flat]
+        assert missing == [], (name, missing)
+        assert "ever an empty success" not in flat.lower(), name
+
+
+def test_no_observation_date_sentence_is_in_every_surface() -> None:
+    assert "If a tool gives no observation date, say so." in " ".join(" ".join(guide_prompts.COMMON_LIMITS).split())
+    intro = " ".join(guide.render_guide().split("## What an answer from this server contains", 1)[1][:800].split())
+    assert "Some tools return no observation date at all; say so" in intro
+    assert "Some tools return no observation date; say so." in " ".join(guide.MEASURES.split())
+
+
+@pytest.mark.asyncio
+async def test_fx_move_direction_matches_the_code() -> None:
+    """0.92 to 0.94 EUR per USD: one USD buys more EUR, so EUR weakened."""
+    from world_intel_mcp.sources.forex import fetch_forex_timeseries
+
+    class _Rates(_DownFetcher):
+        async def get_json(self, *args, **kwargs):
+            return {"base": "USD", "rates": {"2026-10-01": {"EUR": 0.92}, "2026-10-02": {"EUR": 0.94}}}
+
+    result = await fetch_forex_timeseries(_Rates(), base="USD", symbol="EUR", days=30)
+    assert result["trend"]["change_pct"] > 0
+    text = " ".join(_text("fx-move", {"symbol": "EUR"}).split())
+    assert "a positive change means one USD buys more EUR, so EUR weakened against USD" in text
+
+
+@pytest.mark.asyncio
+async def test_exposure_step_states_the_fetch_the_code_makes(monkeypatch) -> None:
+    from world_intel_mcp.analysis import exposure
+    from world_intel_mcp.sources import seismology
+
+    asked: dict = {}
+
+    async def record(fetcher, **kwargs):
+        asked.update(kwargs)
+        return {"earthquakes": []}
+
+    monkeypatch.setattr(seismology, "fetch_earthquakes", record)
+    await exposure.fetch_population_exposure(_DownFetcher(), event_types=["earthquake"])
+    radius = inspect.signature(exposure.fetch_population_exposure).parameters["radius_km"].default
+    text = " ".join(_text("earthquake-exposure").split())
+    magnitude = _number_text_for_test(asked["min_magnitude"])
+    assert (
+        f"its own list of M{magnitude} and larger quakes from the last {asked['hours']} hours, "
+        f"at most {asked['limit']}"
+    ) in text
+    assert f"radius_km (default {_number_text_for_test(radius)})" in text
+
+
+def _number_text_for_test(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def test_history_recall_ten_years_is_the_argument_maximum() -> None:
+    prompt = guide_prompts.get("history-recall")
+    hours = next(a for a in prompt.arguments if a.name == "hours")
+    calls = guide_prompts.resolved_steps(prompt, {"topic": "x"})
+    assert calls[1][1] == {"hours": hours.maximum}
+    assert hours.maximum == 10 * 8760
+    assert "the same over ten years" in calls[1][0].purpose
+
+
+def test_prompt_counts_match_their_tables() -> None:
+    from world_intel_mcp.config.countries import INTEL_HOTSPOTS
+    from world_intel_mcp.sources import aviation, bonds, central_banks
+
+    banks = len(central_banks._CURATED_RATES) + len(central_banks._FRED_RATE_SERIES)
+    assert f"rates for {banks} central banks" in _text("central-bank-compare")
+    assert f"the {len(INTEL_HOTSPOTS)} hotspots" in _text("hotspot-escalation")
+    assert f"FAA delays at {len(aviation._MAJOR_AIRPORTS)} major US airports" in _text("airport-disruption")
+    maturities = list(bonds._YAHOO_YIELD_SYMBOLS.values())
+    words = {3: "three", 4: "four", 5: "five"}
+    flat = " ".join(_text("yield-curve-check").split())
+    assert f"falls back to {words[len(maturities)]} Yahoo maturities ({', '.join(maturities)})" in flat
