@@ -32,8 +32,9 @@ _COMPOUND_EXCLUSIONS: dict[str, re.Pattern[str]] = {
 
 _MATCH_METHOD = (
     "whole-word match of each headline against the country's tier-1 keywords "
-    "(name, demonym, capital; plurals of words of five letters or more), so "
-    "'Tirana' is not Iran and 'Indiana' is not India; South Sudan, the Indian "
+    "(name, demonym, capital), each allowed an -n, -ns or -s ending on its last "
+    "word ('North Koreans', 'Gazan', 'Afghans'), so 'Tirana' is not Iran and "
+    "'Indiana' is not India; South Sudan, the Indian "
     "Ocean, Latin/South/Central/North American and New Mexico are removed "
     "first. Other compound names still count (Lagos in Portugal, the Republic "
     "of the Congo). Searched: the newest items across every RSS feed."
@@ -47,13 +48,27 @@ def _keyword_pattern(iso3: str) -> re.Pattern[str] | None:
     keywords = (TIER1_COUNTRIES.get(iso3) or {}).get("keywords") or []
     if not keywords:
         return None
-    parts = []
-    for kw in sorted(keywords, key=len, reverse=True):
-        body = re.escape(kw.lower())
-        if kw.isalpha() and len(kw) >= 5:
-            body += "s?"
-        parts.append(body)
+    # The keyword table lists names and some demonyms, not every form:
+    # "north korea" must also find "North Korean(s)", "gaza" "Gazan(s)".
+    parts = [
+        re.escape(kw.lower()) + "(?:n|ns|s)?"
+        for kw in sorted(keywords, key=len, reverse=True)
+    ]
     return re.compile(r"\b(?:" + "|".join(parts) + r")\b")
+
+
+def _utc_stamp(value: object) -> datetime | None:
+    """A feed item's published time if it is the feed's ISO UTC form."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _iso_z(when: datetime) -> str:
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _names_country(title: str, iso3: str) -> bool:
@@ -271,14 +286,18 @@ async def fetch_country_dossier(
                     "link": article.get("link"),
                     "category": article.get("category"),
                 })
-        stamps = sorted(
-            a["published"] for a in items if isinstance(a.get("published"), str) and a["published"]
-        )
+        # The span comes from parsed UTC times only: the feed passes a date
+        # it cannot parse through raw ("Okt 17, 2026"), which would sort
+        # anywhere as text.
+        stamps = sorted(t for t in (_utc_stamp(a.get("published")) for a in items) if t)
         news_reach = {
             "matching_items": matching,
             "mention_count_capped": matching > len(news_mentions),
             "items_searched": len(items),
-            "searched_span": {"oldest": stamps[0], "newest": stamps[-1]} if stamps else None,
+            "searched_span": (
+                {"oldest": _iso_z(stamps[0]), "newest": _iso_z(stamps[-1])} if stamps else None
+            ),
+            "items_without_parsed_time": len(items) - len(stamps),
             "match_method": _MATCH_METHOD,
         }
         if news_data.get("degraded"):

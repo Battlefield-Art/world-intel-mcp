@@ -288,8 +288,12 @@ _UNMEASURED_CHANGE = {
 
 
 def _feed_marker(feed: dict) -> dict:
-    """A partial RSS outage's degraded/reason, passed on with the ranking."""
-    return {k: feed[k] for k in ("degraded", "reason") if k in feed}
+    """A partial RSS outage's degraded/reason, passed on with the ranking,
+    plus the feed counts it rests on (the CLI's partial-outage line reads
+    them)."""
+    return {
+        k: feed[k] for k in ("degraded", "reason", "feeds_attempted", "feeds_ok") if k in feed
+    }
 
 
 _CHANGE_DEFINITION = (
@@ -482,21 +486,35 @@ async def fetch_hostility_timeline(
         name, iso3 = _resolve_country(value)
         parties.append({"input": value, "name": name, "iso3": iso3})
 
-    codes = [p["input"] for p in parties if p["iso3"] is None and _looks_like_code(p["input"])]
-    if codes:
+    def _refused(error: str) -> dict:
         return {
             "parties": parties,
             "days_requested": days,
             "days": [],
-            "error": "; ".join(
+            "error": error,
+            "source": "gdelt-doc-2.0",
+            "timestamp": _iso(now),
+        }
+
+    # An empty or one-letter input would send GDELT empty or one-letter
+    # queries (nine requests with the retry pass) and could open its breaker.
+    short = [p["input"] for p in parties if len("".join(str(p["input"] or "").split())) < 2]
+    if short:
+        return _refused(
+            "; ".join(f"country {c!r} is too short to search" for c in short)
+            + "; pass a country name, or an ISO3 or ISO2 code from the "
+            f"{len(TIER1_COUNTRIES)}-country table"
+        )
+    codes = [p["input"] for p in parties if p["iso3"] is None and _looks_like_code(p["input"])]
+    if codes:
+        return _refused(
+            "; ".join(
                 f"'{c}' looks like a country code but is not in the "
                 f"{len(TIER1_COUNTRIES)}-country table"
                 for c in codes
             )
-            + "; pass the country's name instead (names are searched verbatim)",
-            "source": "gdelt-doc-2.0",
-            "timestamp": _iso(now),
-        }
+            + "; pass the country's name instead (names are searched verbatim)"
+        )
 
     base_query = " ".join(_gdelt_term(p["name"]) for p in parties)
     queries = {"articles": base_query}
