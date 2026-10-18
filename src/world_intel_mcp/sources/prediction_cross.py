@@ -33,10 +33,19 @@ Gaps / not covered:
 - Polymarket scoring shares the ``polymarket`` circuit breaker and 1 s
   floor with Gamma (see sources/prediction.py): ``limit=100`` makes up
   to 100 sequential CLOB calls.
+- Matching runs in a worker thread so the event loop keeps serving;
+  a caller's timeout (the collector's 45 s) returns on time but cannot
+  stop a thread already matching, which finishes in the background.
+  Pair counts are not capped beyond the venue limits.
+- Kalshi last-trade lookups are paced and sequential (at most 10 within
+  10 s); the trade price and time come from the same trade, but a
+  separate read from the listing, so a pair whose looked-up trade price
+  differs from the listing's last price is flagged.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timezone
@@ -63,7 +72,12 @@ _MATCH_METHOD = (
     "when both titles state one; negation, rate actions (cut, raise, hold) and directions "
     "(above, below) must agree; end dates within max(3 days, 15% of the horizon); the "
     "Kalshi YES side must be named in the Polymarket question or match exactly one "
-    "Polymarket outcome. match_confidence = title word overlap (Dice) x date factor "
+    "Polymarket outcome. When both titles state them, clock times and days of the same month "
+    "must be equal and months must overlap; quantity units ($, %, bps), 'to' vs 'by' and the "
+    "order of two or more amounts must agree; opposite words (rise/fall, positive/negative, "
+    "before/after, win/lose, approve/reject) must not conflict; a distinguishing name "
+    "(capitalized, or a listed chamber, party, country or qualifier) on both venues but not "
+    "shared rejects, and a listed one on one venue only rejects. match_confidence = title word overlap (Dice) x date factor "
     "(1.0 same day, 0.5 at the tolerance edge): an ordinal score for ranking candidate "
     "pairs, not a probability that two markets are the same event. One-to-one, greedy "
     "by confidence."
@@ -79,8 +93,24 @@ _RANKING = (
 
 MAX_PAIRS = 500
 # Matched pairs whose Kalshi price is a last trade get that trade's time
-# looked up (one /markets/trades request each), for the first this many.
+# looked up (one /markets/trades request each), for the first this many,
+# within one overall deadline: the collector gives the whole comparison
+# 45 s, and a trades endpoint that accepts connections and never answers
+# held compare for 145.7 s before (measured in review, 2026-10-17).
 MAX_TRADE_LOOKUPS = 10
+TRADE_LOOKUP_DEADLINE_SECONDS = 10.0
+# What a Kalshi side's ``last_trade_lookup`` says about its
+# ``last_trade_time`` (null for every status but "found" and
+# "found_in_expired_copy").
+LOOKUP_STATUSES = {
+    "found": "time and price of the latest trade, read live",
+    "found_in_expired_copy": "time and price of the latest trade in an expired cached copy (age in last_trade_age_seconds)",
+    "no_trade": "the venue lists no trade for the market",
+    "lookup_failed": "the trades endpoint could not be read or its trade time was unreadable",
+    "not_looked_up_cap": f"beyond the first {MAX_TRADE_LOOKUPS} last-trade pairs shown",
+    "not_looked_up_deadline": f"the lookups' {TRADE_LOOKUP_DEADLINE_SECONDS:g} s deadline passed first",
+    "not_looked_up_stale_listing": "the price came from an expired listing copy, so a live trade time would not date it",
+}
 MAX_OFFSETS = 10
 # A price window spans at most 8760 + 720 hours, so one market's hourly
 # candles stay under the candlestick endpoint's 10,000 cap.
@@ -183,6 +213,8 @@ async def fetch_prediction_compare(
         gaps.append(f"polymarket: {p_raw['error']}")
     if p_raw.get("stale"):
         gaps.append("polymarket: served from expired cache after a failed live fetch")
+        if p_raw.get("stale_max_age_seconds") is not None:
+            gaps.append(f"polymarket: the oldest open-markets copy is {p_raw['stale_max_age_seconds'] / 3600:.1f} h old")
     gaps.append(
         f"polymarket: top {p_raw['requested']} open markets by 24h volume requested; "
         f"{p_raw['non_binary_skipped']} non-binary rows skipped"
@@ -197,10 +229,13 @@ async def fetch_prediction_compare(
         "method": _MATCH_METHOD,
         "price_gap": "kalshi YES probability minus polymarket probability of the same side",
         "price_basis": (
-            "per side: bid_ask_midpoint (two-sided book), last_trade (Kalshi's last trade; its time is "
-            "looked up for the first matched pairs), gamma_outcome_price (Polymarket's listed outcome "
-            "price; Gamma publishes no last-trade time) or no_price"
+            "per side: bid_ask_midpoint (two-sided book), last_trade (Kalshi's last trade; its time and "
+            f"price are looked up for the first {MAX_TRADE_LOOKUPS} such pairs shown, and "
+            "last_trade_lookup says what a null last_trade_time means), gamma_outcome_price "
+            "(Polymarket's listed outcome price; Gamma publishes no last-trade time) or no_price. A "
+            "side priced from an expired cached copy carries stale: true and its age, and is flagged"
         ),
+        "last_trade_lookup": LOOKUP_STATUSES,
         "ranking": _RANKING,
         "units": {"kalshi": kalshi.UNITS, "polymarket": prediction.UNITS},
         "timestamp": _utc_now_iso(),
@@ -224,20 +259,18 @@ async def fetch_prediction_compare(
         })
         return out
 
-    result = match_markets(k_markets, p_markets, min_confidence=min_confidence)
+    # CPU-bound (seconds at the documented maxima): off the event loop, so
+    # other tool calls and the collector's timeout are not starved.
+    result = await asyncio.to_thread(match_markets, k_markets, p_markets, min_confidence=min_confidence)
     matched = result["matched"]
     matched.sort(key=lambda r: (
         r["price_gap"] is None, not r["comparable"], -abs(r["price_gap"] or 0.0), -r["match_confidence"],
     ))
     shown = matched[:limit]
-    lookups = [p for p in shown if p["kalshi"].get("price_basis") == "last_trade"][:MAX_TRADE_LOOKUPS]
-    if lookups:
-        times, trade_gaps = await kalshi.fetch_kalshi_last_trade_times(fetcher, [p["kalshi"]["id"] for p in lookups])
-        for p in lookups:
-            p["kalshi"]["last_trade_time"] = times.get(p["kalshi"]["id"])
-        # Supplementary: a failed lookup leaves the time null and is named
-        # here; the comparison itself is complete, so it is not degraded.
-        gaps.extend(f"kalshi: {g}" for g in trade_gaps)
+    # Supplementary: a lookup that fails or is skipped leaves the time null,
+    # says why per side and is named in a gap; the comparison itself is
+    # complete, so it is not degraded.
+    gaps.extend(f"kalshi: {g}" for g in await _last_trades(fetcher, shown))
     out.update({
         "matched": shown,
         "matched_count": len(matched),
@@ -251,6 +284,91 @@ async def fetch_prediction_compare(
     if k_raw["errors"] or k_raw.get("stale") or p_raw.get("error") or p_raw.get("stale"):
         out["degraded"] = True
     return out
+
+
+async def _last_trades(fetcher: Fetcher, shown: list[dict]) -> list[str]:
+    """Look up the last trade behind each shown last-trade Kalshi price.
+
+    Sets ``last_trade_time``, ``last_trade_price`` and
+    ``last_trade_lookup`` (a LOOKUP_STATUSES key) on each such Kalshi
+    side, flags a pair whose looked-up trade price differs from the
+    listing's last price, and returns the gaps. At most
+    MAX_TRADE_LOOKUPS requests, all within TRADE_LOOKUP_DEADLINE_SECONDS.
+    """
+    sides = [p for p in shown if p["kalshi"].get("price_basis") == "last_trade"]
+    if not sides:
+        return []
+    live = [p for p in sides if not p["kalshi"].get("stale")]
+    targets = live[:MAX_TRADE_LOOKUPS]
+    target_ids = {id(p) for p in targets}
+    times: dict[str, str | None] = {}
+    prices: dict[str, float | None] = {}
+    stale: dict[str, float | None] = {}
+    attempted: set[str] = set()
+
+    async def run() -> None:
+        for p in targets:
+            ticker = p["kalshi"]["id"]
+            found, _ = await kalshi.fetch_kalshi_last_trade_times(
+                fetcher, [ticker], prices=prices, stale_tickers=stale
+            )
+            times.update(found)
+            attempted.add(ticker)
+
+    timed_out = False
+    try:
+        await asyncio.wait_for(run(), TRADE_LOOKUP_DEADLINE_SECONDS)
+    except asyncio.TimeoutError:
+        timed_out = True
+    counts: dict[str, int] = {}
+    for p in sides:
+        side = p["kalshi"]
+        ticker = side["id"]
+        if side.get("stale"):
+            status = "not_looked_up_stale_listing"
+        elif id(p) not in target_ids:
+            status = "not_looked_up_cap"
+        elif ticker not in attempted:
+            status = "not_looked_up_deadline"
+        elif ticker not in times:
+            status = "lookup_failed"
+        elif times[ticker] is None:
+            status = "no_trade"
+        else:
+            status = "found_in_expired_copy" if ticker in stale else "found"
+        counts[status] = counts.get(status, 0) + 1
+        side["last_trade_lookup"] = status
+        side["last_trade_time"] = times.get(ticker) if status.startswith("found") else None
+        side["last_trade_price"] = prices.get(ticker) if status.startswith("found") else None
+        if status == "found_in_expired_copy":
+            side["last_trade_age_seconds"] = stale[ticker]
+        listed, traded = side.get("last_price"), side["last_trade_price"]
+        if traded is not None and listed is not None and abs(traded - listed) > 1e-9:
+            p["flags"].append(
+                f"kalshi last trade at {traded:g} (looked up separately) differs from the listing's last price {listed:g}"
+            )
+            p["comparable"] = False
+    gaps = []
+    if counts.get("lookup_failed"):
+        gaps.append(f"Kalshi last-trade time unavailable for {counts['lookup_failed']} market(s)")
+    if stale:
+        gaps.append(kalshi.stale_gap("Kalshi last-trade times", list(stale.values())))
+    if counts.get("not_looked_up_cap"):
+        gaps.append(
+            f"last-trade time looked up for the first {len(targets)} of {len(live)} last-trade pairs "
+            f"shown; {counts['not_looked_up_cap']} not looked up (cap {MAX_TRADE_LOOKUPS})"
+        )
+    if timed_out:
+        gaps.append(
+            f"last-trade lookups stopped at the {TRADE_LOOKUP_DEADLINE_SECONDS:g} s deadline; "
+            f"{counts.get('not_looked_up_deadline', 0)} pair(s) not looked up"
+        )
+    if counts.get("not_looked_up_stale_listing"):
+        gaps.append(
+            f"last-trade time not looked up for {counts['not_looked_up_stale_listing']} pair(s) priced "
+            "from an expired listing copy"
+        )
+    return gaps
 
 
 _STALE_HISTORY = "price history served from expired cache"

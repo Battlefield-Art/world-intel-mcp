@@ -26,7 +26,8 @@ TOOLS: list[Tool] = [
             "$1 contract; raw bid/ask/last kept). Filter by category (e.g. 'Economics', 'Politics', "
             "'Elections', 'Financials', 'Climate and Weather') or series ticker (e.g. 'KXFED'). The "
             "response states which events were scanned and whether the scan was exhaustive; data "
-            "served from expired cache after a failed fetch is marked stale and degraded."
+            "served from expired cache after a failed fetch is marked stale and degraded, and each "
+            "market from such a copy carries stale: true and its age."
         ),
         inputSchema={
             "type": "object",
@@ -70,13 +71,16 @@ TOOLS: list[Tool] = [
         name="intel_prediction_compare",
         description=(
             "The same event on Kalshi and Polymarket side by side: deterministic matching on normalized "
-            "titles, quantities, years, end dates, negation, rate actions (cut/raise/hold), directions "
-            "(above/below) and outcome side, with a match_confidence (an ordinal score for ranking "
+            "titles, quantities (value, unit, to/by, order), years, months, days, clock times, end "
+            "dates, negation, rate actions (cut/raise/hold), directions (above/below), opposite words "
+            "(rise/fall, before/after, ...), distinguishing names (House/Senate, Fed/BoJ, Bitcoin/"
+            "Bitcoin Cash) and outcome side, with a match_confidence (an ordinal score for ranking "
             "pairs, not a probability) and the reasons for each pair. Below min_confidence a pair is "
             "not a match. Returns matched pairs with the price gap, each side's price basis, spread "
-            "and last-trade time (a pair is flagged and ranked after comparable ones when either side "
-            "is not a two-sided quote midpoint or its spread is wide), the closest rejected pairs with "
-            "why, and unmatched counts per venue."
+            "and last-trade time with its lookup status (a pair is flagged and ranked after comparable "
+            "ones when either side is not a live two-sided quote midpoint, comes from an expired "
+            "cached copy or its spread is wide), the closest rejected pairs with why, and unmatched "
+            "counts per venue."
         ),
         inputSchema={
             "type": "object",

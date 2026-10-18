@@ -868,12 +868,14 @@ def predictions(ctx: click.Context, limit: int) -> None:
     if _bail_on_error(ctx, data):
         return
 
+    _print_data_gaps(data)
     mkts = data.get("markets", [])
     if not mkts:
         console.print("[yellow]No prediction market data available[/yellow]")
         return
 
-    table = Table(title="Prediction Markets", box=box.SIMPLE_HEAVY)
+    title = "Prediction Markets (expired cached copy)" if data.get("stale") else "Prediction Markets"
+    table = Table(title=title, box=box.SIMPLE_HEAVY)
     table.add_column("Question", max_width=50)
     table.add_column("YES %", justify="right")
     table.add_column("Sentiment")
@@ -897,6 +899,27 @@ def predictions(ctx: click.Context, limit: int) -> None:
 
 def _pct(value: Any) -> str:
     return "-" if value is None else f"{value * 100:.1f}%"
+
+
+def _stale_note(m: dict) -> str:
+    """" (expired copy, N h old)" for a market priced from expired cache."""
+    if not m.get("stale"):
+        return ""
+    age = m.get("stale_age_seconds")
+    return f" (expired copy, {age / 3600:.1f} h old)" if isinstance(age, (int, float)) else " (expired copy)"
+
+
+def _last_trade_note(side: dict) -> str | None:
+    """The Kalshi last-trade lookup result for the Flags column."""
+    status = side.get("last_trade_lookup")
+    if status is None and not side.get("last_trade_time"):
+        return None
+    if side.get("last_trade_time"):
+        price = side.get("last_trade_price")
+        at = f" at {_pct(price)}" if price is not None else ""
+        copy = " (expired copy)" if status == "found_in_expired_copy" else ""
+        return f"kalshi last trade {side['last_trade_time']}{at}{copy}"
+    return f"kalshi last trade: {str(status).replace('_', ' ')}"
 
 
 # Data gaps print through the shared _print_data_gaps defined with the
@@ -944,7 +967,7 @@ def kalshi(ctx: click.Context, category: str | None, series: str | None, limit: 
             _cell(m.get("question") or ""),
             _cell(m.get("yes_side") or ""),
             _pct(m.get("probability")),
-            _cell(m.get("price_basis", "")),
+            _cell(m.get("price_basis", "") + _stale_note(m)),
             f"{m.get('volume_24h', 0):,.0f}",
             f"{m.get('volume', 0):,.0f}",
         )
@@ -1015,9 +1038,9 @@ def prediction_compare(
         gap = p.get("price_gap")
         flags = list(p.get("flags") or [])
         flagged = flagged or bool(flags)
-        traded = (p.get("kalshi") or {}).get("last_trade_time")
+        traded = _last_trade_note(p.get("kalshi") or {})
         if traded:
-            flags.append(f"kalshi last trade {traded}")
+            flags.append(traded)
         table.add_row(  # wrapped, not sliced (see the kalshi table)
             _cell(p.get("kalshi", {}).get("question") or ""),
             _cell(p.get("polymarket", {}).get("question") or ""),

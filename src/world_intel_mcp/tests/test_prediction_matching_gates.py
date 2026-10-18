@@ -16,7 +16,8 @@ date tolerance is fixed.
 
 Gaps / not covered: wording beyond these cases; the candidate-pair
 completeness check is randomized over a small vocabulary, not
-exhaustive (the prefix bound itself was checked with z3).
+exhaustive, and the prefix bound is not machine-proved (the total order
+it relies on is tested in test_prediction_matching_late_gates.py).
 """
 
 import random
