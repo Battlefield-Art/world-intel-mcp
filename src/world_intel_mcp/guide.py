@@ -297,9 +297,13 @@ with none of them invites a story.
   stated baselines, not probabilities.
 - Prove causation. Series that move together, or one shortly after the
   other, may share a cause or be coincidence.
-- Show history it did not record. Stored history (semantic search,
-  timelines, baselines, area change detection) exists only for the time
-  the collector or server was running and storing.
+- Show history it did not record. Collected history (semantic search,
+  timelines, baselines, area change detection) covers only the time the
+  collector or server was running and storing. The exception is
+  intel_history_backfill, which loads FRED and ECB publisher history
+  into the history store for intel_series_history, intel_revisions and
+  intel_day_timeline. Those values are the publisher's current vintage,
+  so revisions made before the backfill do not show.
 - Use keyed sources without their keys. Tools marked [needs ...] in the
   list below return an error naming the variable when it is not set; a
   few others fall back to a keyless source with less detail.

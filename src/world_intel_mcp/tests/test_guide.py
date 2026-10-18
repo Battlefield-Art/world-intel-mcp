@@ -1675,3 +1675,22 @@ def test_story_breadth_unit_rule_agrees_with_the_answer_shape() -> None:
     assert "Do not state a unit for it" in text
     assert "each number with its unit (or say the source states none) and date" in text
     assert "each number with its unit and date" not in text
+
+
+def test_guide_says_backfilled_history_predates_collection(registered) -> None:
+    """After intel_history_backfill the store holds publisher values from
+    before the collector ran; the guide must not say none exist."""
+    text = guide.render_guide()
+    start = text.index("- Show history it did not record.")
+    bullet = text[start : text.index("\n- ", start + 1)]
+    assert "exists only for the time" not in bullet
+    named = re.findall(r"intel_[a-z_]+", bullet)
+    assert named == [
+        "intel_history_backfill",
+        "intel_series_history",
+        "intel_revisions",
+        "intel_day_timeline",
+    ]
+    assert set(named) <= registered
+    assert "current vintage" in bullet
+    assert "revisions made before the backfill do not show" in " ".join(bullet.split())

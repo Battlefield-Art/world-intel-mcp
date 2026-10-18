@@ -339,6 +339,11 @@ source here, and no proxy is substituted for any of these measures.
   while the shared answer shape asked for each number with its unit. The
   answer shape now reads "each number with its unit (or say the source
   states none) and date".
+- The guide said stored history exists only for the time the collector
+  or server ran, which is false after `intel_history_backfill` loads FRED
+  or ECB publisher history. The limit now names the backfill, the three
+  tools that read it, and that its values are the publisher's current
+  vintage.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`
