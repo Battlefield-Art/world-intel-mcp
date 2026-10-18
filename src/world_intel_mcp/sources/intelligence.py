@@ -1602,7 +1602,9 @@ _VESSEL_MATCHING_RULE = (
     "Naval ones are listed in unplaced_naval_warnings with the reason. "
     "status counts the naval-keyword warnings credited to the waterway; it "
     "reads stale when the feed's newest warning is older than "
-    "stale_after_days and unknown when the feed is unavailable. "
+    "stale_after_days and unknown when the feed is unavailable or how "
+    "current it is cannot be checked (feed_stale null: no usable issue "
+    "date, or no active warnings at all). "
     "total_nearby counts credited warnings of any topic."
 )
 
@@ -1620,7 +1622,8 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     Scores each waterway: clear/advisory/elevated/critical; stale when the
     feed's newest warning is past its staleness threshold (the counts then
     describe the feed's last update, status_as_of, not today); unknown when
-    the feed itself is unavailable.
+    the feed itself is unavailable or its currency cannot be checked
+    (feed_stale None: no usable issue date, or an empty feed).
 
     Note: Real-time AIS requires paid API.  This uses NGA MSI as a
     free proxy for naval activity indicators.
@@ -1642,6 +1645,10 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     all_warnings = nav_data.get("warnings", []) or []
     feed_error = nav_data.get("error")
     feed_stale = nav_data.get("feed_stale") is True
+    # Only feed_stale False says the feed is current. None (no usable issue
+    # date, or no active warnings) used to score as current: three undated
+    # warnings near Hormuz read "critical".
+    currency_unknown = not feed_error and nav_data.get("feed_stale") is None
 
     credited: dict[str, dict] = {
         ww["name"]: {"naval": [], "nearby": 0} for ww in STRATEGIC_WATERWAYS
@@ -1720,7 +1727,7 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         naval_warnings = sorted(entry["naval"], key=lambda d: d["distance_km"])
         naval_count = len(naval_warnings)
 
-        if feed_error:
+        if feed_error or currency_unknown:
             status = "unknown"
         elif feed_stale:
             # A frozen feed's warnings describe its last update, not today:
@@ -1754,6 +1761,12 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
     data_gaps = [f"NGA feed: {gap}" for gap in nav_data.get("data_gaps") or []]
     if feed_error and not data_gaps:
         data_gaps.append(f"NGA feed: {feed_error}")
+    if currency_unknown:
+        data_gaps.append(
+            "every waterway reads unknown, not a threat level: how current the "
+            "NGA feed is cannot be checked (feed_stale null), so naval_warnings "
+            "is not scored as today's activity"
+        )
     if feed_stale and not feed_error:
         data_gaps.append(
             "every waterway reads stale, not a threat level: naval_warnings "
@@ -1798,7 +1811,7 @@ async def fetch_vessel_snapshot(fetcher: Fetcher) -> dict:
         response["error"] = f"NGA navigational warnings unavailable: {feed_error}"
         response["degraded"] = True
         response["reason"] = nav_data.get("reason") or "nav_warnings_unavailable"
-    elif nav_data.get("degraded"):
+    elif nav_data.get("degraded") or currency_unknown:
         response["degraded"] = True
     return response
 

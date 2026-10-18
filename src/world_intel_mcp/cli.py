@@ -566,10 +566,20 @@ def posture(ctx: click.Context) -> None:
     if _bail_on_error(ctx, data):
         return
 
-    console.print(
-        f"[bold]{data.get('total_military_aircraft', 0)} total military aircraft[/bold]\n"
-    )
     theaters = data.get("theaters", {})
+    # A theater no flight source answered for used to print 0, the reading
+    # of an empty sky, under a total that looked complete.
+    unknown = set(data.get("unavailable_theaters") or []) | {
+        name for name, info in theaters.items() if info.get("source") == "none"
+    }
+    total = data.get("total_military_aircraft", 0)
+    if unknown:
+        console.print(
+            f"[bold]{total} military aircraft in the theaters that answered[/bold] "
+            f"({len(theaters) - len(unknown)} of {len(theaters)}; the rest are unknown)\n"
+        )
+    else:
+        console.print(f"[bold]{total} total military aircraft[/bold]\n")
 
     table = Table(title="Theater Posture", box=box.SIMPLE_HEAVY)
     table.add_column("Theater", style="bold")
@@ -581,6 +591,8 @@ def posture(ctx: click.Context) -> None:
         count = info.get("count", 0)
         style = "red bold" if count >= 20 else "yellow" if count >= 5 else ""
         count_str = f"[{style}]{count}[/{style}]" if style else str(count)
+        if name in unknown:
+            count_str = "[yellow]unknown[/yellow]"
         table.add_row(
             name.replace("_", " ").title(),
             count_str,
@@ -588,6 +600,7 @@ def posture(ctx: click.Context) -> None:
             _cell(", ".join(info.get("sample_callsigns", [])[:3])),
         )
     console.print(table)
+    _print_data_gaps(data)
 
 
 # ---------------------------------------------------------------------------

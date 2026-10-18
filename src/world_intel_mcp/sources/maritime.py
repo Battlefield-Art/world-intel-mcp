@@ -7,6 +7,7 @@ No API key required.
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from ..fetcher import Fetcher
@@ -151,16 +152,24 @@ def _extract_coords(text: str) -> tuple[float | None, float | None]:
 
 # One coordinate: degrees-minutes ('22-16.65') or degrees-minutes-seconds
 # ('20-03-44'). Latitude and longitude are read separately, so a mixed pair
-# ('20-03-44N 072-58.00W') parses as written. The lookbehind keeps a match
-# from starting inside a longer number: two separate patterns used to read
-# the '03-44N' of that mixed pair as latitude 3.73, about 1,800 km off.
+# ('20-03-44N 072-58.00W') parses as written: one pattern for the whole
+# lat/lon pair fixed that, where two separate patterns read the pair's
+# '03-44N' as latitude 3.73, about 1,800 km off. The lookbehinds below do
+# something else: they keep a match from starting inside a longer number
+# or word, so a malformed coordinate ('20-03-44-10N', '2O-03-44N' with a
+# letter O, '20-O3-44N', chart number '26060-03.5N') reads as no position
+# rather than a confident wrong one. _POSITION_RE's lookbehind also
+# excludes letters ('20-O3-44N' read as 3.73N); widening it changed no
+# position in 3,643 real warnings (2024 and live). _COORD_TOKEN_RE keeps
+# the digit-only one, so a mistyped coordinate still counts as a stated
+# position (unplaced as position_unreadable, not by its area code).
 _COORD_PART = r"(\d{1,3})-(\d{1,2}(?:\.\d+)?)(?:-(\d{1,2}(?:\.\d+)?))?"
 
 # A lat/lon pair. Latitude and longitude may be separated by whitespace, a
 # comma or a slash: live HYDROLANT 2024-473, 479 and 488 write
 # '60-17.40S, 050-16.80W', which a whitespace-only separator never read.
 _POSITION_RE = re.compile(
-    rf"(?<![\d.-]){_COORD_PART}\s*([NS])(?:\s*[,/]\s*|\s+){_COORD_PART}\s*([EW])"
+    rf"(?<![\w.-]){_COORD_PART}\s*([NS])(?:\s*[,/]\s*|\s+){_COORD_PART}\s*([EW])"
 )
 
 # Any single latitude or longitude ('24-30N', '080-00W', '65-07.80 S'),
@@ -366,6 +375,27 @@ def _parse_warning(warning: dict) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
+# An empty answer is kept in the cache this long, not the hour a full feed
+# is, so a feed fault is not replayed for an hour after NGA recovers.
+_EMPTY_ANSWER_REUSE_SECONDS = 300
+
+
+def _expire_empty_answer(fetcher: Fetcher, cache_key: str) -> None:
+    """Drop a cached empty NGA answer once it is _EMPTY_ANSWER_REUSE_SECONDS
+    old, so the next call fetches again. The fetcher caches every answer for
+    the TTL it was given; this shortens that for an empty one without
+    restamping when it was fetched."""
+    cache = getattr(fetcher, "cache", None)
+    get_meta = getattr(cache, "get_stale_meta", None)
+    if get_meta is None:
+        return
+    meta = get_meta(cache_key)
+    if not isinstance(meta, tuple):
+        return
+    if time.time() - meta[1] >= _EMPTY_ANSWER_REUSE_SECONDS:
+        cache.delete(cache_key)
+
+
 async def fetch_nav_warnings(
     fetcher: Fetcher,
     navarea: str | None = None,
@@ -391,7 +421,10 @@ async def fetch_nav_warnings(
         the response is degraded, with the age named in data_gaps. The
         freshness fields describe the whole active feed, before any navarea
         filter. feed_stale is None when no usable issue date says how current
-        the feed is.
+        the feed is, or when the active feed is empty; either way the
+        response is degraded, with the reason in data_gaps, and an empty
+        answer is reused from the cache for at most
+        _EMPTY_ANSWER_REUSE_SECONDS.
     """
     cache_label = navarea.upper() if navarea else "all"
     cache_key = f"maritime:warnings:{cache_label}"
@@ -533,7 +566,19 @@ async def fetch_nav_warnings(
             f"{_FUTURE_TOLERANCE.days} day ahead, left out of the freshness check: "
             + ", ".join(f"{_warning_label(w)} ({w.get('issue_date')})" for w in future)
         )
-    if feed and newest is None:
+    if not feed:
+        # NGA answering 200 with no active warnings (or only cancelled ones)
+        # used to read as a quiet sea: count 0, no marker, every waterway
+        # clear. The feed carried 386 active warnings on 2026-10-17, so an
+        # empty one is more likely a fault than calm; feed_stale stays None.
+        response["degraded"] = True
+        response["data_gaps"].append(
+            "NGA returned no active warnings (the feed normally carries "
+            "hundreds), so a quiet sea cannot be told from a feed fault and how "
+            "current the list is cannot be checked"
+        )
+        _expire_empty_answer(fetcher, cache_key)
+    elif newest is None:
         response["degraded"] = True
         if future:
             response["data_gaps"].append(

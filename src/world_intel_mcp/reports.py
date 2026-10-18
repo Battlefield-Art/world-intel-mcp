@@ -431,6 +431,13 @@ def _render_maritime(data: dict) -> str:
                 f"last updated {_esc(data.get('newest_issue_date'))}: these statuses "
                 "describe that date, not today.</p>"
             )
+        elif data.get("feed_stale") is not False:
+            # An undated or empty feed used to render its statuses as current.
+            html += (
+                '<p><span class="metric amber">UNDATED</span> How current the NGA '
+                "warning feed is cannot be checked, so these statuses are not "
+                "current threat levels.</p>"
+            )
         ww_rows = []
         for ww in waterways:
             if not isinstance(ww, dict):

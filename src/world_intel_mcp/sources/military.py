@@ -144,7 +144,60 @@ def _extract_aircraft(state: list) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def _fetch_adsblol_military(fetcher: Fetcher) -> list[dict] | None:
+class _FlightRead:
+    """One source's military aircraft, with how old the copy is.
+
+    stale_age_seconds is None for a live answer. When the live fetch fails
+    the fetcher may hand back its last cached copy, marked _stale with
+    _stale_age_seconds; those markers used to be dropped here, so a copy
+    days old read as current flights.
+    """
+
+    __slots__ = ("aircraft", "stale_age_seconds")
+
+    def __init__(self, aircraft: list[dict], stale_age_seconds: float | None) -> None:
+        self.aircraft = aircraft
+        self.stale_age_seconds = stale_age_seconds
+
+
+def _stale_age(data: object) -> float | None:
+    if isinstance(data, dict) and data.get("_stale"):
+        age = data.get("_stale_age_seconds")
+        return float(age) if isinstance(age, (int, float)) else 0.0
+    return None
+
+
+def _parse_bbox(bbox: str) -> tuple[float, float, float, float] | None:
+    """lamin, lomin, lamax, lomax from "lamin,lomin,lamax,lomax", or None
+    when the box is malformed: not exactly four comma-separated finite
+    numbers, a latitude outside -90..90, a longitude outside -180..180, or
+    a minimum not below its maximum. A 3-part or semicolon-split box used
+    to skip the filter and return every aircraft in the world as the box's.
+    """
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        la_min, lo_min, la_max, lo_max = (float(p) for p in parts)
+    except ValueError:
+        return None
+    # The chained comparisons are False for nan and inf too.
+    if not (-90 <= la_min < la_max <= 90 and -180 <= lo_min < lo_max <= 180):
+        return None
+    return la_min, lo_min, la_max, lo_max
+
+
+def _in_bbox(aircraft: list[dict], box: tuple[float, float, float, float]) -> list[dict]:
+    la_min, lo_min, la_max, lo_max = box
+    return [
+        a for a in aircraft
+        if a["latitude"] is not None and a["longitude"] is not None
+        and la_min <= a["latitude"] <= la_max
+        and lo_min <= a["longitude"] <= lo_max
+    ]
+
+
+async def _fetch_adsblol_military(fetcher: Fetcher) -> _FlightRead | None:
     """Fetch military aircraft from adsb.lol free API (pre-filtered)."""
     data = await fetcher.get_json(
         url=_ADSBLOL_MIL_URL,
@@ -176,24 +229,23 @@ async def _fetch_adsblol_military(fetcher: Fetcher) -> list[dict] | None:
             "aircraft_type": ac.get("t"),
             "registration": ac.get("r"),
         })
-    return aircraft
+    return _FlightRead(aircraft, _stale_age(data))
 
 
 async def _fetch_opensky_military(
-    fetcher: Fetcher, bbox: str | None = None,
-) -> list[dict] | None:
-    """Fetch military aircraft from OpenSky (requires filtering)."""
+    fetcher: Fetcher, bbox: tuple[float, float, float, float] | None = None,
+) -> _FlightRead | None:
+    """Fetch military aircraft from OpenSky (requires filtering).
+
+    bbox is an already validated (lamin, lomin, lamax, lomax).
+    """
     params: dict[str, str] = {}
     if bbox is not None:
-        parts = bbox.split(",")
-        if len(parts) == 4:
-            params["lamin"] = parts[0]
-            params["lomin"] = parts[1]
-            params["lamax"] = parts[2]
-            params["lomax"] = parts[3]
+        for key, value in zip(("lamin", "lomin", "lamax", "lomax"), bbox):
+            params[key] = str(int(value)) if value.is_integer() else repr(value)
 
     headers = _build_opensky_auth_headers()
-    cache_label = bbox or "global"
+    cache_label = ",".join(params.values()) if params else "global"
 
     data = await fetcher.get_json(
         url=_OPENSKY_STATES_URL,
@@ -216,7 +268,7 @@ async def _fetch_opensky_military(
         callsign = state[1] or ""
         if _is_military_icao(icao24) or _is_military_callsign(callsign):
             aircraft.append(_extract_aircraft(state))
-    return aircraft
+    return _FlightRead(aircraft, _stale_age(data))
 
 
 async def fetch_military_flights(
@@ -230,56 +282,78 @@ async def fetch_military_flights(
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
-        bbox: Optional bounding box as "lamin,lomin,lamax,lomax" (OpenSky only).
+        bbox: Optional bounding box as "lamin,lomin,lamax,lomax": four
+            comma-separated numbers, latitudes -90..90 and longitudes
+            -180..180, each minimum below its maximum (a box crossing the
+            antimeridian is two boxes). Anything else returns error /
+            reason "invalid_bbox" without fetching.
 
     Returns:
         Dict with aircraft list, count, filter description, source, and timestamp.
-        When neither source answers, source is "none" and the dict also carries
-        error, degraded and reason: the count is unknown, not zero.
+        When neither source answers live, source is "none" and the dict also
+        carries error, degraded and reason: the count is unknown, not zero.
+        An expired cached copy is never returned as current flights: when
+        it is all that is left it goes under stale_copy, with its source,
+        as_of and age, and aircraft stays empty.
     """
+    box: tuple[float, float, float, float] | None = None
+    if bbox is not None:
+        box = _parse_bbox(bbox)
+        if box is None:
+            return {
+                "aircraft": [],
+                "count": 0,
+                "bbox": bbox,
+                "source": "none",
+                "timestamp": _utc_now_iso(),
+                "error": (
+                    f"invalid bbox {bbox!r}: expected lamin,lomin,lamax,lomax as four "
+                    "comma-separated numbers, latitudes -90..90, longitudes "
+                    "-180..180, each minimum below its maximum (split a box that "
+                    "crosses the antimeridian in two)"
+                ),
+                "reason": "invalid_bbox",
+            }
+
     # Primary: adsb.lol (free, dedicated military endpoint, no filtering needed)
-    aircraft = await _fetch_adsblol_military(fetcher)
-    adsblol_failed = aircraft is None
-    if aircraft is not None and len(aircraft) > 0:
+    adsblol = await _fetch_adsblol_military(fetcher)
+    adsblol_live = adsblol is not None and adsblol.stale_age_seconds is None
+    # A live answer with aircraft elsewhere but none in the box is a real zero.
+    adsblol_any = adsblol is not None and bool(adsblol.aircraft)
+    if adsblol is not None and box is not None:
         # Apply bbox filter client-side if requested
-        if bbox is not None:
-            parts = bbox.split(",")
-            if len(parts) == 4:
-                la_min, lo_min, la_max, lo_max = map(float, parts)
-                aircraft = [
-                    a for a in aircraft
-                    if a["latitude"] is not None and a["longitude"] is not None
-                    and la_min <= a["latitude"] <= la_max
-                    and lo_min <= a["longitude"] <= lo_max
-                ]
+        adsblol.aircraft = _in_bbox(adsblol.aircraft, box)
+    if adsblol_live and adsblol_any:
         return {
-            "aircraft": aircraft,
-            "count": len(aircraft),
+            "aircraft": adsblol.aircraft,
+            "count": len(adsblol.aircraft),
             "military_filter": "adsblol_mil_endpoint",
             "source": "adsb.lol",
             "timestamp": _utc_now_iso(),
         }
 
-    # Fallback: OpenSky Network
+    # Fallback: OpenSky Network, tried live before any cached copy is
+    # considered.
     logger.debug("adsb.lol unavailable, trying OpenSky")
-    aircraft = await _fetch_opensky_military(fetcher, bbox)
-    if aircraft is not None:
+    opensky = await _fetch_opensky_military(fetcher, box)
+    if opensky is not None and opensky.stale_age_seconds is None:
         return {
-            "aircraft": aircraft,
-            "count": len(aircraft),
+            "aircraft": opensky.aircraft,
+            "count": len(opensky.aircraft),
             "military_filter": "icao_prefix+callsign",
             "source": "opensky",
             "timestamp": _utc_now_iso(),
         }
 
-    # Neither source answered. This used to read as an empty sky (count 0,
-    # told apart only by source "none"); the keys stay for the consumers
-    # that read them, and error / degraded / reason mark the outage.
-    if adsblol_failed:
-        detail = "adsb.lol and OpenSky both failed"
-    else:
+    # Neither source answered live. This used to read as an empty sky (count
+    # 0, told apart only by source "none"), and an expired cached copy used
+    # to come back as current flights stamped now; the keys stay for the
+    # consumers that read them, and error / degraded / reason mark the outage.
+    if adsblol_live:
         detail = "adsb.lol returned no positioned aircraft and OpenSky failed"
-    return {
+    else:
+        detail = "adsb.lol and OpenSky both failed"
+    response = {
         "aircraft": [],
         "count": 0,
         "military_filter": "icao_prefix+callsign",
@@ -288,7 +362,41 @@ async def fetch_military_flights(
         "error": f"No military flight source available ({detail})",
         "degraded": True,
         "reason": "military_flights_unavailable",
+        "data_gaps": [],
     }
+    copies = [
+        (name, read) for name, read in (("adsb.lol", adsblol), ("opensky", opensky))
+        if read is not None and read.stale_age_seconds is not None
+    ]
+    if copies:
+        # Prefer a copy that holds aircraft; adsb.lol first.
+        name, read = next(((n, r) for n, r in copies if r.aircraft), copies[0])
+        age = read.stale_age_seconds
+        as_of = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - age, tz=timezone.utc
+        ).isoformat()
+        response["stale_copy"] = {
+            "source": name,
+            "aircraft": read.aircraft,
+            "count": len(read.aircraft),
+            "as_of": as_of,
+            "age_seconds": age,
+        }
+        response["stale_age_seconds"] = age
+        response["error"] = (
+            f"No live military flight source ({detail}); only an expired cached "
+            f"copy from {name}, {age:.0f} s old, remains (stale_copy)"
+        )
+        response["data_gaps"].append(
+            f"no live military flight source answered; the {len(read.aircraft)} "
+            f"aircraft in stale_copy are {name}'s cached copy as of {as_of} "
+            f"({age:.0f} s old), not current positions, and are not counted"
+        )
+    else:
+        response["data_gaps"].append(
+            "no military flight source answered: the aircraft count is unknown, not zero"
+        )
+    return response
 
 
 async def fetch_theater_posture(fetcher: Fetcher) -> dict:
@@ -301,8 +409,11 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
     source "none") has an unknown count, not zero: it is named in
     unavailable_theaters and data_gaps and the response is degraded; with
     every theater unavailable it carries error / reason. Its count stays 0
-    for consumers that read the field directly. Only a complete posture is
-    cached, so an outage is not replayed after the sources recover.
+    for consumers that read the field directly. A theater for which only an
+    expired cached copy answered is unavailable too, and is also named in
+    stale_theaters (its stale_copy_age_seconds gives the copy's age). Only a
+    complete, live posture is cached, so an outage is not replayed after the
+    sources recover.
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
@@ -328,14 +439,17 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
             if ac.get("callsign"):
                 callsigns.append(ac["callsign"])
 
-        return (name, {
+        summary = {
             "count": len(aircraft_list),
             "countries": sorted(countries),
             "sample_callsigns": callsigns[:5],
             "bbox": info["bbox"],
             "description": info["desc"],
             "source": result.get("source"),
-        })
+        }
+        if result.get("stale_copy"):
+            summary["stale_copy_age_seconds"] = result["stale_copy"]["age_seconds"]
+        return (name, summary)
 
     tasks = [
         _fetch_theater(name, info) for name, info in THEATERS.items()
@@ -367,6 +481,16 @@ async def fetch_theater_posture(fetcher: Fetcher) -> dict:
             f"{', '.join(unavailable)}: their counts are unknown, not zero, and "
             "total_military_aircraft counts only the other theaters"
         )
+        stale = [name for name in unavailable if "stale_copy_age_seconds" in theaters[name]]
+        if stale:
+            # An expired cached copy used to read as current flights, and a
+            # posture built from it was cached as complete.
+            oldest = max(theaters[name]["stale_copy_age_seconds"] for name in stale)
+            response["stale_theaters"] = stale
+            response["data_gaps"].append(
+                f"for {', '.join(stale)} only an expired cached copy answered "
+                f"(up to {oldest:.0f} s old); it is not counted as current flights"
+            )
         if len(unavailable) == len(theaters):
             response["error"] = (
                 "No military flight source available for any theater "
