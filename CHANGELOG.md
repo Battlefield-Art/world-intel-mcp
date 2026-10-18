@@ -398,6 +398,12 @@ source here, and no proxy is substituted for any of these measures.
   dropped a city that a large quake had reached. The step now says so
   and to compare each city's position with every step-1 event before
   dropping it. The code is unchanged.
+- aoi-watch-setup said every failed domain is listed in `data_gaps` and
+  left out of the diff. Earthquakes, and wildfires when
+  `NASA_FIRMS_API_KEY` is set, return empty with no error when their
+  fetch fails, so the diff reports everything departing with no gap. Both
+  AOI prompts now say so, call a whole domain departing at once
+  unconfirmed, and point to `failing_sources`. The code is unchanged.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

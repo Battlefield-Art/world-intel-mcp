@@ -1145,8 +1145,12 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
         limits=(
             "The first change check records a baseline and claims nothing "
             "entered or left.",
-            "A domain that fails is listed in data_gaps and left out of the "
-            "diff. Never read it as everything leaving.",
+            "Most domains that fail are listed in data_gaps and left out of "
+            "the diff, but earthquakes, and wildfires when NASA_FIRMS_API_KEY "
+            "is set, can come back empty from a failed fetch with no data_gaps "
+            "entry, which reads as everything leaving. A whole domain "
+            "departing at once is unconfirmed: check failing_sources in "
+            "intel://guide/source-health and say it could not be confirmed.",
             "Each intel_aoi_changes call compares with the snapshot saved by "
             "the call before it (yours or a collector AOI sweep) and then "
             "replaces that snapshot.",
@@ -1185,6 +1189,11 @@ PROMPTS: tuple[ResearchPrompt, ...] = (
             "Every intel_aoi_changes call saves a new snapshot. Call it once: a "
             "retried call compares with the snapshot the first call just saved "
             "and reports that nothing changed.",
+            "Earthquakes, and wildfires when NASA_FIRMS_API_KEY is set, can "
+            "return empty from a failed fetch with no data_gaps entry, so a "
+            "whole domain departing at once may be an outage: check "
+            "failing_sources in intel://guide/source-health and report it as "
+            "unconfirmed.",
             "News for an AOI is found by place name near its centre, so a "
             "nearby place with the same name can leak in.",
         ),

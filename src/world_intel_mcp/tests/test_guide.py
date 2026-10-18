@@ -1950,3 +1950,37 @@ def test_earthquake_exposure_says_each_city_names_only_its_nearest_event() -> No
     assert "names only the nearest of them for each city" in text
     assert "compare its lat and lon with each step-1 event" in text
     assert "Keep only the exposed_cities whose event_detail" not in text
+
+
+@pytest.mark.asyncio
+async def test_aoi_prompts_say_which_domains_fail_silently(monkeypatch, tmp_path) -> None:
+    """Earthquakes, and FIRMS regions with a key set, come back empty with
+    no error when the fetch fails, so the AOI diff cannot list them as a
+    gap; the prompts must not promise it does. Every request gets a 503."""
+    from world_intel_mcp.fetcher import Fetcher
+    from world_intel_mcp.sources import seismology, wildfire
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+    cache = Cache(db_path=tmp_path / "aoi-silent.db")
+    down = Fetcher(cache, CircuitBreaker(), max_retries=0, client=client)
+    monkeypatch.setenv("NASA_FIRMS_API_KEY", "test-only")
+
+    async def _no_wait(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    try:
+        quakes = await seismology.fetch_earthquakes(down)
+        fires = await wildfire.fetch_wildfires(down)
+    finally:
+        await client.aclose()
+        cache.close()
+    assert (quakes["earthquakes"], "error" in quakes) == ([], False)
+    assert "error" not in fires
+    assert fires["total_fires"] == 0
+    assert {r["count"] for r in fires["fires_by_region"].values()} == {0}
+    for name in ("aoi-watch-setup", "aoi-review"):
+        text = " ".join(_text(name).split())
+        assert "A domain that fails is listed in data_gaps" not in text
+        assert "earthquakes, and wildfires when NASA_FIRMS_API_KEY" in text.replace("Earthquakes", "earthquakes")
+        assert "failing_sources in intel://guide/source-health" in text
