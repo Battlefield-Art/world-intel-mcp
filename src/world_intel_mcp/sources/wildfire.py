@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from .freshness import text_answer_freshness
 
 logger = logging.getLogger("world-intel-mcp.sources.wildfire")
 
@@ -32,6 +33,11 @@ REGIONS = {
     "southeast_asia": "90,-15,155,25",
     "oceania": "105,-50,180,-5",
 }
+
+# How many 0.5-degree clusters each region's answer lists (the largest by
+# fire count). A region's ``cluster_count`` says how many there were, so a
+# caller can tell when smaller clusters were cut.
+TOP_CLUSTERS_PER_REGION = 20
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,8 +112,9 @@ def _parse_fires_csv(csv_text: str) -> list[dict]:
     return fires
 
 
-def _cluster_fires(fires: list[dict], top_n: int = 20) -> list[dict]:
-    """Group fires by a 0.5-degree grid and return the top N clusters by count."""
+def _cluster_fires(fires: list[dict], top_n: int | None = TOP_CLUSTERS_PER_REGION) -> list[dict]:
+    """Group fires by a 0.5-degree grid and return the top N clusters by
+    count (every cluster when ``top_n`` is None)."""
     grid: dict[tuple[float, float], list[dict]] = {}
 
     for fire in fires:
@@ -145,7 +152,11 @@ async def fetch_wildfires(
     region: str | None = None,
     api_key: str | None = None,
 ) -> dict:
-    """Fetch active wildfire data from NASA FIRMS (VIIRS SNPP NRT, last 24h).
+    """Fetch active wildfire data from NASA FIRMS (VIIRS SNPP NRT).
+
+    Each region is one FIRMS area request with a day range of 2 (the
+    trailing ``/2`` in the URL), which asks FIRMS for its two most recent
+    days of detections, not a rolling 24 hours.
 
     Args:
         fetcher: Shared HTTP fetcher with caching and circuit breaking.
@@ -153,7 +164,18 @@ async def fetch_wildfires(
         api_key: NASA FIRMS API key. Falls back to NASA_FIRMS_API_KEY env var.
 
     Returns:
-        Dict with fires_by_region, total_fires, source, and timestamp.
+        Dict with fires_by_region, total_fires, source, and timestamp. Each
+        answered region has ``count``, ``top_clusters`` (the
+        ``TOP_CLUSTERS_PER_REGION`` largest), ``cluster_count`` and
+        ``fetched_at`` (when FIRMS answered), plus ``_stale`` /
+        ``_stale_age_seconds`` when it is an expired cached copy served
+        because FIRMS did not answer. A region FIRMS did not answer (and no
+        copy exists) keeps ``count`` 0 and empty ``top_clusters`` but
+        carries ``error``, and the result is ``degraded`` with
+        ``reason: "firms_fetch_failed"`` and ``failed_regions``: ``error``
+        when every requested region failed, else ``partial_errors``. Any
+        expired copy also marks the result ``_stale`` with
+        ``stale_regions``.
     """
     key = api_key or os.environ.get("NASA_FIRMS_API_KEY")
     if not key:
@@ -169,23 +191,26 @@ async def fetch_wildfires(
     else:
         regions_to_fetch = dict(REGIONS)
 
-    async def _fetch_region(region_name: str, bbox: str) -> tuple[str, list[dict] | None]:
-        """Fetch fires for a single region, return (name, fires_list_or_None)."""
+    async def _fetch_region(
+        region_name: str, bbox: str
+    ) -> tuple[str, list[dict] | None, dict]:
+        """Fetch fires for a single region: (name, fires or None, freshness)."""
         url = f"{_FIRMS_BASE_URL}/{key}/VIIRS_SNPP_NRT/{bbox}/2"
+        cache_key = f"wildfire:csv:{region_name}"
 
         csv_text = await fetcher.get_text(
             url=url,
             source="nasa-firms",
-            cache_key=f"wildfire:csv:{region_name}",
+            cache_key=cache_key,
             cache_ttl=1800,
         )
 
         if csv_text is None:
             logger.warning("FIRMS returned no data for region %s", region_name)
-            return (region_name, None)
+            return (region_name, None, {})
 
         fires = _parse_fires_csv(csv_text)
-        return (region_name, fires)
+        return (region_name, fires, text_answer_freshness(fetcher, cache_key, csv_text))
 
     # Fetch all requested regions in parallel
     tasks = [
@@ -197,36 +222,65 @@ async def fetch_wildfires(
     # Assemble response
     fires_by_region: dict[str, dict] = {}
     total_fires = 0
+    failed: list[str] = []
+    stale: list[str] = []
+    stale_ages: list[float] = []
 
-    for region_name, fires in results:
+    for region_name, fires, freshness in results:
         if fires is None:
-            fires_by_region[region_name] = {"count": 0, "top_clusters": []}
+            # A region FIRMS did not answer must not read as a region with
+            # no fires: same contract as ACLED, GDELT and USGS. The empty
+            # count/top_clusters keep old callers iterating.
+            failed.append(region_name)
+            fires_by_region[region_name] = {
+                "count": 0,
+                "top_clusters": [],
+                "error": (
+                    f"NASA FIRMS gave no answer for {region_name} (API error, "
+                    "timeout, or open circuit) and no cached copy exists"
+                ),
+            }
             continue
 
         count = len(fires)
         total_fires += count
-        top_clusters = _cluster_fires(fires)
+        clusters = _cluster_fires(fires, top_n=None)
         fires_by_region[region_name] = {
             "count": count,
-            "top_clusters": top_clusters,
+            "top_clusters": clusters[:TOP_CLUSTERS_PER_REGION],
+            "cluster_count": len(clusters),
+            **freshness,
         }
+        if freshness.get("_stale"):
+            stale.append(region_name)
+            stale_ages.append(freshness["_stale_age_seconds"])
 
-    cache_label = region if region is not None else "global"
-    # Store assembled result in cache under the composite key
-    fetcher.cache.set(
-        f"wildfire:fires:{cache_label}",
-        {
-            "fires_by_region": fires_by_region,
-            "total_fires": total_fires,
-            "source": "nasa-firms",
-            "timestamp": _utc_now_iso(),
-        },
-        1800,
-    )
-
-    return {
+    result: dict = {
         "fires_by_region": fires_by_region,
         "total_fires": total_fires,
         "source": "nasa-firms",
         "timestamp": _utc_now_iso(),
     }
+    if failed:
+        result["degraded"] = True
+        result["reason"] = "firms_fetch_failed"
+        result["failed_regions"] = sorted(failed)
+        if len(failed) == len(results):
+            result["error"] = (
+                "NASA FIRMS fetch failed for every requested region (API error, "
+                "timeout, or open circuit; no cached copy)"
+            )
+        else:
+            result["partial_errors"] = [
+                fires_by_region[name]["error"] for name in sorted(failed)
+            ]
+    if stale:
+        result["_stale"] = True
+        result["_stale_age_seconds"] = max(stale_ages)
+        result["stale_regions"] = sorted(stale)
+
+    cache_label = region if region is not None else "global"
+    # Store assembled result in cache under the composite key
+    fetcher.cache.set(f"wildfire:fires:{cache_label}", result, 1800)
+
+    return result

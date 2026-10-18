@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from ..fetcher import Fetcher
+from .freshness import json_answer_freshness
 
 logger = logging.getLogger("world-intel-mcp.sources.seismology")
 
@@ -29,7 +30,13 @@ async def fetch_earthquakes(
         limit: Maximum number of results.
 
     Returns:
-        Dict with earthquakes list, count, query params, source, and timestamp.
+        Dict with earthquakes list, count, query params, source, timestamp
+        and ``fetched_at`` (when USGS answered; earlier than ``timestamp``
+        for a cached answer). An expired cached copy served because USGS
+        did not answer carries ``_stale`` and ``_stale_age_seconds``. A
+        failed fetch with no copy is ``error`` / ``degraded`` /
+        ``reason: "usgs_fetch_failed"`` with the list keys kept empty, so
+        it never reads as a quiet planet.
     """
     now = datetime.now(timezone.utc)
     starttime = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -42,17 +49,28 @@ async def fetch_earthquakes(
         "starttime": starttime,
     }
 
+    # The limit is part of the key: a 5-quake answer cached for one caller
+    # must not be served to another that asked for 50 and then reads the
+    # short list as complete.
+    cache_key = f"seismology:quakes:{min_magnitude}:{hours}:{limit}"
     data = await fetcher.get_json(
         url=_USGS_ENDPOINT,
         source="usgs",
-        cache_key=f"seismology:quakes:{min_magnitude}:{hours}",
+        cache_key=cache_key,
         cache_ttl=300,
         params=params,
     )
 
     if data is None:
         logger.warning("USGS API returned no data")
+        # A failed fetch must not be byte-identical to a quiet planet, the
+        # same contract ACLED and GDELT follow. earthquakes/count keep their
+        # normal empty shape so callers that don't check "error" or
+        # "degraded" still iterate an empty list.
         return {
+            "error": "USGS earthquake fetch failed (API error, timeout, or malformed response)",
+            "degraded": True,
+            "reason": "usgs_fetch_failed",
             "earthquakes": [],
             "count": 0,
             "query": {"min_magnitude": min_magnitude, "hours": hours},
@@ -95,4 +113,5 @@ async def fetch_earthquakes(
         "query": {"min_magnitude": min_magnitude, "hours": hours},
         "source": "usgs",
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **json_answer_freshness(fetcher, cache_key, data),
     }

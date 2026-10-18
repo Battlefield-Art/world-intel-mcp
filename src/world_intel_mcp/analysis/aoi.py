@@ -1122,7 +1122,47 @@ async def _safe_fetch(coro, label: str) -> dict:
         return {"error": str(exc)}
 
 
-async def _fetch_wildfires_for_aoi(fetcher, wildfire_regions: list[str]) -> dict:
+def _age_text(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} min"
+    if seconds < 2 * 86400:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86400:.1f} days"
+
+
+def _stale_copy_reason(subject: str, result: dict) -> str:
+    """Why an expired cached copy is not used: names the copy's age and
+    write time as this server's, never as the upstream's data gap."""
+    age = result.get("_stale_age_seconds")
+    age_text = _age_text(float(age)) if isinstance(age, (int, float)) else "an unknown time"
+    when = f" (at {result['fetched_at']})" if result.get("fetched_at") else ""
+    return (
+        f"no fresh {subject} (the request failed or its circuit breaker is "
+        f"open); the only copy on hand is one this server cached {age_text} "
+        f"ago{when}, so it is not scored as current"
+    )
+
+
+def _refuse_stale_copy(result: Any, subject: str) -> Any:
+    """An escalation input that is the fetcher's expired fallback copy
+    (``_stale``) becomes an outage that names the copy's age, so a days-old
+    answer never scores as current conditions."""
+    if isinstance(result, dict) and result.get("_stale"):
+        return {"error": _stale_copy_reason(subject, result), "stale_copy": True}
+    return result
+
+
+async def _fetch_wildfires_for_aoi(
+    fetcher, wildfire_regions: list[str], refuse_stale: bool = False
+) -> dict:
+    """FIRMS fire clusters from every continental region the AOI overlaps,
+    merged as ``{"clusters": [...]}``. ``error`` when no region answered
+    with a cluster and at least one failed (quiet cannot be told from
+    missing); a failed region next to answered ones is named in
+    ``partial_errors``. ``truncated_regions`` lists regions whose answer
+    kept only its largest clusters; ``fetched_at`` is the oldest answered
+    region's fetch time. With ``refuse_stale`` (the escalation score), a
+    region answered only by an expired cached copy counts as failed."""
     from ..sources import wildfire
 
     if not wildfire_regions:
@@ -1133,17 +1173,63 @@ async def _fetch_wildfires_for_aoi(fetcher, wildfire_regions: list[str]) -> dict
     )
     clusters: list[dict] = []
     errors: list[str] = []
-    for res in results:
+    truncated: list[dict] = []
+    fetched: list[str] = []
+    for region, res in zip(wildfire_regions, results):
         if not isinstance(res, dict):
+            errors.append(f"the NASA FIRMS answer for {region} was not a dict")
             continue
-        if res.get("error"):
-            errors.append(res["error"])
+        by_region = res.get("fires_by_region")
+        has_regions = isinstance(by_region, dict) and bool(by_region)
+        # A failed region names itself inside fires_by_region; the top-level
+        # error ("every requested region") is used only when none does.
+        if res.get("error") and not has_regions:
+            errors.append(str(res["error"]))
             continue
-        for region_data in res.get("fires_by_region", {}).values():
-            clusters.extend(region_data.get("top_clusters", []))
+        if not has_regions:
+            errors.append(f"the NASA FIRMS answer for {region} carried no regions")
+            continue
+        for name, region_data in by_region.items():
+            if isinstance(region_data, dict) and region_data.get("error"):
+                errors.append(str(region_data["error"]))
+                continue
+            top = region_data.get("top_clusters") if isinstance(region_data, dict) else None
+            if not isinstance(top, list):
+                errors.append(f"the NASA FIRMS answer for {name} carried no cluster list")
+                continue
+            if refuse_stale and region_data.get("_stale"):
+                errors.append(
+                    _stale_copy_reason(f"NASA FIRMS answer for {name}", region_data)
+                )
+                continue
+            clusters.extend(top)
+            total = region_data.get("cluster_count")
+            if isinstance(total, int) and not isinstance(total, bool):
+                cut = total > len(top)
+            else:
+                cut = len(top) >= wildfire.TOP_CLUSTERS_PER_REGION
+            if cut:
+                truncated.append(
+                    {"region": name, "listed": len(top), "clusters": total}
+                )
+            if region_data.get("fetched_at"):
+                fetched.append(str(region_data["fetched_at"]))
     if not clusters and errors:
         return {"error": "; ".join(sorted(set(errors)))}
-    return {"clusters": clusters}
+    out: dict[str, Any] = {"clusters": clusters}
+    if errors:
+        out["partial_errors"] = sorted(set(errors))
+    if truncated:
+        out["truncated_regions"] = truncated
+    if fetched:
+        out["fetched_at"] = min(fetched)
+    return out
+
+
+_MILITARY_NO_SOURCE = (
+    "no military flight source answered (adsb.lol failed or returned no "
+    "aircraft, and the OpenSky fallback failed)"
+)
 
 
 async def _fetch_military_merged(fetcher, bboxes: list[str]) -> dict:
@@ -1153,7 +1239,10 @@ async def _fetch_military_merged(fetcher, bboxes: list[str]) -> dict:
     the adsb.lol path returns a global list regardless of bbox. Reports
     an error only when every box failed; a partial failure is surfaced
     via ``partial_errors`` so the caller can name the gap honestly
-    instead of presenting half-coverage as full."""
+    instead of presenting half-coverage as full. A box whose answer is
+    ``source: "none"`` (adsb.lol gave no aircraft and the OpenSky
+    fallback failed), with or without an ``error`` key, failed: that
+    shape is an outage, not an empty sky."""
     from ..sources import military
 
     results = await asyncio.gather(
@@ -1174,8 +1263,14 @@ async def _fetch_military_merged(fetcher, bboxes: list[str]) -> dict:
         if res.get("error"):
             errors.append(str(res["error"]))
             continue
+        if res.get("source") == "none":
+            errors.append(_MILITARY_NO_SOURCE)
+            continue
+        if not isinstance(res.get("aircraft"), list):
+            errors.append("the military flights answer carried no aircraft list")
+            continue
         any_ok = True
-        for ac in res.get("aircraft", []):
+        for ac in res["aircraft"]:
             key = ac.get("icao24") or ac.get("callsign")
             if key is not None:
                 if key in seen:
@@ -1218,10 +1313,15 @@ async def _aoi_news_query(fetcher, aoi_row: dict) -> tuple[str, dict]:
     )
 
     if isinstance(place_ctx, dict) and place_ctx.get("error"):
+        error = str(place_ctx["error"])
         return aoi_name, {
             "basis": "aoi_name",
             "query": aoi_name,
-            "reason": f"Reverse geocoding failed: {place_ctx['error']}",
+            "reason": (
+                error
+                if error.lower().startswith("reverse geocoding")
+                else f"Reverse geocoding failed: {error}"
+            ),
         }
 
     terms = place_ctx.get("terms") or [] if isinstance(place_ctx, dict) else []
@@ -1264,7 +1364,16 @@ def _scope_to_aoi(
     fence."""
     if isinstance(result, dict) and result.get("error"):
         return {"error": str(result["error"])}
-    items = result.get(list_key, []) if isinstance(result, dict) else []
+    items = result.get(list_key) if isinstance(result, dict) else None
+    if not isinstance(items, list):
+        # An unrecognized answer (``_safe_fetch`` turns a non-dict into {})
+        # says nothing about the area: unknown, not an empty fence.
+        return {
+            "error": (
+                f"the answer carried no {list_key} list, so what is inside "
+                "the area is unknown"
+            )
+        }
     entry: dict[str, Any] = {"items": filter_by_aoi(items, aoi_row, lat_key, lon_key)}
     if isinstance(result, dict) and result.get("partial_errors"):
         entry["partial_errors"] = result["partial_errors"]
@@ -1455,6 +1564,8 @@ async def fetch_aoi_brief(fetcher, store: AOIStore, name: Any) -> dict:
         counts["wildfires"] = 0
     else:
         fire_in_range = scoped["wildfires"]["items"]
+        for partial in scoped["wildfires"].get("partial_errors", []):
+            data_gaps.append(f"Wildfires: partial coverage: {partial}")
         counts["wildfires"] = len(fire_in_range)
         for fc in fire_in_range:
             n = _add_source(
@@ -1634,17 +1745,35 @@ _NEWS_MIN_INTAKE_RATIO = 0.5
 
 NEWS_METHOD = (
     "GDELT DOC timelinevolraw for the geocoded place query (see "
-    "news_scoping). Current window: the 7 days ending with GDELT's current "
-    "time step, which may be partly filled; prior window: the 7 days before "
-    "it. Share = matching articles / all articles GDELT monitored in the "
-    "window. expected_articles = prior share x current monitored volume; "
-    "change_pct = 100 x (current articles - expected) / max(expected, 20); "
-    "news component = min(20, 0.2 x max(0, change_pct)), so a doubled share "
-    "scores the full 20 (once 20 or more articles were expected) and a flat "
-    "or falling one scores 0. Not scored when "
-    "either window monitored under half the other's volume (GDELT ingestion "
-    "gaps)."
+    "news_scoping): the settlement and county at the AOI's centre, so "
+    "coverage of other places inside a large area is not counted. Current "
+    "window: the 7 days ending with GDELT's current time step (a UTC day at "
+    "GDELT's default daily resolution), which is still filling: "
+    "current_step_elapsed is the fraction of it that has passed; a share is "
+    "unaffected by how much of the day GDELT has ingested so far, but any "
+    "time-of-day mix in a partial day is not measured. Prior window: the 7 "
+    "days before it. Share = matching articles / all articles GDELT "
+    "monitored in the window. expected_articles = prior share x current "
+    "monitored volume; change_pct = 100 x (current articles - expected) / "
+    "max(expected, 20); news component = min(20, 0.2 x max(0, change_pct)), "
+    "so a doubled share scores the full 20 (once 20 or more articles were "
+    "expected) and a flat or falling one scores 0. Not scored when either "
+    "window monitored under half the other's volume (GDELT ingestion gaps), "
+    "or when the only timeline on hand is an expired cached copy."
 )
+
+# News is scoped to the settlement and county at the AOI's centre. Above
+# this bounding radius that place describes only part of the area, and
+# data_gaps says so. A judgment threshold (the README's worked example is
+# a 50 km circle around Pittsburgh), not a measured one.
+_NEWS_SCOPE_RADIUS_KM = 50.0
+
+# The escalation's global event feeds and the caps that make even a full
+# answer a sample: a list that reaches its cap is marked partial coverage.
+_QUAKE_WINDOW_HOURS = 72
+_QUAKE_SAMPLE_LIMIT = 50
+_ACLED_WINDOW_DAYS = 7
+_ACLED_SAMPLE_LIMIT = 100
 
 # Convergence component: the geolocated domains whose in-fence events
 # feed analysis/convergence.py, with their coordinate keys. Aviation is
@@ -1660,15 +1789,76 @@ _CONVERGENCE_GRID_DEGREES = 1.0
 _CONVERGENCE_MIN_DOMAINS = 2
 _CONVERGENCE_MIN_EVENTS = 3
 
+# The 1-degree grid laid four ways, shifted by half a cell in latitude,
+# longitude or both, as (lat, lon) offsets in degrees. A fixed grid splits
+# a compact cluster that straddles a degree line (the README's Pittsburgh
+# centre is 0.0041 degrees from -80). Any cluster spanning under half a
+# cell on both axes lies inside one cell of at least one of these grids
+# (z3-checked); the unshifted grid comes first so it wins ties.
+_CONVERGENCE_GRID_OFFSETS: tuple[tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (0.0, 0.5),
+    (0.5, 0.0),
+    (0.5, 0.5),
+)
+
+# Names for the convergence domains in data_gaps prose.
+_CONVERGENCE_LABELS = {
+    "earthquakes": "earthquakes",
+    "military_flights": "military flights",
+    "conflict_events": "conflict events",
+    "wildfires": "wildfires",
+}
+
+# What each convergence domain covers: they share no common window.
+_CONVERGENCE_WINDOWS = {
+    "earthquakes": (
+        f"USGS M4.5+ quakes in the {_QUAKE_WINDOW_HOURS} h before the fetch, "
+        f"worldwide, newest first, at most {_QUAKE_SAMPLE_LIMIT}"
+    ),
+    "military_flights": (
+        "a live ADS-B snapshot (adsb.lol, OpenSky as fallback); the source "
+        "does not report when it fetched, so its fetched_at is null"
+    ),
+    "conflict_events": (
+        f"ACLED events dated in the {_ACLED_WINDOW_DAYS} days before the "
+        "fetch (by event date; ACLED publishes with a reporting lag), "
+        f"worldwide, at most {_ACLED_SAMPLE_LIMIT}"
+    ),
+    "wildfires": (
+        "NASA FIRMS VIIRS SNPP NRT detections for a day range of 2 (FIRMS's "
+        "two most recent days, not a rolling 24 h), the 20 largest "
+        "0.5-degree clusters per continental region"
+    ),
+}
+
 CONVERGENCE_METHOD = (
     "analysis/convergence.py detect_convergence over the events inside the "
     "AOI's exact shape (filter_by_aoi) from earthquakes, military flights, "
     "ACLED conflict events and wildfires: 1-degree grid, a cell converges "
     "with events from at least 2 of those domains and at least 3 events, "
-    "cell score = domains x (1 + sqrt(events)). Input = the strongest cell; "
-    "convergence component = min(8, 2 x score), so any convergent cell "
-    "(smallest possible score 5.46) earns the full 8. A cell's lat/lon is "
-    "its grid-cell centre, which can lie outside a small AOI."
+    "cell score = domains x (1 + sqrt(events)). The grid is laid four ways, "
+    "shifted 0 or 0.5 degrees in latitude and in longitude (grid_offset_deg "
+    "names the one used; ties keep the unshifted grid), and input = the "
+    "strongest cell of any of them, so a cluster spanning under 0.5 degrees "
+    "in both latitude and longitude is never split; one spanning 0.5 to 1 "
+    "degree still can be. Convergence component = min(8, 2 x score), so any "
+    "convergent cell (smallest possible score 5.46) earns the full 8. A "
+    "cell's lat/lon is its grid-cell centre, which can lie outside a small "
+    "AOI. The four domains cover different windows (windows) and were "
+    "fetched at different times (fetched_at)."
+)
+
+SCORE_METHOD = (
+    "score_hotspot (analysis/escalation.py): capped components baseline 20, "
+    "news 20, military 20, conflict 20, social unrest 12 and convergence 8, "
+    "summed and renormalized to 0-100 over computed_from. An AOI has no "
+    "curated baseline, so baseline is a structural 0: the score can reach "
+    "80 when every component is measured (75 without news, 78.3 without "
+    "convergence, 72.2 without either); score_ceiling is this call's, with "
+    "any zero-filled component held at 0. "
+    "zero_filled_components are 0 only because their fetch failed; "
+    "lower_bound_components could only rise with the data that is missing."
 )
 
 
@@ -1783,6 +1973,9 @@ def news_coverage_trend(timeline: Any, now: datetime | None = None) -> dict:
         "window_days": NEWS_WINDOW_DAYS,
         "step_seconds": int(step_s),
         "latest_step": _iso(last),
+        # The step containing `now` is still filling: how far into it we are.
+        "current_step_start": _iso(current_step),
+        "current_step_elapsed": round((now - current_step) / step, 3),
         "current_window": cur,
         "prior_window": pri,
         "method": NEWS_METHOD,
@@ -1820,21 +2013,68 @@ def news_coverage_trend(timeline: Any, now: datetime | None = None) -> dict:
     return out
 
 
-def aoi_convergence(scoped: dict[str, dict]) -> dict:
+def _finite(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _grid_events(
+    events: list[dict], dlat: float, dlon: float, ref_lon: float | None
+) -> list[dict]:
+    """``events`` moved by (dlat, dlon) degrees, which shifts the grid
+    ``detect_convergence`` lays by the opposite amount. With ``ref_lon``
+    (the AOI's centre), a longitude more than 180 degrees from it is first
+    moved by exactly 360 so a cluster straddling the antimeridian stays
+    contiguous. Events without usable coordinates keep None, which
+    ``detect_convergence`` skips."""
+    moved = []
+    for event in events:
+        lat, lon = _finite(event["lat"]), _finite(event["lon"])
+        if lat is None or lon is None:
+            moved.append({**event, "lat": None, "lon": None})
+            continue
+        if ref_lon is not None:
+            if lon - ref_lon > 180.0:
+                lon -= 360.0
+            elif lon - ref_lon < -180.0:
+                lon += 360.0
+        moved.append({**event, "lat": lat + dlat, "lon": lon + dlon})
+    return moved
+
+
+def _wrap_lon(lon: float) -> float:
+    if lon > 180.0:
+        return lon - 360.0
+    if lon < -180.0:
+        return lon + 360.0
+    return lon
+
+
+def aoi_convergence(scoped: dict[str, dict], ref_lon: float | None = None) -> dict:
     """Multi-domain convergence inside an AOI: ``detect_convergence``
     (``analysis/convergence.py``, unmodified) over the in-fence events of
     the four geolocated domains in ``_CONVERGENCE_DOMAINS``. ``scoped``
     maps each domain to its ``_scope_to_aoi`` result, so the events are
     already filtered to the AOI's exact shape (circle, polygon or
-    corridor).
+    corridor). The grid is laid at each of ``_CONVERGENCE_GRID_OFFSETS``
+    and the grid holding the strongest cell is reported (``cells``,
+    ``convergent_cells``, ``grid_offset_deg``); cell centres are given in
+    ordinary coordinates. ``ref_lon`` (the AOI's centre longitude) keeps
+    an antimeridian-straddling cluster in one piece.
 
     ``score`` is the strongest convergent cell's score, the escalation
-    input. It is a measured 0.0 only when every input domain answered in
-    full. With a domain failed or partial, a positive score is reported
+    input. It is reported as a measured 0.0 only when no input domain
+    reported a failure or partial coverage; it cannot see gaps the
+    sources do not report, which is why ``fetch_aoi_escalation`` marks
+    samples cut at their caps as partial and refuses expired cached
+    copies. With a domain failed or partial, a positive score is reported
     with ``lower_bound`` true (with uniform weights a cell scores
     domains x (1 + sqrt(events)), so the missing events could only raise
-    it), and no convergent cell yields ``score`` None plus ``error``,
-    because quiet cannot be told from missing.
+    it, on every grid), and no convergent cell yields ``score`` None plus
+    ``error``, because quiet cannot be told from missing.
     """
     events: list[dict] = []
     events_by_domain: dict[str, int] = {}
@@ -1855,18 +2095,33 @@ def aoi_convergence(scoped: dict[str, dict]) -> dict:
             for item in result["items"]
         )
 
-    cells = detect_convergence(
-        events,
-        resolution=_CONVERGENCE_GRID_DEGREES,
-        min_types=_CONVERGENCE_MIN_DOMAINS,
-        min_total=_CONVERGENCE_MIN_EVENTS,
-    )
+    best: tuple[float, tuple[float, float], list[dict]] | None = None
+    for dlat, dlon in _CONVERGENCE_GRID_OFFSETS:
+        grid_cells = detect_convergence(
+            _grid_events(events, dlat, dlon, ref_lon),
+            resolution=_CONVERGENCE_GRID_DEGREES,
+            min_types=_CONVERGENCE_MIN_DOMAINS,
+            min_total=_CONVERGENCE_MIN_EVENTS,
+        )
+        top = grid_cells[0]["convergence_score"] if grid_cells else 0.0
+        if best is None or top > best[0]:
+            best = (top, (dlat, dlon), grid_cells)
+    _, (dlat, dlon), grid_cells = best
+    cells = [
+        {
+            **cell,
+            "lat": round(cell["lat"] - dlat, 2),
+            "lon": round(_wrap_lon(cell["lon"] - dlon), 2),
+        }
+        for cell in grid_cells
+    ]
     incomplete = failed + partial
     out: dict[str, Any] = {
         "score": None,
         "lower_bound": False,
         "convergent_cells": len(cells),
         "cells": cells[:5],
+        "grid_offset_deg": {"lat": dlat, "lon": dlon},
         "events_by_domain": events_by_domain,
         "inputs_used": used,
         "inputs_failed": failed,
@@ -1922,7 +2177,95 @@ async def _aoi_news_timeline(fetcher, aoi_row: dict) -> tuple[dict, dict]:
         news.fetch_gdelt_search(fetcher, query=query, mode="timelinevolraw"),
         "news_timeline",
     )
-    return result, scoping
+    return _refuse_stale_copy(result, "GDELT answer"), scoping
+
+
+def _news_scope_gap(aoi_row: dict, scoping: dict) -> str | None:
+    """The news-scope limit as a data gap where it bites: the query names
+    only the settlement and county at the AOI's centre, which cover a
+    large area only in part, and a shape whose centre cannot be placed
+    (a corridor or strait polygon centred at sea) gets no news score at
+    all, even where it covers named places."""
+    radius_km = float(aoi_row.get("radius_km") or 0.0)
+    kind = aoi_row.get("kind", "circle")
+    if scoping.get("basis") == "geocoded":
+        if radius_km <= _NEWS_SCOPE_RADIUS_KM:
+            return None
+        place = ", ".join(
+            str(part) for part in (scoping.get("place"), scoping.get("county")) if part
+        )
+        return (
+            f"News: scoped to {place or 'the place at the centre'}, the place at "
+            f"the AOI's centre; the area reaches {radius_km:.0f} km from its "
+            "centre, so coverage of other places inside it is not counted."
+        )
+    if kind != "circle" or radius_km > _NEWS_SCOPE_RADIUS_KM:
+        return (
+            "News: the query is built from the place at the AOI's centre "
+            f"only, so a {kind} whose centre cannot be placed gets no news "
+            "score even where it covers named places."
+        )
+    return None
+
+
+def _mark_capped_samples(
+    scoped: dict[str, dict], eq_result: Any, acled_result: Any, wildfire_result: Any
+) -> None:
+    """Name as partial coverage every escalation input whose global answer
+    reached its cap: its in-fence count is then a floor, not a
+    measurement, and convergence over it a lower bound. None of these
+    sources takes the AOI's box: USGS and ACLED are queried worldwide and
+    FIRMS by continental region."""
+
+    def _partial(domain: str, text: str) -> None:
+        entry = scoped[domain]
+        if "items" in entry:
+            entry["partial_errors"] = [*entry.get("partial_errors", []), text]
+
+    quakes = eq_result.get("earthquakes") if isinstance(eq_result, dict) else None
+    if isinstance(quakes, list) and len(quakes) >= _QUAKE_SAMPLE_LIMIT:
+        times = sorted(
+            str(q["time"]) for q in quakes if isinstance(q, dict) and q.get("time")
+        )
+        since = f"only quakes since {times[0]} are in" if times else "the oldest are cut"
+        _partial(
+            "earthquakes",
+            f"USGS answered with its cap of {_QUAKE_SAMPLE_LIMIT} M4.5+ quakes "
+            f"worldwide, newest first, so {since}; earlier ones in the "
+            f"{_QUAKE_WINDOW_HOURS} h window are missing",
+        )
+    events = acled_result.get("events") if isinstance(acled_result, dict) else None
+    if isinstance(events, list) and len(events) >= _ACLED_SAMPLE_LIMIT:
+        _partial(
+            "conflict_events",
+            f"ACLED answered with its cap of {_ACLED_SAMPLE_LIMIT} events "
+            f"worldwide for {_ACLED_WINDOW_DAYS} days, so in-area events "
+            "outside that sample are missing",
+        )
+    cut_regions = (
+        wildfire_result.get("truncated_regions", [])
+        if isinstance(wildfire_result, dict)
+        else []
+    )
+    for cut in cut_regions:
+        total = cut.get("clusters")
+        of = f" of {total}" if isinstance(total, int) else ""
+        _partial(
+            "wildfires",
+            f"NASA FIRMS listed only the {cut.get('listed')} largest{of} fire "
+            f"clusters for {cut.get('region')}, so smaller in-area clusters "
+            "can be missing",
+        )
+
+
+def _domain_names(domains: list[str]) -> str:
+    return ", ".join(_CONVERGENCE_LABELS.get(d, d) for d in domains)
+
+
+def _fetched_at(result: Any) -> str | None:
+    if isinstance(result, dict) and not result.get("error"):
+        return result.get("fetched_at")
+    return None
 
 
 async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
@@ -1938,6 +2281,13 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     is ``analysis/convergence.py`` run over the in-fence earthquakes,
     military flights, conflict events and wildfires (``aoi_convergence``).
 
+    An outage is never read as quiet: a source that did not answer
+    (USGS, a FIRMS region, both military sources, ACLED, GDELT), or that
+    answered only with an expired cached copy, counts as failed, the
+    copy's age named in ``data_gaps``. A global sample that reached its
+    cap (USGS newest 50, ACLED 100, FIRMS 20 largest clusters per region)
+    counts as partial coverage.
+
     When the news or convergence inputs fail, that component is
     ``None`` in ``components``, listed in ``unavailable_components`` and
     explained in ``data_gaps``, never a 0; ``computed_from`` names the
@@ -1945,9 +2295,14 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     failure is named in ``data_gaps`` but still enters the score as 0,
     because ``score_hotspot`` takes no null for those components;
     ``zero_filled_components`` lists which of ``computed_from`` that
-    happened to, so a reader can tell those zeros from measured quiet.
-    ``news_signal`` and ``convergence_signal`` carry the working for
-    both new components."""
+    happened to, so a reader can tell those zeros from measured quiet,
+    and ``lower_bound_components`` the components partial data can only
+    have understated. ``score_ceiling`` is the highest score reachable
+    with the components measured, a zero-filled one held at 0 (an AOI's
+    baseline is a structural 0, ``score_method``). ``news_signal`` and
+    ``convergence_signal`` carry the working for both new components,
+    with each input's ``fetched_at`` and, for convergence, each domain's
+    ``windows``."""
     if not isinstance(name, str) or not name.strip():
         return {"error": "name must be a non-empty string."}
 
@@ -1972,12 +2327,30 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
         wildfire_result,
         (news_result, news_scoping),
     ) = await asyncio.gather(
-        _safe_fetch(conflict_mod.fetch_acled_events(fetcher, days=7), "acled_events"),
+        _safe_fetch(
+            conflict_mod.fetch_acled_events(
+                fetcher, days=_ACLED_WINDOW_DAYS, limit=_ACLED_SAMPLE_LIMIT
+            ),
+            "acled_events",
+        ),
         _fetch_military_merged(fetcher, bboxes),
-        _safe_fetch(seismology.fetch_earthquakes(fetcher, hours=72), "earthquakes"),
-        _safe_fetch(_fetch_wildfires_for_aoi(fetcher, wildfire_regions), "wildfires"),
+        _safe_fetch(
+            seismology.fetch_earthquakes(
+                fetcher, hours=_QUAKE_WINDOW_HOURS, limit=_QUAKE_SAMPLE_LIMIT
+            ),
+            "earthquakes",
+        ),
+        _safe_fetch(
+            _fetch_wildfires_for_aoi(fetcher, wildfire_regions, refuse_stale=True),
+            "wildfires",
+        ),
         _aoi_news_timeline(fetcher, aoi),
     )
+    # "How hot is this area right now" must not be built from an expired
+    # copy: refused, with its age named (the news timeline and FIRMS
+    # regions are refused where they are fetched).
+    acled_result = _refuse_stale_copy(acled_result, "ACLED answer")
+    eq_result = _refuse_stale_copy(eq_result, "USGS answer")
     scoped = {
         "earthquakes": _scope_to_aoi(
             eq_result, "earthquakes", aoi, "latitude", "longitude"
@@ -1990,12 +2363,15 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
         ),
         "wildfires": _scope_to_aoi(wildfire_result, "clusters", aoi, "lat", "lon"),
     }
+    _mark_capped_samples(scoped, eq_result, acled_result, wildfire_result)
 
     data_gaps: list[str] = []
     conflict_count = fatalities = protests = 0
     if scoped["conflict_events"].get("error"):
         data_gaps.append(f"Conflict events: {scoped['conflict_events']['error']}")
     else:
+        for partial in scoped["conflict_events"].get("partial_errors", []):
+            data_gaps.append(f"Conflict events: partial coverage: {partial}")
         for ev in scoped["conflict_events"]["items"]:
             if "protest" in (ev.get("event_type") or "").lower():
                 protests += 1
@@ -2014,17 +2390,33 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     for domain, label in (("earthquakes", "Earthquakes"), ("wildfires", "Wildfires")):
         if scoped[domain].get("error"):
             data_gaps.append(f"{label}: {scoped[domain]['error']}")
+        for partial in scoped[domain].get("partial_errors", []):
+            data_gaps.append(f"{label}: partial coverage: {partial}")
 
-    convergence = aoi_convergence(scoped)
+    convergence = aoi_convergence(scoped, ref_lon=lon)
+    incomplete = convergence["inputs_failed"] + convergence["inputs_partial"]
     if convergence.get("error"):
-        data_gaps.append(f"Convergence: not scored; {convergence['error']}.")
+        reason = (
+            f"no convergent cell among {_domain_names(convergence['inputs_used'])}, "
+            f"but {_domain_names(incomplete)} answered only partly or not at "
+            "all, so quiet cannot be told from missing"
+            if convergence["inputs_used"]
+            else convergence["error"]
+        )
+        data_gaps.append(f"Convergence: not scored; {reason}.")
     elif convergence["lower_bound"]:
-        incomplete = convergence["inputs_failed"] + convergence["inputs_partial"]
         data_gaps.append(
-            f"Convergence: computed without full {', '.join(incomplete)} data; "
+            f"Convergence: computed without full {_domain_names(incomplete)} data; "
             f"{convergence['score']} is a lower bound (the missing events could "
             "only raise it)."
         )
+    convergence["windows"] = dict(_CONVERGENCE_WINDOWS)
+    convergence["fetched_at"] = {
+        "earthquakes": _fetched_at(eq_result),
+        "military_flights": _fetched_at(mil_result),
+        "conflict_events": _fetched_at(acled_result),
+        "wildfires": _fetched_at(wildfire_result),
+    }
 
     if news_result.get("error"):
         trend: dict[str, Any] = {"error": str(news_result["error"])}
@@ -2033,12 +2425,16 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
     news_signal = {
         "query": news_scoping.get("query"),
         "basis": news_scoping.get("basis"),
+        "fetched_at": _fetched_at(news_result),
         **trend,
     }
     if news_signal.get("error"):
         data_gaps.append(f"News: {news_signal['error']}.")
     elif news_signal.get("note"):
         data_gaps.append(f"News: {news_signal['note']}")
+    scope_gap = _news_scope_gap(aoi, news_scoping)
+    if scope_gap:
+        data_gaps.append(scope_gap)
 
     hotspot_config = {
         "lat": lat,
@@ -2055,6 +2451,21 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
         fatalities=fatalities,
         protests=protests,
     )
+    # The same scorer with every measured component at its cap: what this
+    # call could have reached (an AOI's baseline is always 0; a zero-filled
+    # component stays at 0).
+    unavailable = scored["unavailable_components"]
+    military_failed = bool(scoped["military_flights"].get("error"))
+    conflict_failed = bool(scoped["conflict_events"].get("error"))
+    score_ceiling = score_hotspot(
+        hotspot_config,
+        news_mentions=None if "news" in unavailable else 10**6,
+        military_count=0 if military_failed else 10**6,
+        conflict_events=0 if conflict_failed else 10**6,
+        convergence_score=None if "convergence" in unavailable else 10**6,
+        fatalities=0,
+        protests=0 if conflict_failed else 10**6,
+    )["score"]
 
     return {
         "aoi": {
@@ -2073,13 +2484,24 @@ async def fetch_aoi_escalation(fetcher, store: AOIStore, name: Any) -> dict:
             comp for comp, points in scored["components"].items() if points is not None
         ],
         "zero_filled_components": (
-            (["military"] if scoped["military_flights"].get("error") else [])
+            (["military"] if military_failed else [])
+            + (["conflict", "social_unrest"] if conflict_failed else [])
+        ),
+        "lower_bound_components": (
+            (["military"] if scoped["military_flights"].get("partial_errors") else [])
             + (
                 ["conflict", "social_unrest"]
-                if scoped["conflict_events"].get("error")
+                if scoped["conflict_events"].get("partial_errors")
+                else []
+            )
+            + (
+                ["convergence"]
+                if convergence["score"] is not None and convergence["lower_bound"]
                 else []
             )
         ),
+        "score_ceiling": score_ceiling,
+        "score_method": SCORE_METHOD,
         "news_scoping": news_scoping,
         "news_signal": news_signal,
         "convergence_signal": convergence,
