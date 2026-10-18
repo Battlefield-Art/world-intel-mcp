@@ -91,7 +91,8 @@ async def fetch_fleet_report(fetcher) -> dict:
     A component that raised or reported an error is named in
     unavailable_components and data_gaps, and the report is degraded; so is
     a vessel snapshot whose NGA feed is stale (feed_stale), since its
-    warnings describe the feed's last update, not today. The readiness
+    warnings describe the feed's last update, not today, or whose currency
+    cannot be checked (feed_stale anything but False). The readiness
     score leaves unavailable inputs out, which makes it a lower bound
     (readiness_lower_bound True, with the reason in data_gaps); so does a
     theater with no flight source (posture's unavailable_theaters) or a
@@ -137,6 +138,16 @@ async def fetch_fleet_report(fetcher) -> dict:
                 f"{data.get('newest_issue_date')}, past the "
                 f"{data.get('stale_after_days')}-day threshold)"
             )
+            continue
+        if name == "vessel_snapshot" and data.get("feed_stale") is not False:
+            # Only feed_stale False says the snapshot is current; None (no
+            # usable issue date, or an empty feed) used to score as today.
+            unavailable.append(name)
+            data_gaps.append(
+                f"{name}: how current its NGA feed is cannot be checked "
+                "(feed_stale null), so its waterway statuses are not scored"
+            )
+            data_gaps.extend(f"{name}: {gap}" for gap in data.get("data_gaps") or [])
             continue
         gaps = data.get("data_gaps") or []
         data_gaps.extend(f"{name}: {gap}" for gap in gaps)

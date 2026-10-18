@@ -79,7 +79,14 @@ TOOLS: list[Tool] = [
             "properties": {
                 "bbox": {
                     "type": "string",
-                    "description": "Bounding box: lamin,lomin,lamax,lomax",
+                    "pattern": r"^\s*-?\d+(\.\d+)?\s*(,\s*-?\d+(\.\d+)?\s*){3}$",
+                    "description": (
+                        "Bounding box: lamin,lomin,lamax,lomax, four comma-separated "
+                        "numbers with latitudes -90..90, longitudes -180..180 and each "
+                        "minimum below its maximum (split a box that crosses the "
+                        "antimeridian in two). Anything else returns error "
+                        "invalid_bbox."
+                    ),
                 },
             },
         },

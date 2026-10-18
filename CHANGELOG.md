@@ -702,7 +702,12 @@ source here, and no proxy is substituted for any of these measures.
 - With NGA down every waterway read `clear`. It now reads `unknown`, and
   the response carries `error`, `degraded` and `reason`. With the feed past
   its staleness threshold every waterway reads `stale` (its counts kept,
-  dated by `status_as_of`) instead of a current threat level.
+  dated by `status_as_of`) instead of a current threat level. A feed whose
+  currency cannot be checked (`feed_stale` null: no parseable issue date,
+  or no active warnings) also reads `unknown`, degraded, with a data gap:
+  three undated warnings near Hormuz used to read `critical` with
+  `status_as_of` null. The fleet report leaves such a snapshot out of its
+  score (a lower bound) and the report prints an UNDATED note.
 - Positions are read in degrees-minutes, degrees-minutes-seconds and the
   two mixed, with whitespace, a comma or a slash between latitude and
   longitude; a lone latitude or longitude (a band or a meridian) counts as
@@ -710,6 +715,12 @@ source here, and no proxy is substituted for any of these measures.
   2026-10-17 (386 active, 3,480 from 2024) this loses none of the previous
   parser's 21,780 positions and reads 34 more, in HYDROLANT 2024-473, 479
   and 488.
+- A position match no longer starts right after a letter: '20-O3-44N'
+  (letter O for zero) used to read as 3.73N, about 1,800 km off; it now
+  reads as no position. On 3,643 distinct real warnings (2024 and the
+  live captures) this changes no position. A lone latitude or longitude
+  still counts as a stated position when a letter precedes it, so a
+  mistyped coordinate is unplaced as `position_unreadable`.
 
 ### Fixed: navigational warnings
 - An NGA outage returned `warnings: []` with no marker, the same shape as a
@@ -744,6 +755,11 @@ source here, and no proxy is substituted for any of these measures.
   never the Roman numerals) to the NAVAREAs, with each code's source in
   `sources/maritime.py`. Code 4 also carries Canadian Arctic (NAVAREA
   XVIII) warnings, so it is not a single NAVAREA.
+- NGA answering with no active warnings (an empty list, or only cancelled
+  ones) read as a quiet sea: count 0, no marker, every waterway `clear`.
+  The live feed held 386 active warnings on 2026-10-17, so the response is
+  now degraded with a data gap and `feed_stale` null, and the empty answer
+  is reused from the cache for at most 5 minutes instead of an hour.
 
 ### Fixed: fleet report and theater posture
 - `intel_fleet_report` turned a failed component into `{}`, so with all
@@ -770,6 +786,27 @@ source here, and no proxy is substituted for any of these measures.
   `intel_military_surge` turns a posture error into its own error and
   skips regions whose theater had no source (`unchecked_regions`) instead
   of recording zeros in their baselines.
+- On a warm cache those markers were bypassed: when adsb.lol failed, the
+  fetcher's expired copy (marked `_stale`) came back as current flights,
+  source `adsb.lol`, stamped now, and OpenSky was never tried. Measured
+  with a 3-day-old copy and both hosts returning 500: posture cached it as
+  complete, surge recorded it into its baselines as today's traffic, and
+  the fleet report scored it with no data gap. OpenSky is now tried live
+  before any copy is considered, and an expired copy from either source is
+  an outage (`error`, `degraded`, `reason`): its aircraft go under
+  `stale_copy` with their source, `as_of` and `age_seconds`, never under
+  `aircraft`. Posture names such theaters in `stale_theaters` and does not
+  cache, surge records nothing for them, and the fleet score is a lower
+  bound.
+- A malformed `bbox` (not four comma-separated numbers, a latitude outside
+  -90..90 or longitude outside -180..180, a minimum not below its maximum)
+  returned every military aircraft in the world as the box's, or raised a
+  bare `ValueError`. It now returns `error` with `reason` `invalid_bbox`
+  without fetching; the tool schema carries a pattern.
+- `intel posture` printed 0 for theaters no flight source answered, under
+  a total that looked complete, and no data gaps. Those theaters now read
+  `unknown`, the total says it covers only the theaters that answered, and
+  the gaps are printed.
 
 ### Fixed: report maritime section
 - The PDF/HTML report read `vessels` and `snapshot` for its maritime
@@ -784,6 +821,12 @@ source here, and no proxy is substituted for any of these measures.
   branch head and passes now, and five tests kill the mutants that survived
   the first round (radius boundary, malformed DMS, notation order,
   staleness boundary, two components down).
+- `test_maritime_honesty_r3.py` for the third round: 44 tests, 26 of which
+  fail on the previous head; the other 18 pin parser guards and controls
+  that no test held. Each of 26 source mutants (stale-copy handling, bbox
+  validation, the CLI posture table, undated and empty feeds, the
+  short reuse of an empty answer, both lookbehinds, longitude-only tokens,
+  decimal minutes followed by seconds) is killed by this file.
 
 ### Still open
 - The dashboard's nav-warnings table and fleet panel do not yet read
@@ -794,6 +837,11 @@ source here, and no proxy is substituted for any of these measures.
 - A naval warning that cannot be placed leaves every waterway's status
   unchanged; it is named only in `unplaced_naval_warnings` and
   `data_gaps`.
+- One malformed coordinate the parser does not anticipate can still raise
+  inside the NGA parse loop and fail the whole feed; there is no
+  per-record guard.
+- For up to 5 minutes after an upgrade a posture cached by the previous
+  code can still be served.
 
 ### Added: AOI escalation news and convergence components
 - `intel_aoi_escalation` now scores the news and convergence components it
