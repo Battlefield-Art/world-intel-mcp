@@ -222,6 +222,60 @@ async def test_collect_once_error_dict_is_success_but_not_stored(
     assert vs.stored == []
 
 
+async def test_collect_once_lists_upstream_errors_apart_from_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error dict stays a completed fetch (pinned above), but the summary
+    names it, so a cycle where every source answered with an error never
+    reads as data collected."""
+    good = {"count": 2, "earthquakes": [{"id": "a"}, {"id": "b"}]}
+    monkeypatch.setattr(
+        collector,
+        "_import_fetch_fn",
+        _importer_for(
+            {
+                "earthquakes": _returning(good),
+                "acled_events": _returning({"error": "ACLED token missing"}),
+            }
+        ),
+    )
+    vs = FakeVectorStore()
+
+    summary = await collector.collect_once(
+        FakeFetcher(), vs, source_filter={"earthquakes", "acled_events"}
+    )
+
+    assert (summary["successes"], summary["failures"]) == (2, 0)
+    assert summary["upstream_errors"] == ["acled_events: ACLED token missing"]
+    assert summary["stale_not_stored"] == []
+    assert vs.stored == [("earthquakes", good)]
+
+
+async def test_collect_once_does_not_store_a_stale_copy_as_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale cache copy is served so callers see something, but it is old
+    data: the collector must not file it in the vector store as this cycle's
+    collection. It still counts as a completed fetch."""
+    stale = {"warnings": [{"id": "NAVAREA IV 1/26"}], "_stale": True, "_stale_age_seconds": 86400}
+    fresh = {"quotes": [{"symbol": "TSTX", "price": 1.0}]}
+    monkeypatch.setattr(
+        collector,
+        "_import_fetch_fn",
+        _importer_for({"nav_warnings": _returning(stale), "market_quotes": _returning(fresh)}),
+    )
+    vs = FakeVectorStore()
+
+    summary = await collector.collect_once(
+        FakeFetcher(), vs, source_filter={"nav_warnings", "market_quotes"}
+    )
+
+    assert (summary["successes"], summary["failures"]) == (2, 0)
+    assert summary["stale_not_stored"] == ["nav_warnings"]
+    assert summary["upstream_errors"] == []
+    assert vs.stored == [("market_quotes", fresh)]
+
+
 async def test_collect_once_unfiltered_attempts_every_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,6 +465,34 @@ def test_main_single_run_failure_exits_one_and_lists_errors(
     assert "1/3 succeeded" in out
     assert "Errors (2):" in out
     assert "acled_events: boom" in out
+
+
+def test_main_names_upstream_errors_and_stale_copies(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    async def fake_run_once(source_filter=None):
+        return {
+            "successes": 3,
+            "sources_attempted": 3,
+            "cycle_time_s": 1.0,
+            "vector_store_points": 7,
+            "errors": [],
+            "failures": 0,
+            "upstream_errors": ["acled_events: ACLED token missing"],
+            "stale_not_stored": ["nav_warnings"],
+        }
+
+    monkeypatch.setattr(collector, "run_once", fake_run_once)
+    monkeypatch.setattr(collector.sys, "argv", ["intel-collector"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        collector.main()
+
+    assert excinfo.value.code == 0  # completed fetches; the exit code is unchanged
+    out = capsys.readouterr().out
+    assert "3/3 succeeded; 1 of them returned an upstream error and stored nothing" in out
+    assert "Upstream errors (1):\n    - acled_events: ACLED token missing" in out
+    assert "Stale copies, not stored as new (1): nav_warnings" in out
 
 
 def test_main_daemon_flag_forwards_interval_and_sources(
