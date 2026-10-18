@@ -32,6 +32,19 @@ def _default_db_path() -> Path:
     return Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
 
 
+def fallback_directory() -> Path:
+    """This user's directory under the temp dir that the fallback uses.
+
+    Only the path: nothing is created or checked. Readers that need to
+    tell whether a database is the fallback (history health) compare
+    against it.
+    """
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return Path(tempfile.gettempdir()) / "world-intel-mcp"
+    return Path(tempfile.gettempdir()) / f"world-intel-mcp-{getuid()}"
+
+
 def _fallback_db_path() -> Path:
     """The cache file in this user's own directory under the temp dir.
 
@@ -41,15 +54,14 @@ def _fallback_db_path() -> Path:
     one else can enter and none of the database's file names in it is a
     symlink.
     """
+    directory = fallback_directory()
     getuid = getattr(os, "getuid", None)
     if getuid is None:
         # No POSIX owner or mode bits to check (Windows, whose default temp
         # directory is per-user).
-        directory = Path(tempfile.gettempdir()) / "world-intel-mcp"
         directory.mkdir(exist_ok=True)
         return directory / "cache.db"
     uid = getuid()
-    directory = Path(tempfile.gettempdir()) / f"world-intel-mcp-{uid}"
     db = directory / "cache.db"
     try:
         directory.mkdir(mode=0o700)

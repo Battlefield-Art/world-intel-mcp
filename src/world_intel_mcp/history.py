@@ -152,6 +152,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .cache import fallback_directory
 from .sources.markets import _COMMODITY_SYMBOLS, _DEFAULT_INDEX_SYMBOLS
 
 logger = logging.getLogger("world-intel-mcp.history")
@@ -878,7 +879,7 @@ def _unrecorded_attempts(failures: list[dict], source: str, after: float | None)
 
 def _temp_fallback_db() -> Path:
     """Where ``Cache`` falls back when its default path is unusable."""
-    return Path(tempfile.gettempdir()) / "world-intel-mcp" / "cache.db"
+    return fallback_directory() / "cache.db"
 
 
 def _same_path(a: Path, b: Path) -> bool:

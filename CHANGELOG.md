@@ -110,6 +110,13 @@
   Measured with 8 processes on one fresh file: 29 to 67 failed opens in 80
   to 160 before, none in 160 after.
 
+### Fixed: collection health names the per-user cache fallback
+- `intel_collection_health` says when its run log is the temp-directory
+  fallback, but it compared against the old shared `world-intel-mcp`
+  directory after the fallback moved to the per-user
+  `world-intel-mcp-<uid>` directory, so a run log in the real fallback was
+  never named as one. The cache and history now read one path helper.
+
 ### Fixed: the collector cycle summary separates data from errors
 - A source that answers with an upstream error (`{"error": ...}`) still
   counts as a completed fetch, but the cycle summary now lists it under
