@@ -1007,6 +1007,58 @@ async def test_fetch_arxiv_papers(fetcher: Fetcher) -> None:
     assert len(result["papers"][0]["authors"]) == 2
 
 
+_ARXIV_ONE_ENTRY = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+<id>http://arxiv.org/abs/2610.00001v1</id><title>One paper</title>
+<summary>s</summary><published>2026-10-16T00:00:00Z</published>
+</entry></feed>"""
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_tool_without_query_searches_the_default(fetcher: Fetcher, monkeypatch) -> None:
+    """The schema and the guide present query as optional; the handler
+    used to pass None into the source, which raised before any request."""
+    from types import SimpleNamespace
+
+    from world_intel_mcp.sources import arxiv_papers
+    from world_intel_mcp.tools import society
+
+    default = "cat:cs.AI OR cat:cs.LG OR cat:cs.CL"
+    route = respx.get(url__regex=r".*export\.arxiv\.org/api/query.*").mock(
+        return_value=httpx.Response(200, text=_ARXIV_ONE_ENTRY)
+    )
+    monkeypatch.setattr(society, "runtime", SimpleNamespace(fetcher=fetcher))
+    result = await society.HANDLERS["intel_arxiv_papers"]({})
+
+    assert result["count"] == 1
+    assert result["query"] == default == getattr(arxiv_papers, "DEFAULT_QUERY", default)
+    assert route.call_count == 1
+    assert dict(route.calls[0].request.url.params) == {
+        "search_query": default,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+        "max_results": "25",
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_first_request_carries_the_search(fetcher: Fetcher) -> None:
+    """A bare request to the API URL searches for nothing; the query must
+    be in the first request, not only in a fallback."""
+    from world_intel_mcp.sources.arxiv_papers import fetch_arxiv_papers
+
+    route = respx.get(url__regex=r".*export\.arxiv\.org/api/query.*").mock(
+        return_value=httpx.Response(200, text=_ARXIV_ONE_ENTRY)
+    )
+    result = await fetch_arxiv_papers(fetcher, query="cat:cs.CV", limit=3)
+
+    assert result["count"] == 1
+    assert [dict(c.request.url.params).get("search_query") for c in route.calls] == ["cat:cs.CV"]
+    assert dict(route.calls[0].request.url.params)["max_results"] == "3"
+
+
 # ---------------------------------------------------------------------------
 # USA Spending
 # ---------------------------------------------------------------------------

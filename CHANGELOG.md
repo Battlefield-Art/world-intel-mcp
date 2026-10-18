@@ -274,6 +274,10 @@ source here, and no proxy is substituted for any of these measures.
   `yields_source` says whether the maturities came from FRED or Yahoo. A
   maturity with no rate is listed in `data_gaps` with `degraded: true`, and
   no rate at all is an `error`.
+- `intel_arxiv_papers` without `query` raised a TypeError before any
+  request; it now searches the default AI, ML and NLP categories. The
+  search also goes into the first request: before, the first request was
+  sent to the bare API URL and the query only reached a fallback.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

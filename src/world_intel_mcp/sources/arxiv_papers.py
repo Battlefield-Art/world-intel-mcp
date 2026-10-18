@@ -69,9 +69,12 @@ def _parse_arxiv_xml(xml_text: str) -> list[dict]:
     return papers
 
 
+DEFAULT_QUERY = "cat:cs.AI OR cat:cs.LG OR cat:cs.CL"
+
+
 async def fetch_arxiv_papers(
     fetcher: Fetcher,
-    query: str = "cat:cs.AI OR cat:cs.LG OR cat:cs.CL",
+    query: str | None = DEFAULT_QUERY,
     limit: int = 25,
     sort_by: str = "submittedDate",
 ) -> dict:
@@ -79,7 +82,8 @@ async def fetch_arxiv_papers(
 
     Args:
         fetcher: Shared HTTP fetcher.
-        query: arXiv search query (default: AI/ML/NLP categories).
+        query: arXiv search query (default: AI/ML/NLP categories); None or
+            empty means the default.
         limit: Number of papers (max 50).
         sort_by: Sort field — "submittedDate", "relevance", or "lastUpdatedDate".
 
@@ -87,29 +91,25 @@ async def fetch_arxiv_papers(
         Dict with papers[], count, source, timestamp.
     """
     limit = min(limit, 50)
+    query = query or DEFAULT_QUERY
 
     safe_query = re.sub(r"[^a-zA-Z0-9:._\s|()]", "", query)[:128]
 
-    xml_text = await fetcher.get_xml(
+    # The search goes in the query string of the first and only request: a
+    # bare request to the API URL would not search for anything.
+    xml_text = await fetcher.get_text(
         _ARXIV_API_URL,
         source="arxiv",
         cache_key=f"arxiv:{safe_query}:{sort_by}:{limit}",
         cache_ttl=900,
+        params={
+            "search_query": query,
+            "sortBy": sort_by,
+            "sortOrder": "descending",
+            "max_results": limit,
+        },
         timeout=20.0,
     )
-
-    # get_xml doesn't support params, so construct URL manually
-    # Actually, we need to use get_text with params
-    if xml_text is None:
-        # Try with full URL including params
-        url = f"{_ARXIV_API_URL}?search_query={query}&sortBy={sort_by}&sortOrder=descending&max_results={limit}"
-        xml_text = await fetcher.get_text(
-            url,
-            source="arxiv",
-            cache_key=f"arxiv:{safe_query}:{sort_by}:{limit}",
-            cache_ttl=900,
-            timeout=20.0,
-        )
 
     if xml_text is None:
         return {"papers": [], "count": 0, "source": "arxiv", "timestamp": _utc_now_iso()}
