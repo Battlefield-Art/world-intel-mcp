@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -174,6 +175,9 @@ async def fetch_prediction_markets(fetcher: Fetcher, limit: int = 20) -> dict:
 
         {"markets": [...], "count": N, "source": "polymarket",
          "timestamp": "<iso>"}
+
+    A list served from expired cache adds ``stale``, ``degraded`` and a
+    ``data_gaps`` entry.
     """
     params = {
         "limit": str(limit),
@@ -256,6 +260,7 @@ async def fetch_prediction_markets(fetcher: Fetcher, limit: int = 20) -> dict:
     gaps = []
     if stale:
         result["stale"] = True
+        result["degraded"] = True
         gaps.append("served from expired cache after a failed live fetch")
     if unpriced:
         gaps.append(f"{unpriced} market(s) left out: outcome price missing, unreadable or outside 0..1")
@@ -323,19 +328,24 @@ async def fetch_polymarket_open(fetcher: Fetcher, limit: int = 300) -> dict:
     """Open binary Polymarket markets by 24h volume, cross-venue shape.
 
     Returns ``{"markets", "requested", "rows_read", "non_binary_skipped",
-    "error"?, "degraded"?, "stale"?}``.
+    "error"?, "degraded"?, "stale"?, "stale_max_age_seconds"?}``. Each
+    market carries ``stale`` and ``stale_age_seconds``: whether its page
+    was served from expired cache, and that copy's age.
     """
     limit = max(1, min(int(limit), MAX_OPEN_MARKETS))
-    rows: list = []
+    rows: list[tuple[dict, float | None, bool]] = []
     offset = 0
     stale_before = _stale_serves(fetcher, "polymarket")
+    stale_ages: list[float | None] = []
     error = None
     while offset < limit:
         size = min(_GAMMA_PAGE_MAX, limit - offset)
+        cache_key = f"prediction:polymarket:open:{size}:{offset}"
+        page_before = _stale_serves(fetcher, "polymarket")
         data = await fetcher.get_json(
             _GAMMA_MARKETS_URL,
             source="polymarket",
-            cache_key=f"prediction:polymarket:open:{size}:{offset}",
+            cache_key=cache_key,
             cache_ttl=300,
             params={
                 "limit": str(size), "offset": str(offset), "active": "true",
@@ -348,11 +358,21 @@ async def fetch_polymarket_open(fetcher: Fetcher, limit: int = 300) -> dict:
                 if data is None else f"Unexpected Polymarket response shape: {type(data).__name__}"
             )
             break
-        rows.extend(r for r in data if isinstance(r, dict))
+        page_stale = _stale_serves(fetcher, "polymarket") > page_before
+        age = _stale_copy_age(fetcher, cache_key) if page_stale else None
+        if page_stale:
+            stale_ages.append(age)
+        rows.extend((r, age, page_stale) for r in data if isinstance(r, dict))
         if len(data) < size:
             break
         offset += size
-    markets = [m for m in (normalize_gamma_market(r) for r in rows) if m is not None]
+    markets = []
+    for row, age, page_stale in rows:
+        m = normalize_gamma_market(row)
+        if m is not None:
+            m["stale"] = page_stale
+            m["stale_age_seconds"] = age
+            markets.append(m)
     out: dict = {
         "markets": markets,
         "requested": limit,
@@ -362,9 +382,20 @@ async def fetch_polymarket_open(fetcher: Fetcher, limit: int = 300) -> dict:
     if error:
         out["error"] = error
         out["degraded"] = True
-    if _stale_serves(fetcher, "polymarket") > stale_before:
+    if stale_ages or _stale_serves(fetcher, "polymarket") > stale_before:
         out["stale"] = True
+        known = [a for a in stale_ages if a is not None]
+        out["stale_max_age_seconds"] = max(known) if known else None
     return out
+
+
+def _stale_copy_age(fetcher: Fetcher, cache_key: str) -> float | None:
+    """Age in seconds of the cached copy under ``cache_key`` (a list
+    payload carries no inline age), or None when unknown."""
+    meta = fetcher.cache.get_stale_meta(cache_key)
+    if meta is None or not isinstance(meta[1], (int, float)):
+        return None
+    return round(max(0.0, time.time() - meta[1]), 1)
 
 
 def _closed_ts(value) -> int | None:

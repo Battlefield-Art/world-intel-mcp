@@ -129,6 +129,23 @@ def _finite(value: Any) -> float | None:
     return number if number is not None and math.isfinite(number) else None
 
 
+def _quote(value: Any) -> float | None:
+    """A quote in dollars per $1 payout: a finite number from 0 to 1, else
+    None (a cents-scaled "45" or a negative value is not a price)."""
+    number = _finite(value)
+    return number if number is not None and 0 <= number <= 1 else None
+
+
+_QUOTE_FIELDS = ("yes_bid_dollars", "yes_ask_dollars", "last_price_dollars")
+
+
+def bad_quote_fields(market: dict) -> list[str]:
+    """Quote fields present in a raw market but not a price from 0 to 1."""
+    return [f for f in _QUOTE_FIELDS if _num(market.get(f)) is not None and _quote(market.get(f)) is None] + [
+        f for f in _QUOTE_FIELDS if market.get(f) not in (None, "") and _num(market.get(f)) is None
+    ]
+
+
 def _volume(value: Any) -> float | None:
     """A contract count: absent means 0.0; unparseable, non-finite or
     negative means None (unreadable, counted by the caller)."""
@@ -186,9 +203,9 @@ def implied_probability(market: dict) -> tuple[float | None, str]:
     ask < 1); otherwise the last trade when it is a finite price in
     (0, 1]; otherwise None ("no price").
     """
-    bid = _finite(market.get("yes_bid_dollars"))
-    ask = _finite(market.get("yes_ask_dollars"))
-    last = _finite(market.get("last_price_dollars"))
+    bid = _quote(market.get("yes_bid_dollars"))
+    ask = _quote(market.get("yes_ask_dollars"))
+    last = _quote(market.get("last_price_dollars"))
     if bid is not None and ask is not None and 0 < bid <= ask < 1:
         return round((bid + ask) / 2, 4), "bid_ask_midpoint"
     if last is not None and 0 < last <= 1:
@@ -203,6 +220,10 @@ def normalize_market(market: dict, event: dict | None = None) -> dict:
     unreadable (callers count such rows); ``spread`` is set only for a
     two-sided book. Kalshi's market listings carry no last-trade time
     (``last_trade_time`` is None here; see fetch_kalshi_last_trade_times).
+    Quote fields outside 0..1 are None (bad_quote_fields names them).
+    ``stale`` and ``stale_age_seconds`` say whether the listing response
+    this market came from was served from expired cache (the event dict
+    carries the marker, set by _events_pages).
     """
     event = event or {}
     prob, basis = implied_probability(market)
@@ -210,9 +231,10 @@ def normalize_market(market: dict, event: dict | None = None) -> dict:
     series_ticker = event.get("series_ticker") or (event_ticker.split("-", 1)[0] if event_ticker else "")
     yes_side = market.get("yes_sub_title") or ""
     title = market.get("title") or ""
-    bid = _finite(market.get("yes_bid_dollars"))
-    ask = _finite(market.get("yes_ask_dollars"))
+    bid = _quote(market.get("yes_bid_dollars"))
+    ask = _quote(market.get("yes_ask_dollars"))
     two_sided = bid is not None and ask is not None and 0 < bid <= ask < 1
+    stale = bool(event.get("_stale"))
     return {
         "venue": "kalshi",
         "id": market.get("ticker", ""),
@@ -227,8 +249,10 @@ def normalize_market(market: dict, event: dict | None = None) -> dict:
         "yes_bid": bid,
         "yes_ask": ask,
         "spread": round(ask - bid, 4) if two_sided else None,
-        "last_price": _finite(market.get("last_price_dollars")),
+        "last_price": _quote(market.get("last_price_dollars")),
         "last_trade_time": None,
+        "stale": stale,
+        "stale_age_seconds": _stale_age(event) if stale else None,
         "volume": _volume(market.get("volume_fp")),
         "volume_24h": _volume(market.get("volume_24h_fp")),
         "open_interest": _finite(market.get("open_interest_fp")),
@@ -280,7 +304,14 @@ async def _events_pages(
                 f"Kalshi /events page {pages + 1} unavailable (no live or cached data)"
             )
         pages += 1
-        events.extend(e for e in data["events"] if isinstance(e, dict))
+        page = [e for e in data["events"] if isinstance(e, dict)]
+        if data.get("_stale"):
+            # Carried onto each market by normalize_market, so a price
+            # from this page is marked where it is shown.
+            for e in page:
+                e["_stale"] = True
+                e["_stale_age_seconds"] = _stale_age(data)
+        events.extend(page)
         cursor = data.get("cursor") or ""
         if not cursor:
             return events, pages, True, None
@@ -393,13 +424,20 @@ async def fetch_kalshi_open_markets(
             )
 
     markets: list[dict] = []
+    bad_quotes = 0
     for ev in events:
         if category and ev.get("category") and ev["category"] != category:
             continue
         for m in ev.get("markets") or []:
             if isinstance(m, dict) and m.get("status") in (None, "active", "open"):
                 markets.append(normalize_market(m, ev))
+                bad_quotes += bool(bad_quote_fields(m))
     scan["events_scanned"] = len(events)
+    if bad_quotes:
+        gaps.append(
+            f"{bad_quotes} market(s) with a quote field that is not a price from 0 to 1 "
+            "(left null; the price falls back or is missing)"
+        )
     if stale:
         scan["stale_responses"] = len(stale)
         scan["stale_max_age_seconds"] = max_stale_age(stale)
@@ -715,17 +753,24 @@ async def fetch_kalshi_price_history(
 
 
 async def fetch_kalshi_last_trade_times(
-    fetcher: Fetcher, tickers: list[str]
+    fetcher: Fetcher, tickers: list[str], *,
+    prices: dict[str, float | None] | None = None,
+    stale_tickers: dict[str, float | None] | None = None,
 ) -> tuple[dict[str, str | None], list[str]]:
     """When each market last traded, from the public ``/markets/trades``
     endpoint (``limit=1``). The market listings carry no trade time
     (measured 2026-10-17), so a price whose basis is the last trade has
-    no age without this lookup.
+    no age without this lookup. ``limit=1`` returns the venue's first
+    listed trade, which is the latest only while the endpoint lists
+    newest first (observed live on 2026-10-17 in two samples).
 
     Returns (``{ticker: created_time or None}``, gaps): None means the
     venue returned no trade; a ticker missing from the dict could not be
     looked up or its trade time was unreadable (named in the gaps, never
-    guessed).
+    guessed). When the caller passes ``prices``, the same trade's
+    ``yes_price_dollars`` is recorded per ticker (None when unreadable
+    or outside 0..1); ``stale_tickers`` records the tickers whose answer
+    was served from expired cache, with the copy's age in seconds.
     """
     times: dict[str, str | None] = {}
     failed = 0
@@ -742,14 +787,20 @@ async def fetch_kalshi_last_trade_times(
         if not isinstance(trades, list):
             failed += 1
             continue
+        if stale_tickers is not None and data.get("_stale"):
+            stale_tickers[ticker] = _stale_age(data)
         if not trades:
             times[ticker] = None
+            if prices is not None:
+                prices[ticker] = None
             continue
         created = trades[0].get("created_time") if isinstance(trades[0], dict) else None
         if not isinstance(created, str) or _ts(created) is None:
             failed += 1
             continue
         times[ticker] = created
+        if prices is not None:
+            prices[ticker] = _quote(trades[0].get("yes_price_dollars"))
     gaps: list[str] = []
     if failed:
         gaps.append(f"Kalshi last-trade time unavailable for {failed} market(s)")

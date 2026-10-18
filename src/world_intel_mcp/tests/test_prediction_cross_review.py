@@ -8,8 +8,9 @@ earlier response, so each test sets up the shared venues first and
 then overrides the one endpoint it fails.
 
 Gaps / not covered: a real outage on either venue; ordering of the live
-trades endpoint (the lookup asks for one trade and does not depend on
-it).
+trades endpoint. The lookup asks for one trade (``limit=1``), so it
+relies on the endpoint listing newest first, which was observed live on
+2026-10-17 (two samples) and is not pinned by any test here.
 """
 
 import asyncio as asyncio_mod

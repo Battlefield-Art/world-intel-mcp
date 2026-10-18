@@ -1259,6 +1259,29 @@ source here, and no proxy is substituted for any of these measures.
   characters. `intel_prediction_markets` names how many markets it left
   out for an unusable price.
 
+### Fixed: prediction-market re-review findings
+- Matching rejects a pair when both titles name different days of the
+  same month, no shared month, or different clock times; when a quantity
+  differs in unit ($, %, bps) or kind (to a level, by a change) or the
+  same numbers come in a different order; on opposite wording (rise or
+  fall, positive or negative, before or after); and when a listed name
+  (chamber, party, country, a qualifier such as core or cash) or another
+  capitalized name appears on one venue only. More negation words
+  (won't, fail to), rate verbs (tighten, ease, boost, reduce and their
+  forms), number words, dash minus signs, "between" ranges and bps read
+  as hundredths of a percent. "Hold" counts as a rate action only in a
+  rate question.
+- `intel_prediction_compare`: a side priced from an expired copy carries
+  `stale` and its age and its pair is flagged and not comparable. The
+  Kalshi last-trade lookup reads the trade's price with its time, flags a
+  pair whose trade price differs from the listing, skips sides priced from
+  an expired listing, stops after 10 lookups or 10 s, and says per side
+  what a null time means (`last_trade_lookup`). Matching runs in a worker
+  thread. A pair with no price is flagged; Kalshi quotes outside 0 to 1
+  are left null and counted.
+- `intel_prediction_markets` sets `degraded` with `stale`; `intel
+  predictions` prints its data gaps and titles an expired list as such.
+
 ## 0.11.0 - 2026-10-12
 
 Cross-border migration (MCP tools, CLI, collector and a dashboard
