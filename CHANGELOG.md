@@ -366,6 +366,12 @@ source here, and no proxy is substituted for any of these measures.
   forms, treats hyphens as underscores and needs no word boundary in
   front. Whole and decimal numbers take ASCII digits only, and a value
   over 200 characters is refused instead of cut.
+- A cache file moved, deleted or replaced while the server held it open
+  kept answering from the open handle, and source health reported it as
+  the shared cache. `cache.moved` now marks it (the path is gone, or is
+  not the file source health first read), the verdict says the numbers
+  come from a file no other process shares, and the scope notes say a
+  replacement made before the first read is not detected.
 
 ### Added: tropical cyclone forecast tracks
 - `intel_cyclones` and `intel_jtwc_cyclones` take `include_forecast`

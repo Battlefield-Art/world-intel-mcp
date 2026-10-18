@@ -26,8 +26,10 @@ Gaps / not covered:
   so in its ``scope`` field.
 - ``keyed_sources`` reports whether a variable is set, not whether the
   key is valid or within quota.
-- A cache file moved or deleted while the server holds it open keeps
-  answering from the open handle; source health cannot tell.
+- A cache file moved, deleted or replaced while the server holds it open
+  keeps answering from the open handle. Source health marks it
+  (cache.moved) by comparing the path with the file it first read, so a
+  replacement made before the first source-health read is not detected.
 - The guide states no count of tools that return no failure marker under
   a total outage, because the count changes as tools are added. A review
   sweep at 7782d22 (137 of its 139 tools, each in a fresh process with a
@@ -43,6 +45,7 @@ import os
 import re
 import sqlite3
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -473,7 +476,11 @@ _HEALTH_SCOPE = (
     "cache.requested_path is the database this process was configured to "
     "use; when it could not be opened, cache.fell_back is true and db_path "
     "is a temporary database that no other process shares. "
-    "cache.available is false when the database could not be read at all.",
+    "cache.available is false when the database could not be read at all. "
+    "cache.moved is true when the file at db_path is gone, or is not the "
+    "file this process first read, while this process still holds the old "
+    "one open: its numbers then come from a file no other process shares. "
+    "A file replaced before this resource was first read is not detected.",
     "keyed_sources says whether each variable is set in this server's "
     "environment. It never shows values and does not check that a key works.",
     "Not read here: vector store statistics (intel_vector_stats) and the "
@@ -481,12 +488,38 @@ _HEALTH_SCOPE = (
 )
 
 
+# The file each cache object's database was on when source health first
+# read it. A moved or replaced file keeps answering through the open
+# handle, so the path is compared with this on every read.
+_FIRST_FILE: "weakref.WeakKeyDictionary[Any, tuple[int, int]]" = weakref.WeakKeyDictionary()
+
+
+def _file_identity(path: Any) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _cache_moved(cache: Any) -> bool:
+    now = _file_identity(cache.db_path)
+    if now is None:
+        return True
+    try:
+        first = _FIRST_FILE.setdefault(cache, now)
+    except TypeError:
+        return False
+    return first != now
+
+
 def _read_cache(cache: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Cache statistics and per-prefix freshness, or why they are unreadable.
 
     A broken database (table missing, file corrupt, disk error) becomes
     ``available: false`` with the error text, so the rest of the health
-    snapshot still reaches the caller.
+    snapshot still reaches the caller. ``moved`` marks a database file that
+    was moved, deleted or replaced while this process holds it open.
     """
     paths = {
         "db_path": str(cache.db_path),
@@ -498,7 +531,7 @@ def _read_cache(cache: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
         by_prefix = cache.freshness()
     except (sqlite3.Error, OSError) as exc:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}", **paths}, None
-    return {"available": True, **stats, **paths}, by_prefix
+    return {"available": True, **stats, **paths, "moved": _cache_moved(cache)}, by_prefix
 
 
 def _failing_sources(breakers: dict[str, Any]) -> list[str]:
@@ -543,6 +576,12 @@ def _verdict(breakers: dict[str, Any], cache_info: dict[str, Any]) -> str:
         verdict += (
             "; the configured cache could not be opened, so this process uses "
             "a temporary cache of its own"
+        )
+    if cache_info.get("moved"):
+        verdict += (
+            "; the cache file at db_path was moved or replaced while this "
+            "process held it open, so its cache numbers come from a file no "
+            "other process shares"
         )
     return verdict
 

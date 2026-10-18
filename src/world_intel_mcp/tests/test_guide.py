@@ -1822,3 +1822,37 @@ def test_prompt_refuses_an_overlong_value_instead_of_cutting_it() -> None:
     assert "y" * 200 in guide_prompts.render(prompt, {"country": "y" * 200})
     with pytest.raises(guide_prompts.PromptArgumentError, match="longer than 200 characters"):
         guide_prompts.render(prompt, {"country": "y" * 201})
+
+
+def test_source_health_marks_a_cache_file_moved_or_replaced_under_it(tmp_path) -> None:
+    """The open handle keeps answering after the file is moved or a new
+    file takes its path; source health must say so."""
+    path = tmp_path / "held.db"
+    cache = Cache(db_path=path)
+    other = None
+    try:
+        cache.set("markets:quote:SPY", {"price": 1}, 60)
+        before = guide.source_health(CircuitBreaker(), cache)
+        assert before["cache"]["moved"] is False
+        assert "moved or replaced" not in before["verdict"]
+
+        for suffix in ("", "-wal", "-shm"):
+            moved_from = Path(f"{path}{suffix}")
+            if moved_from.exists():
+                moved_from.rename(tmp_path / f"away.db{suffix}")
+        gone = guide.source_health(CircuitBreaker(), cache)
+        assert (gone["cache"]["available"], gone["cache"]["total_entries"]) == (True, 1)
+        assert gone["cache"]["moved"] is True
+        assert "moved or replaced while this process held it open" in gone["verdict"]
+
+        other = Cache(db_path=path)
+        other.set("conflict:acled:SDN", {"events": []}, 60)
+        replaced = guide.source_health(CircuitBreaker(), cache)
+        assert replaced["cache"]["moved"] is True
+        assert guide.source_health(CircuitBreaker(), other)["cache"]["moved"] is False
+    finally:
+        cache.close()
+        if other is not None:
+            other.close()
+    scope = " ".join(guide._HEALTH_SCOPE)
+    assert "cache.moved is true when the file at db_path is gone" in scope
